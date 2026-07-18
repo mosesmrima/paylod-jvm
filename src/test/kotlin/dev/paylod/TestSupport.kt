@@ -62,18 +62,34 @@ fun testClient(
     baseUrl: String? = null,
     webhookSecret: String? = null,
     allowInsecureBaseUrl: Boolean = false,
+    now: Long = 0,
+    timeoutMs: Long = 30_000,
 ): Pair<Paylod, StubTransport> {
     val transport = StubTransport(steps)
     val options = PaylodOptions.of(
         baseUrl = baseUrl,
         webhookSecret = webhookSecret,
         maxRetries = maxRetries,
+        timeoutMs = timeoutMs,
         transport = transport,
         simulate = simulate,
         allowInsecureBaseUrl = allowInsecureBaseUrl,
     )
-    val paylod = Paylod(apiKey, options, FakeTimeSource(), Random(1))
+    val paylod = Paylod(apiKey, options, FakeTimeSource(now), Random(1))
     return paylod to transport
+}
+
+/** As [testClient], but hands the test the virtual clock so it can assert on elapsed time. */
+fun testClientWithClock(
+    steps: List<Step>,
+    apiKey: String = "mp_test_abc123",
+    maxRetries: Int = 0,
+    now: Long = 0,
+): Triple<Paylod, StubTransport, FakeTimeSource> {
+    val transport = StubTransport(steps)
+    val clock = FakeTimeSource(now)
+    val options = PaylodOptions.of(maxRetries = maxRetries, transport = transport)
+    return Triple(Paylod(apiKey, options, clock, Random(1)), transport, clock)
 }
 
 /** The standard 202 collect ack body. */

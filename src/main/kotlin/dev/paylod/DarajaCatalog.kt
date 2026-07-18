@@ -275,11 +275,17 @@ object DarajaCatalog {
             return if (outcome == StkOutcome.PENDING) pendingFallback(code) else failedFallback(code, rawDesc)
         }
 
-        // Terminal (api_error / b2c_c2b_result): no STK pending semantics. Pick the entry for this
-        // family (falling back to any non-STK match, then any match), else an indeterminate failure.
+        // Terminal (api_error / b2c_c2b_result): no STK pending semantics, EVER.
+        //
+        // We select the entry for the requested family, or — failing that — another NON-STK entry.
+        // We deliberately do NOT fall back to `matches.firstOrNull()`: that last-resort fallback could
+        // hand back an STK entry, and the only STK entries a non-STK lookup can collide with are the
+        // *pending* ones (4999, 500.001.1001). Returning those would tell a caller "the payment is
+        // still in flight, keep polling" about a code that arrived on a terminal surface — the exact
+        // 4999 bug this family-awareness exists to kill. When no non-STK entry exists the honest
+        // answer is the terminal, NON-RETRYABLE fallback.
         val entry = matches.firstOrNull { it.family == effectiveFamily }
             ?: matches.firstOrNull { it.family != DarajaFamily.STK_RESULT }
-            ?: matches.firstOrNull()
         return if (entry != null) decodedFrom(code, entry) else failedFallback(code, rawDesc)
     }
 

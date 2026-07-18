@@ -506,4 +506,211 @@ class ClientTest {
         val firstStatus = t.calls.first { it.method == "GET" }
         assertTrue(firstStatus.timeoutMs <= 8_000, "expected <= 8000, was ${firstStatus.timeoutMs}")
     }
+
+    // ── 0.3.0: baseUrl is an ORIGIN ALLOWLIST, not just an https:// check ───────────────────
+
+    @Test
+    fun `refuses an arbitrary https origin — a live key must never leave for a foreign host`() {
+        // This is the whole point: HTTPS to attacker.example is still a full credential handover.
+        for (bad in listOf(
+            "https://attacker.example/v1",
+            "https://paylod.dev.attacker.example/v1",
+            "https://evil-paylod.dev/v1",
+        )) {
+            assertThrows(PaylodConfigException::class.java, { testClient(emptyList(), baseUrl = bad) }, bad)
+        }
+    }
+
+    @Test
+    fun `accepts exactly the two allowed paylod hosts`() {
+        testClient(emptyList(), baseUrl = "https://paylod.dev/functions/v1")
+        testClient(emptyList(), baseUrl = "https://api.paylod.dev/v1")
+        testClient(emptyList(), baseUrl = "https://paylod.dev:443/functions/v1")
+        // …and even a live key is fine, because these are the origins it is FOR.
+        testClient(emptyList(), apiKey = "mp_live_abc", baseUrl = "https://paylod.dev/functions/v1")
+    }
+
+    @Test
+    fun `the allowlist is an exact host set, not a suffix match`() {
+        // A suffix match on ".paylod.dev" would wave through any subdomain, including one an attacker
+        // can get pointed elsewhere. Only the two named hosts are allowed.
+        for (bad in listOf("https://staging.paylod.dev/v1", "https://a.api.paylod.dev/v1")) {
+            assertThrows(PaylodConfigException::class.java, { testClient(emptyList(), baseUrl = bad) }, bad)
+        }
+    }
+
+    @Test
+    fun `https loopback needs the same opt-in as plaintext, and never takes a live key`() {
+        // An https:// dev server must NOT slip through on the strength of its scheme alone.
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(emptyList(), baseUrl = "https://localhost:54321/v1")
+        }
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(emptyList(), baseUrl = "https://127.0.0.1:54321/v1")
+        }
+        // With the opt-in and a sandbox key it is allowed…
+        testClient(emptyList(), baseUrl = "https://localhost:54321/v1", allowInsecureBaseUrl = true)
+        // …but never with a live key.
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(
+                emptyList(),
+                apiKey = "mp_live_abc",
+                baseUrl = "https://localhost:54321/v1",
+                allowInsecureBaseUrl = true,
+            )
+        }
+    }
+
+    @Test
+    fun `refuses userinfo, an unexpected port, a query, a fragment, and IP literals`() {
+        for (bad in listOf(
+            // The real host here is attacker.example — `paylod.dev` is only the username.
+            "https://paylod.dev@attacker.example/v1",
+            "https://paylod.dev:8443/v1",
+            "https://paylod.dev/v1?next=https://attacker.example",
+            "https://paylod.dev/v1#x",
+            // Raw IPs are never the canonical origin — including private and loopback ranges.
+            "https://10.0.0.1/v1",
+            "https://192.168.1.1/v1",
+            "https://169.254.169.254/v1",
+            "https://127.0.0.1/v1",
+        )) {
+            assertThrows(PaylodConfigException::class.java, { testClient(emptyList(), baseUrl = bad) }, bad)
+        }
+    }
+
+    @Test
+    fun `keeps the test-only loopback exception, and still never allows it with a live key`() {
+        testClient(emptyList(), baseUrl = "http://localhost:54321/v1", allowInsecureBaseUrl = true)
+        testClient(emptyList(), baseUrl = "http://127.0.0.1:54321/v1", allowInsecureBaseUrl = true)
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(
+                emptyList(),
+                apiKey = "mp_live_abc",
+                baseUrl = "http://localhost:54321/v1",
+                allowInsecureBaseUrl = true,
+            )
+        }
+    }
+
+    // ── 0.3.0: Retry-After parsing ─────────────────────────────────────────────────────────
+
+    @Test
+    fun `honours Retry-After regardless of header case, and past the old 10s truncation`() {
+        val (paylod, _, clock) = testClientWithClock(
+            listOf(Step(status = 429, headers = mapOf("Retry-After" to "45")), Step(status = 202, json = ACK)),
+            maxRetries = 1,
+        )
+        val start = clock.now
+        paylod.collect(CollectParams("0712345678", 100, idempotencyKey = "k1"))
+        // 45s was honoured in full. The old code lowercased-only (missing this header entirely) and
+        // then truncated every value to 10s.
+        assertTrue(clock.now - start >= 45_000, "waited only ${clock.now - start}ms")
+    }
+
+    @Test
+    fun `honours the HTTP-date form of Retry-After`() {
+        // 2015-10-21T07:28:00Z. The virtual clock is parked 30s before it.
+        val target = 1_445_412_480_000L
+        val (paylod, _, clock) = testClientWithClock(
+            listOf(
+                Step(status = 429, headers = mapOf("retry-after" to "Wed, 21 Oct 2015 07:28:00 GMT")),
+                Step(status = 202, json = ACK),
+            ),
+            maxRetries = 1,
+            now = target - 30_000,
+        )
+        paylod.collect(CollectParams("0712345678", 100, idempotencyKey = "k1"))
+        assertTrue(clock.now >= target, "clock did not reach the Retry-After date: ${clock.now}")
+    }
+
+    @Test
+    fun `ignores an unusable or past Retry-After rather than misreading it as a delay`() {
+        // "1e3" must not become 1000 seconds; a date in the past must not become a negative sleep.
+        for (header in listOf("1e3", "not-a-date", "-5", "Wed, 21 Oct 2015 07:28:00 GMT")) {
+            val (paylod, _, clock) = testClientWithClock(
+                listOf(Step(status = 429, headers = mapOf("retry-after" to header)), Step(status = 202, json = ACK)),
+                maxRetries = 1,
+                now = 2_000_000_000_000L, // well past 2015
+            )
+            val start = clock.now
+            paylod.collect(CollectParams("0712345678", 100, idempotencyKey = "k1"))
+            // Only the ordinary jittered backoff (a few hundred ms) elapsed — no bogus long sleep.
+            assertTrue(clock.now - start < 5_000, "header \"$header\" caused a ${clock.now - start}ms sleep")
+        }
+    }
+
+    @Test
+    fun `clamps a huge Retry-After to the wait deadline instead of overrunning it`() {
+        val (paylod, _, clock) = testClientWithClock(
+            listOf(
+                Step(status = 202, json = ACK),
+                // Every status poll is throttled with an hour-long Retry-After.
+                Step(status = 429, headers = mapOf("retry-after" to "3600")),
+            ),
+            maxRetries = 2,
+        )
+        val start = clock.now
+        assertThrows(PaylodException::class.java) {
+            paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k1"), WaitOptions.of(timeoutMs = 5_000))
+        }
+        // The 5s wait budget bounds the whole operation. Without the clamp this would have slept an
+        // hour per attempt inside a call the caller capped at five seconds.
+        assertTrue(clock.now - start <= 5_000, "overran the deadline by ${clock.now - start - 5_000}ms")
+    }
+
+    // ── 0.3.0: idempotency-key charset ─────────────────────────────────────────────────────
+
+    @Test
+    fun `rejects C1 control characters and invisible Unicode in an idempotency key`() {
+        val (paylod, _) = testClient(emptyList())
+        // Written as escapes so the intent survives any editor that would "helpfully" normalise them.
+        val bad = mapOf(
+            "C1 NEL" to "order\u0085123",
+            "C1 APC" to "order\u009f123",
+            "DEL" to "order\u007f123",
+            "NBSP" to "order\u00a0123",
+            // Visually IDENTICAL to "order123" in every log and dashboard, but a different key.
+            "zero-width space" to "order\u200b123",
+            "BOM" to "order\ufeff123",
+            "line separator" to "order\u2028123",
+            "ideographic space" to "order\u3000123",
+        )
+        for ((name, k) in bad) {
+            assertThrows(PaylodInvalidRequestException::class.java, {
+                paylod.collect(CollectParams("0712345678", 100, idempotencyKey = k))
+            }, "accepted a key containing $name")
+        }
+    }
+
+    @Test
+    fun `bounds an idempotency key in BYTES, not characters`() {
+        val (paylod, _) = testClient(emptyList())
+        // 128 three-byte characters = 384 UTF-8 bytes, but only 128 `String` chars. A char-length
+        // bound would wave this through and let the server truncate it into a colliding key.
+        val key = "中".repeat(128)
+        assertEquals(128, key.length)
+        assertThrows(PaylodInvalidRequestException::class.java) {
+            paylod.collect(CollectParams("0712345678", 100, idempotencyKey = key))
+        }
+    }
+
+    // ── 0.3.0: the deadline bounds ALL in-flight work ──────────────────────────────────────
+
+    @Test
+    fun `a slow transport cannot overrun the wait deadline`() {
+        val (paylod, t, clock) = testClientWithClock(
+            listOf(Step(status = 202, json = ACK), Step(json = paymentJson(status = "pending"))),
+        )
+        val start = clock.now
+        assertThrows(PaylodTimeoutException::class.java) {
+            paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k1"), WaitOptions.of(timeoutMs = 3_000))
+        }
+        assertTrue(clock.now - start <= 3_000, "wait ran ${clock.now - start}ms past a 3000ms budget")
+        // Every status read was itself capped to the remaining budget — none could hang for the full
+        // 30s per-request default and blow through the deadline on its own.
+        for (call in t.calls.filter { it.method == "GET" }) {
+            assertTrue(call.timeoutMs in 1..3_000, "poll timeout was ${call.timeoutMs}")
+        }
+    }
 }

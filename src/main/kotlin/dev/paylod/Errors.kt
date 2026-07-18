@@ -25,15 +25,34 @@ open class PaylodException internal constructor(
 /** Bad input caught locally, before any network call (invalid amount, unparseable phone). */
 class PaylodInvalidRequestException internal constructor(message: String) : PaylodException(message)
 
-// Control chars (C0 range + DEL): invalid in an HTTP header value and a sure sign of a bad key.
-private val CONTROL_CHAR_RE = Regex("[\\u0000-\\u001f\\u007f]")
+/**
+ * The FULL Unicode control ranges — C0 (U+0000..U+001F), DEL (U+007F) and C1 (U+0080..U+009F).
+ *
+ * The C1 range matters as much as C0: those code points are invalid in an HTTP field value, and some
+ * intermediaries transcode or strip them. A key that is silently altered in transit is a key that no
+ * longer matches the one the first attempt used — which is precisely how a "protected" retry becomes
+ * a second charge.
+ */
+private val CONTROL_CHAR_RE = Regex("[\\u0000-\\u001f\\u007f-\\u009f]")
 
 /**
- * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace
- * keys, keys carrying control characters (which also cannot go in an HTTP header), and absurdly long
- * values. A caller-supplied key is the ONE thing standing between a double-click and a double-charge,
- * so a bad one must fail loudly rather than be quietly accepted. Shared by `collect()` and
- * `simulate.collect()`.
+ * Unicode-only whitespace and invisible formatting characters: NBSP, the en/em spaces, line/paragraph
+ * separators, the zero-width set and BOM. `isBlank()` catches a key made ENTIRELY of these, but a key
+ * like `"order-123​"` looks identical to `"order-123"` in every log and dashboard while being a
+ * different key on the wire. Two attempts that a human would swear used "the same key" would then
+ * charge twice, so any such character is fatal.
+ */
+private val UNICODE_WHITESPACE_RE = Regex("[\\u00a0\\u1680\\u2000-\\u200f\\u2028\\u2029\\u202f\\u205f\\u2060\\u3000\\ufeff]")
+
+/** An idempotency key travels in an HTTP header; bound it in BYTES, which is what a server counts. */
+private const val MAX_IDEMPOTENCY_KEY_BYTES = 255
+
+/**
+ * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace keys,
+ * keys carrying control characters or invisible Unicode (neither of which survives an HTTP header
+ * round-trip intact), and over-long values. A caller-supplied key is the ONE thing standing between a
+ * double-click and a double-charge, so a bad one must fail loudly rather than be quietly accepted.
+ * Shared by `collect()` and `simulate.collect()`.
  */
 internal fun assertValidIdempotencyKey(key: String) {
     if (key.isBlank()) {
@@ -44,11 +63,22 @@ internal fun assertValidIdempotencyKey(key: String) {
     }
     if (CONTROL_CHAR_RE.containsMatchIn(key)) {
         throw PaylodInvalidRequestException(
-            "idempotencyKey must not contain control characters (tabs, newlines, NULs, etc.).",
+            "idempotencyKey must not contain control characters (C0/C1 ranges, DEL — tabs, newlines, " +
+                "NULs, etc.). They cannot travel in an HTTP header unaltered.",
         )
     }
-    if (key.length > 255) {
-        throw PaylodInvalidRequestException("idempotencyKey must be 255 characters or fewer.")
+    if (UNICODE_WHITESPACE_RE.containsMatchIn(key)) {
+        throw PaylodInvalidRequestException(
+            "idempotencyKey must not contain non-ASCII whitespace or zero-width/invisible characters " +
+                "(NBSP, zero-width space, BOM, …) — they make two different keys look identical.",
+        )
+    }
+    val bytes = key.toByteArray(Charsets.UTF_8).size
+    if (bytes > MAX_IDEMPOTENCY_KEY_BYTES) {
+        throw PaylodInvalidRequestException(
+            "idempotencyKey must be $MAX_IDEMPOTENCY_KEY_BYTES bytes or fewer when UTF-8 encoded " +
+                "(got $bytes).",
+        )
     }
 }
 

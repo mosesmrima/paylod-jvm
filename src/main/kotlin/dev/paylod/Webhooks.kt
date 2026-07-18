@@ -65,6 +65,12 @@ object Webhooks {
     private val V1_RE = Regex("^[0-9a-f]{64}$")
 
     /**
+     * A well-formed `t` is plain decimal unix seconds — DIGITS ONLY. No sign, no exponent, no hex,
+     * no underscores. Bounded to 19 digits so it cannot overflow a `Long`.
+     */
+    private val T_RE = Regex("^[0-9]{1,19}$")
+
+    /**
      * Parse the signature header STRICTLY. The header is `t=<unix>,v1=<hex>` and nothing else that
      * matters — so we require EXACTLY ONE `t` and EXACTLY ONE `v1`, and reject anything else.
      *
@@ -137,32 +143,50 @@ object Webhooks {
                 "Malformed $SIGNATURE_HEADER header — expected \"t=<unix>,v1=<hex>\".",
             )
 
-        // `t` must always be an integer, regardless of tolerance — a non-numeric timestamp is malformed.
+        // `t` is validated LEXICALLY, not just by `toLongOrNull()`. Kotlin's parser accepts a leading
+        // `+`/`-` sign, and a looser numeric parse would accept `1e3` or hex. The signed header field
+        // is specified as plain decimal unix seconds, so anything else is a malformed header from a
+        // non-conforming (or hostile) signer and must be refused rather than coerced.
+        if (!T_RE.matches(parsed.t)) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.MALFORMED_SIGNATURE,
+                "Signature timestamp must be plain decimal unix seconds (digits only).",
+            )
+        }
         val t = parsed.t.toLongOrNull()
             ?: throw PaylodSignatureVerificationException(
                 SignatureFailureReason.MALFORMED_SIGNATURE,
                 "Signature timestamp is not a number.",
             )
 
-        if (toleranceSec > 0) {
-            val now = nowSec ?: (System.currentTimeMillis() / 1000)
-            if (Math.abs(now - t) > toleranceSec) {
-                throw PaylodSignatureVerificationException(
-                    SignatureFailureReason.STALE_TIMESTAMP,
-                    "Signature timestamp is outside the ${toleranceSec}s tolerance (replay?).",
-                )
-            }
-        } else if (nowSec == null) {
-            // A non-positive tolerance would DISABLE replay protection. That is only ever acceptable
-            // with a fixed, injected clock (a pinned test vector). In production — no `nowSec` — refuse
-            // it loudly rather than silently accept replays of any age.
+        // Replay protection is NOT optional and cannot be switched off — not by a caller, not by a
+        // test. A zero/negative tolerance would accept a captured webhook of ANY age, so it is refused
+        // unconditionally. (A `Long` is inherently finite on the JVM, so "non-finite" is unrepresentable
+        // here; the equivalent hole in a floating-point port is closed by the same `<= 0` rejection.)
+        // A fixed-vector test pins the clock with `nowSec` and keeps a NORMAL positive window.
+        if (toleranceSec <= 0) {
             throw PaylodSignatureVerificationException(
                 SignatureFailureReason.INSECURE_TOLERANCE,
-                "toleranceSec must be a positive number of seconds. A non-positive tolerance disables " +
-                    "webhook replay protection and is only permitted in tests that inject a fixed nowSec.",
+                "toleranceSec must be a positive number of seconds — a non-positive tolerance would " +
+                    "disable webhook replay protection entirely. To verify a pinned fixture, keep a " +
+                    "normal tolerance and inject the fixture's own clock via nowSec.",
             )
         }
-        // else: toleranceSec <= 0 AND a fixed `nowSec` was injected — a deterministic fixed-vector test.
+        // An injected clock is still a clock: a negative or absurd `nowSec` is a caller bug that would
+        // silently widen (or invert) the window, so validate it rather than trust it.
+        if (nowSec != null && nowSec < 0) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INSECURE_TOLERANCE,
+                "nowSec must be a non-negative unix timestamp in seconds (got $nowSec).",
+            )
+        }
+        val now = nowSec ?: (System.currentTimeMillis() / 1000)
+        if (Math.abs(now - t) > toleranceSec) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.STALE_TIMESTAMP,
+                "Signature timestamp is outside the ${toleranceSec}s tolerance (replay?).",
+            )
+        }
 
         val expected = hmacHex(secret, parsed.t, payload)
         val a = expected.toByteArray(StandardCharsets.UTF_8)

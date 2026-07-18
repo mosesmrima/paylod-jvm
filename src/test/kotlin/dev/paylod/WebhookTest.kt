@@ -42,21 +42,26 @@ class WebhookTest {
 
         assertEquals(goldenHeader, Webhooks.sign(goldenBody, goldenSecret, goldenT))
 
-        // The verifier accepts its own signer's golden output. The fixed vector pins the clock via
-        // `nowSec` (freshness is deterministic), the sanctioned way to verify an ancient fixture — a
-        // non-positive `toleranceSec` on its own is now refused in production.
+        // The verifier accepts its own signer's golden output. The fixed vector pins the CLOCK via
+        // `nowSec` and keeps a NORMAL positive tolerance — replay protection is never disabled, not
+        // even for a pinned fixture.
         val event = Webhooks.parseAndVerify(
             payload = goldenBody,
             signature = goldenHeader,
             secret = goldenSecret,
-            toleranceSec = 0,
+            toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC,
             nowSec = goldenT,
         )
         assertEquals("pay_golden", event.data.paymentId)
 
         // And the client's boolean convenience agrees.
         val (paylod, _) = testClient(emptyList())
-        assertTrue(paylod.verifyWebhook(goldenBody, goldenHeader, goldenSecret, toleranceSec = 0, nowSec = goldenT))
+        assertTrue(
+            paylod.verifyWebhook(
+                goldenBody, goldenHeader, goldenSecret,
+                toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = goldenT,
+            ),
+        )
     }
 
     @Test
@@ -151,30 +156,75 @@ class WebhookTest {
     }
 
     @Test
-    fun `verifies an ancient fixture by pinning the clock with nowSec (toleranceSec 0 + fixed clock)`() {
+    fun `verifies an ancient fixture by pinning the clock with nowSec and a NORMAL tolerance`() {
         val header = Webhooks.sign(raw, secret, 1) // ancient
-        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0, nowSec = 1)
+        // The sanctioned way to verify a pinned fixture: keep replay protection on, move the clock.
+        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 300, nowSec = 1)
         assertEquals("pay_123", event.data.paymentId)
     }
 
+    // ── 0.3.0: replay tolerance can no longer be switched off, by anyone ────────────────────
+
     @Test
-    fun `REFUSES toleranceSec 0 in production (no injected clock) — replay protection stays on`() {
+    fun `REFUSES toleranceSec 0 unconditionally — even with an injected clock`() {
         val header = Webhooks.sign(raw, secret, now)
-        val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0)
-        }
-        assertEquals(SignatureFailureReason.INSECURE_TOLERANCE, err.reason)
+        // No injected clock.
+        assertEquals(
+            SignatureFailureReason.INSECURE_TOLERANCE,
+            assertThrows(PaylodSignatureVerificationException::class.java) {
+                Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0)
+            }.reason,
+        )
+        // …and WITH an injected clock. A disabled window is never a legitimate configuration; the
+        // fixed-vector case is served by pinning `nowSec` and keeping a positive tolerance.
+        assertEquals(
+            SignatureFailureReason.INSECURE_TOLERANCE,
+            assertThrows(PaylodSignatureVerificationException::class.java) {
+                Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0, nowSec = now)
+            }.reason,
+        )
     }
 
     @Test
-    fun `REFUSES a negative tolerance too, unless a fixed nowSec is injected`() {
+    fun `REFUSES a negative tolerance unconditionally, injected clock or not`() {
         val header = Webhooks.sign(raw, secret, now)
         assertThrows(PaylodSignatureVerificationException::class.java) {
             Webhooks.parseAndVerify(raw, header, secret, toleranceSec = -5)
         }
-        // …but a fixed clock makes it a legitimate deterministic fixture again.
-        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = -5, nowSec = now)
-        assertEquals("pay_123", event.data.paymentId)
+        assertEquals(
+            SignatureFailureReason.INSECURE_TOLERANCE,
+            assertThrows(PaylodSignatureVerificationException::class.java) {
+                Webhooks.parseAndVerify(raw, header, secret, toleranceSec = -5, nowSec = now)
+            }.reason,
+        )
+        // The boolean convenience must agree — no silent `true`.
+        assertFalse(Webhooks.verify(raw, header, secret, toleranceSec = -5, nowSec = now))
+    }
+
+    @Test
+    fun `REJECTS a negative injected nowSec`() {
+        val header = Webhooks.sign(raw, secret, now)
+        assertEquals(
+            SignatureFailureReason.INSECURE_TOLERANCE,
+            assertThrows(PaylodSignatureVerificationException::class.java) {
+                Webhooks.parseAndVerify(raw, header, secret, nowSec = -1)
+            }.reason,
+        )
+    }
+
+    // ── 0.3.0: `t` is validated lexically, not by a lenient numeric parse ───────────────────
+
+    @Test
+    fun `REJECTS a non-decimal timestamp (exponent, sign, hex)`() {
+        // Each of these is "numeric" to some parser somewhere; none is a valid unix-seconds field.
+        // (A surrounding space is not in this list: the header parser trims values before this point.)
+        for (bad in listOf("1e3", "+1000", "-1000", "0x3e8", "1_000", "1000.0")) {
+            val header = "t=$bad,v1=${"0".repeat(64)}"
+            val err = assertThrows(PaylodSignatureVerificationException::class.java) {
+                Webhooks.parseAndVerify(raw, header, secret, nowSec = now)
+            }
+            assertEquals(SignatureFailureReason.MALFORMED_SIGNATURE, err.reason, "accepted t=$bad")
+        }
     }
 
     @Test

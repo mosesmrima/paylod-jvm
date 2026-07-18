@@ -22,7 +22,7 @@ only the Kotlin standard library.
 
 ```kotlin
 dependencies {
-    implementation("dev.paylod:paylod:0.2.0")
+    implementation("dev.paylod:paylod:0.3.0")
 }
 ```
 
@@ -30,7 +30,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'dev.paylod:paylod:0.2.0'
+    implementation 'dev.paylod:paylod:0.3.0'
 }
 ```
 
@@ -40,7 +40,7 @@ dependencies {
 <dependency>
   <groupId>dev.paylod</groupId>
   <artifactId>paylod</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
 

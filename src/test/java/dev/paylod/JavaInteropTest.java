@@ -104,11 +104,13 @@ class JavaInteropTest {
             + "\"data\":{\"paymentId\":\"pay_9\"}}";
         String header = Webhooks.sign(body, secret, 1700000000L);
 
-        // toleranceSec 0 is only allowed with an injected clock (the ancient fixture is pinned).
-        assertTrue(paylod.verifyWebhook(body, header, secret, 0L, 1700000000L));
-        assertFalse(paylod.verifyWebhook(body, header, "wrong_secret", 0L, 1700000000L));
+        // Replay protection stays ON. The pinned fixture keeps a normal window and moves the clock.
+        assertTrue(paylod.verifyWebhook(body, header, secret, 300L, 1700000000L));
+        assertFalse(paylod.verifyWebhook(body, header, "wrong_secret", 300L, 1700000000L));
+        // A disabled tolerance is refused from Java too.
+        assertFalse(paylod.verifyWebhook(body, header, secret, 0L, 1700000000L));
 
-        WebhookEvent event = paylod.parseWebhook(body, header, secret, 0L, 1700000000L);
+        WebhookEvent event = paylod.parseWebhook(body, header, secret, 300L, 1700000000L);
         assertEquals("pay_9", event.getData().getPaymentId());
         assertEquals(WebhookEventType.PAYMENT_SUCCESS, event.getType());
     }

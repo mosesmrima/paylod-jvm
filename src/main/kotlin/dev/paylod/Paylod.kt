@@ -15,6 +15,9 @@ const val DEFAULT_BASE_URL = "https://paylod.dev/functions/v1"
 private const val MAX_AMOUNT = 150_000
 private const val DEFAULT_WAIT_TIMEOUT_MS = 120_000L
 
+// The ceiling on any single sleep when the operation has no absolute deadline of its own.
+private const val MAX_UNBOUNDED_SLEEP_MS = 60_000L
+
 // Ramp: quick first look, then ease off. Capped at 5s. Values in ms.
 private val POLL_SCHEDULE_MS = longArrayOf(1_000, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000)
 
@@ -168,12 +171,13 @@ class Paylod internal constructor(
             if ((!transient && !inProgress) || attempt == maxRetries) throw apiError
 
             lastError = apiError
-            // Honour Retry-After (clamped to 10s and to the operation deadline). If absent, the
-            // top-of-loop backoff covers the wait.
-            val retryAfter = response.headers["retry-after"]?.toDoubleOrNull()
-            if (retryAfter != null && retryAfter > 0) {
-                boundedSleep(Math.min((retryAfter * 1000).toLong(), 10_000), deadlineMs)
-            }
+            // Honour Retry-After — read case-insensitively, in BOTH RFC 9110 forms, and clamped to the
+            // operation deadline. It is deliberately NOT truncated to a flat 10s: a server that says
+            // "wait 60s" is telling us the request is still in flight on its side, and retrying at 10s
+            // under the same Idempotency-Key just adds load to a system already asking for room.
+            // If the header is absent, the top-of-loop backoff covers the wait.
+            val retryAfterMs = parseRetryAfterMs(headerValue(response.headers, "retry-after"), time.nowMillis())
+            if (retryAfterMs != null) boundedSleep(retryAfterMs, deadlineMs)
             attempt++
         }
 
@@ -184,11 +188,16 @@ class Paylod internal constructor(
     private fun remaining(deadlineMs: Long?): Long? =
         if (deadlineMs == null) null else deadlineMs - time.nowMillis()
 
-    /** A sleep clamped to the operation deadline, so a backoff can never push past [wait]'s cap. */
+    /**
+     * A sleep clamped to the operation deadline, so a backoff — or a server-dictated `Retry-After` —
+     * can never push past [wait]'s cap. When there is NO deadline (a bare `collect()`), the delay is
+     * still ceilinged, so a hostile or broken `Retry-After: 86400` cannot park a caller's thread for
+     * a day.
+     */
     private fun boundedSleep(ms: Long, deadlineMs: Long?) {
         var capped = ms
         val rem = remaining(deadlineMs)
-        if (rem != null) capped = Math.min(capped, Math.max(0L, rem))
+        capped = if (rem != null) Math.min(capped, Math.max(0L, rem)) else Math.min(capped, MAX_UNBOUNDED_SLEEP_MS)
         if (capped > 0) time.sleep(capped)
     }
 
@@ -459,9 +468,38 @@ class Paylod internal constructor(
         val IN_PROGRESS_409_RE = Regex("already in progress", RegexOption.IGNORE_CASE)
 
         /**
-         * Enforce a secure origin for `baseUrl`. HTTPS is required so the API key is never sent in the
-         * clear and a hostile redirect target can't be substituted. Loopback HTTP is permitted ONLY
-         * behind an explicit test-only opt-in, and NEVER with a live (`mp_live_`) key.
+         * The EXACT hosts a paylod key may ever be sent to. Not a suffix match — `endsWith(".paylod.dev")`
+         * would accept any subdomain, including one an attacker gets to point somewhere else.
+         *
+         * `api.paylod.dev` does not route today. It is listed anyway because both names are owned by
+         * paylod, so allowing it cannot let a key reach a host the owner does not control — and its
+         * absence would mean published SDKs hard-reject a legitimate future migration to that host.
+         */
+        val ALLOWED_HOSTS = setOf("paylod.dev", "api.paylod.dev")
+
+        /** The canonical origin, for error messages. */
+        const val CANONICAL_HOST = "paylod.dev"
+
+        private fun isLoopbackHost(host: String): Boolean =
+            host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+
+        /**
+         * Enforce a secure ORIGIN for `baseUrl` — an allowlist, not merely a scheme check.
+         *
+         * HTTPS alone is not enough. `PAYLOD_BASE_URL=https://attacker.example` is still HTTPS, and it
+         * would ship a live `Authorization: Bearer mp_live_…` header to an origin of the attacker's
+         * choosing — a full credential handover from one environment variable. So the host itself must
+         * be one of [ALLOWED_HOSTS] exactly. On top of that we refuse the URL shapes that are used to
+         * smuggle a different effective origin past a naive check:
+         *
+         *   • userinfo (`https://paylod.dev@attacker.example/…`) — the real host is `attacker.example`
+         *   • a missing/empty host, and raw IP literals (private, link-local, loopback, or otherwise)
+         *   • an unexpected port — HTTPS on 443 only
+         *   • a query string or fragment on what is supposed to be a bare API root
+         *
+         * Loopback stays permitted for local development and the test suite — in EITHER scheme, since
+         * an `https://localhost` dev server is no more the canonical origin than a plaintext one — but
+         * ONLY behind the explicit `allowInsecureBaseUrl` opt-in and NEVER with a live (`mp_live_`) key.
          */
         fun assertSecureBaseUrl(baseUrl: String, apiKey: String, allowInsecure: Boolean) {
             val parsed = try {
@@ -470,21 +508,80 @@ class Paylod internal constructor(
                 throw PaylodConfigException("baseUrl is not a valid URL: \"$baseUrl\".")
             }
             val scheme = parsed.scheme?.lowercase()
-            if (scheme == "https") return
-
-            val host = (parsed.host ?: "").lowercase()
-            val isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
             val isLive = apiKey.startsWith("mp_live_")
 
-            if (scheme == "http" && isLoopback && allowInsecure && !isLive) return
-
-            throw PaylodConfigException(
-                "baseUrl must use https:// (got \"$baseUrl\"). Plaintext HTTP would transmit your API " +
-                    "key in the clear and opens you to SSRF / redirection. Loopback HTTP (localhost, " +
-                    "127.0.0.1) is allowed ONLY with allowInsecureBaseUrl = true and NEVER with an " +
-                    "mp_live_ key.",
+            fun reject(why: String): Nothing = throw PaylodConfigException(
+                "baseUrl is not an allowed paylod origin: $why (got \"$baseUrl\"). The API key can move " +
+                    "money, so it is only ever sent to https://$CANONICAL_HOST. Loopback HTTP " +
+                    "(localhost, 127.0.0.1) is allowed ONLY with allowInsecureBaseUrl = true and NEVER " +
+                    "with an mp_live_ key.",
             )
+
+            // `URI` exposes userinfo separately, and reports a null host for the authority shapes it
+            // cannot parse — both are treated as fatal rather than ignored.
+            if (parsed.userInfo != null) reject("the URL carries userinfo, which hides the real host")
+            val host = (parsed.host ?: "").lowercase()
+            if (host.isEmpty()) reject("it has no host")
+            if (parsed.rawQuery != null) reject("it has a query string")
+            if (parsed.rawFragment != null) reject("it has a fragment")
+
+            // Loopback is a DEVELOPMENT posture, and the gate is the same whichever scheme it wears.
+            // Handling it first means an `https://localhost` dev server cannot slip through on the
+            // strength of its scheme alone — it needs the explicit opt-in exactly like plaintext does,
+            // and a live key is refused on both.
+            if (isLoopbackHost(host)) {
+                if (!allowInsecure) {
+                    reject("loopback requires the test-only allowInsecureBaseUrl = true opt-in")
+                }
+                if (isLive) reject("a live mp_live_ key is never sent to a loopback host")
+                if (scheme != "http" && scheme != "https") reject("\"$scheme\" is not an http(s):// URL")
+                return
+            }
+
+            if (scheme == "https") {
+                if (parsed.port != -1 && parsed.port != 443) reject("HTTPS is only allowed on port 443")
+                if (host !in ALLOWED_HOSTS) {
+                    reject("\"$host\" is not one of ${ALLOWED_HOSTS.joinToString(", ")}")
+                }
+                return
+            }
+
+            if (scheme != "http") reject("\"$scheme\" is not an https:// URL")
+            reject("plaintext HTTP would transmit your API key in the clear")
         }
+
+        /** Bounded delta-seconds: digits only, so `1e3`, `+5` and hex can never be read as a delay. */
+        val RETRY_AFTER_SECONDS_RE = Regex("^[0-9]{1,9}$")
+
+        /**
+         * Parse an RFC 9110 `Retry-After` value into a delay in milliseconds, or `null` when it is
+         * absent/unusable. BOTH wire forms are supported — bare delta-seconds (`Retry-After: 30`) and
+         * an HTTP-date (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`) — because real gateways emit
+         * both, and silently ignoring the date form turns a server's explicit "come back later" into
+         * an immediate hammering retry.
+         */
+        fun parseRetryAfterMs(value: String?, nowMs: Long): Long? {
+            val s = value?.trim() ?: return null
+            if (s.isEmpty()) return null
+
+            if (RETRY_AFTER_SECONDS_RE.matches(s)) {
+                val secs = s.toLongOrNull() ?: return null
+                return if (secs > 0) secs * 1000 else null
+            }
+
+            val instant = try {
+                java.time.ZonedDateTime.parse(s, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME)
+                    .toInstant()
+            } catch (e: Exception) {
+                return null
+            }
+            val delta = instant.toEpochMilli() - nowMs
+            return if (delta > 0) delta else null
+        }
+
+        /** Case-insensitive header lookup — a transport is not obliged to hand us lowercased keys. */
+        fun headerValue(headers: Map<String, String>, name: String): String? =
+            headers[name] ?: headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
 
         fun warnMissingIdempotencyKey() {
             if (!warned.compareAndSet(false, true)) return

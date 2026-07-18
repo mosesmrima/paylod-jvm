@@ -2,6 +2,7 @@ package dev.paylod
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -146,6 +147,37 @@ class DarajaCatalogTest {
             StkOutcome.FAILED,
             DarajaCatalog.classifyStkResult("500.001.1001", "The balance is insufficient funds"),
         )
+    }
+
+    // ── 0.3.0: an explicit non-STK decode can NEVER return an STK pending entry ─────────────
+
+    @Test
+    fun `4999 on the api_error surface decodes terminally, never as STK pending`() {
+        val d = DarajaCatalog.decodeError("4999", null, DarajaFamily.API_ERROR)
+        assertEquals("4999", d.code)
+        // 4999 exists ONLY as an STK *pending* entry. Asked about it on a terminal surface, the
+        // decoder must not hand back "payment still in progress" — that would tell a caller to keep
+        // polling a code that arrived on a surface with no in-flight semantics at all.
+        assertNotEquals(DarajaCategory.PENDING, d.category)
+        assertEquals("Payment failed", d.title)
+        // And it must never be advertised as safe to charge again.
+        assertFalse(d.retryable)
+    }
+
+    @Test
+    fun `4999 on the b2c_c2b_result surface decodes terminally too`() {
+        val d = DarajaCatalog.decodeError("4999", "Some B2C result", DarajaFamily.B2C_C2B_RESULT)
+        assertNotEquals(DarajaCategory.PENDING, d.category)
+        assertFalse(d.retryable)
+        // The raw description survives into the cause, so the caller keeps the operator's own words.
+        assertTrue(d.cause.contains("Some B2C result"))
+    }
+
+    @Test
+    fun `the STK surface still treats 4999 as pending — family-awareness cuts one way only`() {
+        val d = DarajaCatalog.decodeError("4999")
+        assertEquals(DarajaCategory.PENDING, d.category)
+        assertFalse(d.retryable)
     }
 
     @Test
