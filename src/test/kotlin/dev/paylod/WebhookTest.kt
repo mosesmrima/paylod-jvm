@@ -42,26 +42,32 @@ class WebhookTest {
 
         assertEquals(goldenHeader, Webhooks.sign(goldenBody, goldenSecret, goldenT))
 
-        // The verifier accepts its own signer's golden output. The fixed vector pins the CLOCK via
-        // `nowSec` and keeps a NORMAL positive tolerance — replay protection is never disabled, not
-        // even for a pinned fixture.
-        val event = Webhooks.parseAndVerify(
+        // The verifier accepts its own signer's golden output, AT THE SIGNATURE LAYER. The vector
+        // pins the SIGNING SCHEME; its body is a minimal signing fixture, not a representative
+        // event, so it is verified with `verifySignature`. `parseAndVerify` additionally enforces
+        // the event schema, which has its own tests rather than being covered by editing these
+        // cross-repo-pinned literals. The fixed vector pins the CLOCK via `nowSec` and keeps a
+        // NORMAL positive tolerance — replay protection is never disabled, not even here.
+        val body = Webhooks.verifySignature(
             payload = goldenBody,
             signature = goldenHeader,
             secret = goldenSecret,
             toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC,
             nowSec = goldenT,
         )
-        assertEquals("pay_golden", event.data.paymentId)
+        @Suppress("UNCHECKED_CAST")
+        val data = body["data"] as Map<String, Any?>
+        assertEquals("pay_golden", data["paymentId"])
 
-        // And the client's boolean convenience agrees.
-        val (paylod, _) = testClient(emptyList())
-        assertTrue(
-            paylod.verifyWebhook(
+        // The minimal vector is NOT a valid event: it carries no `data.status` and nothing that
+        // evidences a settled payment, so the full parser refuses it. A signature proves who sent
+        // the bytes, never that they mean what a handler would assume.
+        assertThrows(PaylodSignatureVerificationException::class.java) {
+            Webhooks.parseAndVerify(
                 goldenBody, goldenHeader, goldenSecret,
                 toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = goldenT,
-            ),
-        )
+            )
+        }
     }
 
     @Test
@@ -287,7 +293,7 @@ class WebhookTest {
         val (paylod, _) = testClient(emptyList())
         val decoded = paylod.decodeError(1037)
         val failedBody =
-            """{"type":"payment.failed","created":1700000000,"data":{"paymentId":"pay_123","status":"failed","resultCode":1037,"resultDesc":"DS timeout","decoded":{"code":"${decoded.code}","title":"${decoded.title}","cause":"","fix":"","category":"customer","retryable":true,"customerMessage":"${decoded.customerMessage}"}}}"""
+            """{"type":"payment.failed","created":1700000000,"data":{"paymentId":"pay_123","status":"failed","amount":100,"resultCode":1037,"resultDesc":"DS timeout","decoded":{"code":"${decoded.code}","title":"${decoded.title}","cause":"","fix":"","category":"customer","retryable":true,"customerMessage":"${decoded.customerMessage}"}}}"""
         val event = Webhooks.parseAndVerify(failedBody, Webhooks.sign(failedBody, secret, now), secret, nowSec = now)
         assertEquals(WebhookEventType.PAYMENT_FAILED, event.type)
         assertEquals(

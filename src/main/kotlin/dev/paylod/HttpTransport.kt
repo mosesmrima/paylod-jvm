@@ -70,7 +70,7 @@ internal class RedactingHeaders(
 }
 
 /** A single HTTP response, as the SDK sees it. */
-data class HttpResponseSpec(
+data class HttpResponseSpec @JvmOverloads constructor(
     val status: Int,
     val headers: Map<String, String>,
     val body: String,

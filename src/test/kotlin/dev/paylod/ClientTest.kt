@@ -3,6 +3,7 @@ package dev.paylod
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -18,7 +19,13 @@ class ClientTest {
         val (paylod, t) = testClient(listOf(Step(status = 202, json = ACK)))
         paylod.collect("0712345678", 1, idempotencyKey = "k")
         assertEquals("https://paylod.dev/functions/v1/collect", t.calls[0].url)
-        assertEquals("Bearer $key", t.calls[0].headers["authorization"])
+        // THE CREDENTIAL IS NOT HERE. A custom transport is a test seam and receives no bearer
+        // token at all — the SDK-owned dispatch adds it after this boundary, from a private field.
+        assertNull(t.calls[0].headers["authorization"], "the API key reached a custom transport")
+        assertFalse(
+            t.calls[0].headers.values.any { it.contains(key) },
+            "the API key appeared in some other header handed to a custom transport",
+        )
     }
 
     @Test

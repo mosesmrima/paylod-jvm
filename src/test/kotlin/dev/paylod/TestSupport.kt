@@ -80,12 +80,19 @@ fun testClient(
     timeoutMs: Long = 30_000,
 ): Pair<Paylod, StubTransport> {
     val transport = StubTransport(steps)
+    // A custom transport is REFUSED for a live key, structurally — so a test that needs a live key
+    // (base-URL allowlist checks, sandbox-only gates) gets a client with no seam at all. That is not
+    // a workaround; it is the guarantee being exercised.
+    val live = apiKey.startsWith("mp_live_")
     val options = PaylodOptions.of(
         baseUrl = baseUrl,
         webhookSecret = webhookSecret,
         maxRetries = maxRetries,
         timeoutMs = timeoutMs,
-        transport = transport,
+        transport = if (live) null else transport,
+        // A custom transport is a gated test seam now. This is a test, so the gate is opened
+        // explicitly — which is exactly the posture the gate exists to force.
+        allowCustomTransport = !live,
         simulate = simulate,
         allowInsecureBaseUrl = allowInsecureBaseUrl,
     )
@@ -102,7 +109,9 @@ fun testClientWithClock(
 ): Triple<Paylod, StubTransport, FakeTimeSource> {
     val transport = StubTransport(steps)
     val clock = FakeTimeSource(now)
-    val options = PaylodOptions.of(maxRetries = maxRetries, transport = transport)
+    val options = PaylodOptions.of(
+        maxRetries = maxRetries, transport = transport, allowCustomTransport = true,
+    )
     return Triple(Paylod(apiKey, options, clock, Random(1)), transport, clock)
 }
 

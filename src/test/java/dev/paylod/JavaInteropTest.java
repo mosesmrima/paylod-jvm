@@ -46,6 +46,7 @@ class JavaInteropTest {
     private Paylod client() {
         PaylodOptions options = PaylodOptions.builder()
             .transport(stub())
+            .allowCustomTransport(true)
             .maxRetries(0)
             .build();
         return new Paylod(KEY, options);
@@ -100,8 +101,11 @@ class JavaInteropTest {
     void verifyWebhookBoolean() {
         Paylod paylod = client();
         String secret = "whsec_test";
+        // A COMPLETE event: the verifier now enforces the full schema, the type/status agreement,
+        // and the evidence that a success actually settled. A bare `{paymentId}` is refused.
         String body = "{\"type\":\"payment.success\",\"created\":1700000000,"
-            + "\"data\":{\"paymentId\":\"pay_9\"}}";
+            + "\"data\":{\"paymentId\":\"pay_9\",\"status\":\"success\",\"amount\":100,"
+            + "\"mpesaReceipt\":\"SFF6XYZ123\",\"resultCode\":0}}";
         String header = Webhooks.sign(body, secret, 1700000000L);
 
         // Replay protection stays ON. The pinned fixture keeps a normal window and moves the clock.

@@ -28,11 +28,17 @@ class ThirdRoundTest {
         val (paylod, _) = testClient(
             listOf(Step(json = mapOf("id" to "pay_123", "status" to "success"))),
         )
-        val err = assertThrows<PaylodApiException> { paylod.check("pay_123") }
-        assertTrue(err.indeterminate, "a malformed 2xx status must be INDETERMINATE")
-        assertTrue(
-            err.message!!.contains("NEITHER an mpesaReceipt NOR a resultCode"),
-            "unhelpful message: ${err.message}",
+        // The rule now lives in the SEMANTIC MODEL (law L2) rather than in the shape validator: the
+        // body is well-formed, so it is accepted and then JUDGED. A claim with nothing behind it is
+        // INDETERMINATE — rendered as PENDING so `wait()` keeps polling and a webhook can settle it,
+        // never as a paid payment a caller would fulfil.
+        val outcome = paylod.check("pay_123")
+        assertFalse(outcome.paid, "a bare status:success with no evidence must never be paid")
+        assertFalse(outcome.retryable, "an indeterminate payment is never safe to charge again")
+        assertEquals(OutcomeStatus.PENDING, outcome.status)
+        assertEquals(
+            PaymentVerdict.INDETERMINATE,
+            PaymentSemantics.judge(outcome.payment).verdict,
         )
     }
 
@@ -136,7 +142,10 @@ class ThirdRoundTest {
         val (paylod, _) = testClient(
             listOf(
                 Step(status = 202, json = ACK),
-                Step(json = mapOf("id" to "pay_123", "status" to "success")), // no evidence
+                // A body describing a DIFFERENT payment — law L1. It is not merely malformed, it is
+                // an answer to another question, and it must reach the caller with the handles to
+                // the charge that is live right now.
+                Step(json = mapOf("id" to "pay_SOMEONE_ELSE", "status" to "success", "resultCode" to "0")),
             ),
         )
         val err = assertThrows<PaylodApiException> {
@@ -218,7 +227,7 @@ class ThirdRoundTest {
         }
         val paylod = Paylod(
             "mp_test_abc123",
-            PaylodOptions.of(maxRetries = 2, transport = transport),
+            PaylodOptions.of(maxRetries = 2, transport = transport, allowCustomTransport = true),
             RealTimeSource,
             Random(1),
         )
@@ -270,57 +279,61 @@ class ThirdRoundTest {
             printed = req.headers.toString()
             HttpResponseSpec(202, emptyMap(), Json.write(ACK))
         }
-        val paylod = Paylod("mp_test_supersecret", PaylodOptions.of(transport = transport))
+        val paylod = Paylod("mp_test_supersecret", PaylodOptions.of(transport = transport, allowCustomTransport = true))
         paylod.collect("0712345678", 100, idempotencyKey = "k1")
         assertFalse(printed.contains("mp_test_supersecret"), "bearer token leaked: $printed")
         assertFalse(printed.contains("k1"), "idempotency key leaked: $printed")
     }
 
+    // ── HIGH: the no-redirect guarantee is not bypassable ────────────────────────────────────
+    //
+    // `JdkHttpTransport` no longer exists as a public class. The guarantees it used to carry —
+    // Redirect.NEVER, and a header-assembly guard that never echoes a secret-bearing value — moved
+    // INSIDE the SDK-owned `Transport`, where a caller cannot reach them to replace them. The tests
+    // below pin the guarantees rather than the vanished class.
+
+    @Test
+    fun `the SDK-owned dispatch never follows a redirect`() {
+        // There is no constructor, factory or option that yields a credentialed dispatch on a
+        // redirect-following client: the only HttpClient the SDK ever builds is built here, once,
+        // with Redirect.NEVER. Reverting that line is caught by the mutation harness.
+        val source = java.io.File("src/main/kotlin/dev/paylod/Transport.kt").readText()
+        assertTrue(
+            source.contains(".followRedirects(HttpClient.Redirect.NEVER)"),
+            "the SDK-owned dispatch must pin Redirect.NEVER",
+        )
+        // There is exactly ONE `followRedirects` call in the whole SDK, so there is no second,
+        // laxer client for a caller (or a future edit) to reach.
+        assertEquals(
+            1,
+            Regex("\\.followRedirects\\(").findAll(source).count(),
+            "more than one redirect policy is configured",
+        )
+    }
+
     @Test
     fun `a header the JDK refuses is reported WITHOUT its value`() {
-        val transport = JdkHttpTransport()
+        // The API key is validated at construction, so the only way to reach the transport's header
+        // guard is an idempotency key the JDK rejects — and its value must not be echoed either.
+        val transport = Transport(
+            apiKey = "mp_test_abc123",
+            baseUrl = "https://paylod.dev/functions/v1",
+            custom = null,
+            redact = dev.paylod.internal.Redactor(listOf("mp_test_abc123")),
+        )
         val err = assertThrows<PaylodConfigException> {
-            transport.execute(
-                HttpRequestSpec(
-                    "GET",
-                    "https://paylod.dev/functions/v1/status/x",
-                    linkedMapOf("authorization" to "Bearer mp_live_supersecret"),
-                    null,
-                    1_000,
+            transport.send(
+                TransportRequest(
+                    method = "POST",
+                    path = "/collect",
+                    body = "{}",
+                    idempotencyKey = "bad\u0000value-supersecret",
+                    timeoutMs = 1_000,
                 ),
             )
         }
-        assertFalse(err.message!!.contains("supersecret"), "the API key leaked: ${err.message}")
-        assertTrue(err.message!!.contains("authorization"), "should name the header: ${err.message}")
-    }
-
-    // ── HIGH: the no-redirect guarantee is not bypassable ────────────────────────────────────
-
-    @Test
-    fun `a JdkHttpTransport cannot be built on a redirect-following HttpClient`() {
-        for (policy in listOf(HttpClient.Redirect.NORMAL, HttpClient.Redirect.ALWAYS)) {
-            val following = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(1))
-                .followRedirects(policy)
-                .build()
-            assertThrows<PaylodConfigException>("accepted a $policy client") {
-                JdkHttpTransport.withClient(following)
-            }
-        }
-        // The compliant one is still accepted.
-        JdkHttpTransport.withClient(
-            HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build(),
-        )
-    }
-
-    @Test
-    fun `the HttpClient-taking constructor is not reachable from JVM bytecode`() {
-        val ctor = JdkHttpTransport::class.java.declaredConstructors
-            .first { it.parameterTypes.contentEquals(arrayOf(HttpClient::class.java)) }
-        assertFalse(
-            java.lang.reflect.Modifier.isPublic(ctor.modifiers),
-            "the client-taking constructor is public bytecode — anyone can inject a redirecting client",
-        )
+        assertFalse(err.message!!.contains("supersecret"), "the header value leaked: ${err.message}")
+        assertTrue(err.message!!.contains("idempotency-key"), "should name the header: ${err.message}")
     }
 
     @Test
@@ -332,7 +345,7 @@ class ThirdRoundTest {
         )
         val paylod = Paylod(
             "mp_test_abc123",
-            PaylodOptions.of(maxRetries = 3, transport = transport),
+            PaylodOptions.of(maxRetries = 3, transport = transport, allowCustomTransport = true),
         )
         val err = assertThrows<PaylodApiException> {
             paylod.collect("0712345678", 100, idempotencyKey = "k-302")
@@ -412,7 +425,7 @@ class ThirdRoundTest {
         val clock = FakeTimeSource(now = 1_700_000_000_000L, mono = 0)
         val paylod = Paylod(
             "mp_test_abc123",
-            PaylodOptions.of(transport = transport),
+            PaylodOptions.of(transport = transport, allowCustomTransport = true),
             clock,
             Random(1),
         )
@@ -448,7 +461,7 @@ class ThirdRoundTest {
             listOf(Step(status = 202, json = ACK), Step(json = paymentJson(status = "pending"))),
         )
         val clock = FakeTimeSource(now = 1_700_000_000_000L, mono = 0)
-        val paylod = Paylod("mp_test_abc123", PaylodOptions.of(transport = transport), clock, Random(1))
+        val paylod = Paylod("mp_test_abc123", PaylodOptions.of(transport = transport, allowCustomTransport = true), clock, Random(1))
         val onPoll = PollListener { clock.now += 86_400_000L } // wall clock leaps a day forward
 
         val err = assertThrows<PaylodTimeoutException> {
