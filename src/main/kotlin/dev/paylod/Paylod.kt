@@ -723,17 +723,50 @@ class Paylod internal constructor(
          * an `https://localhost` dev server is no more the canonical origin than a plaintext one — but
          * ONLY behind the explicit `allowInsecureBaseUrl` opt-in and NEVER with a live (`mp_live_`) key.
          */
+        /**
+         * Render a rejected URL with the credential-bearing parts REMOVED.
+         *
+         * This message is an ordinary configuration error. It is thrown at construction — before a
+         * [dev.paylod.internal.Redactor] exists — and it goes wherever the application logs startup
+         * failures, which is routinely a shared aggregator. Echoing the raw value therefore
+         * published exactly the things people embed in a base URL and never intend to log:
+         *
+         *   • userinfo — `https://svc:sup3rsecret@host/…`, a password in the authority
+         *   • the query string — `?token=…`, `?apikey=…`
+         *   • the fragment — the same, for a caller who put it there
+         *
+         * And these are not exotic inputs; they are three of the shapes this very function REJECTS,
+         * so the rejection was the thing that leaked them. Scheme, host, port and path survive,
+         * because the operator still has to be able to tell which origin was refused and why — a
+         * sanitized message that says nothing is a message that gets replaced by a raw one.
+         */
+        private fun sanitizeUrl(parsed: URI): String {
+            val scheme = parsed.scheme ?: "?"
+            val host = parsed.host ?: "?"
+            val port = if (parsed.port != -1) ":${parsed.port}" else ""
+            val path = parsed.path ?: ""
+            val redactedUserInfo = if (parsed.userInfo != null) "<redacted>@" else ""
+            val suffix = if (parsed.rawQuery != null || parsed.rawFragment != null) {
+                " (query/fragment omitted)"
+            } else {
+                ""
+            }
+            return "$scheme://$redactedUserInfo$host$port$path$suffix"
+        }
+
         fun assertSecureBaseUrl(baseUrl: String, apiKey: String, allowInsecure: Boolean) {
             val parsed = try {
                 URI(baseUrl)
             } catch (e: Exception) {
-                throw PaylodConfigException("baseUrl is not a valid URL: \"$baseUrl\".")
+                // Not the raw value: a URL that failed to PARSE can still contain a credential, and
+                // this message is headed for a log.
+                throw PaylodConfigException("baseUrl is not a valid URL.")
             }
             val scheme = parsed.scheme?.lowercase()
             val isLive = apiKey.startsWith("mp_live_")
 
             fun reject(why: String): Nothing = throw PaylodConfigException(
-                "baseUrl is not an allowed paylod origin: $why (got \"$baseUrl\"). The API key can move " +
+                "baseUrl is not an allowed paylod origin: $why (got \"${sanitizeUrl(parsed)}\"). The API key can move " +
                     "money, so it is only ever sent to https://$CANONICAL_HOST. Loopback HTTP " +
                     "(localhost, 127.0.0.1) is allowed ONLY with allowInsecureBaseUrl = true and NEVER " +
                     "with an mp_live_ key.",
