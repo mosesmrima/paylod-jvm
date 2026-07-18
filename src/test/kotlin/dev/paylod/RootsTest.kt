@@ -447,8 +447,21 @@ class RootsTest {
         assertTrue(err.indeterminate)
 
         // And an unevidenced success is judged, not trusted.
+        //
+        // `webhookQueued` is present because it is now a REQUIRED boolean — a missing one is refused
+        // rather than reported as `true`. What this test guards is unchanged: the point here is that
+        // a success claim with no evidence is not rendered as paid, and the field is supplied so the
+        // assertion below is reached on its own merits rather than short-circuited by an unrelated
+        // rejection. The `webhookQueued` rule itself is guarded by `nv-sim-webhookqueued`.
         val noEvidence = testClient(
-            listOf(Step(status = 200, json = mapOf("paymentId" to "pay_1", "status" to "success"))),
+            listOf(
+                Step(
+                    status = 200,
+                    json = mapOf(
+                        "paymentId" to "pay_1", "status" to "success", "webhookQueued" to true,
+                    ),
+                ),
+            ),
         )
         val outcome = noEvidence.first.simulate.outcome("pay_1", SimOutcomeId.APPROVE)
         assertFalse(outcome.paid, "simulate.outcome() returned paid with no evidence")
