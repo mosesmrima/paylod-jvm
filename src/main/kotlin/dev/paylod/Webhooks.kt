@@ -43,6 +43,27 @@ object Webhooks {
      */
     const val MAX_TOLERANCE_SEC = 3_600L
 
+    /**
+     * The largest webhook body this SDK will process, in bytes.
+     *
+     * ── Why a bound has to exist at all ──────────────────────────────────────────────────────
+     * These bytes arrive from an UNAUTHENTICATED sender. That is not a hypothetical: the whole
+     * purpose of the signature check is that anyone can POST to a webhook endpoint and only the
+     * signature distinguishes paylod from everyone else. But the signature is computed OVER the
+     * body, so every byte is copied into a `String`, HMAC'd, and parsed before the verdict exists.
+     * Until this bound, a sender who supplied a syntactically well-formed but bogus signature could
+     * hand over a body of any size and have the process allocate and hash all of it — a rejection
+     * that costs the receiver arbitrarily more than it costs the sender.
+     *
+     * The limit is deliberately conservative. A paylod event is a few hundred bytes; 1 MiB is three
+     * orders of magnitude of headroom and still bounds the work an anonymous caller can command.
+     *
+     * The transport enforces its OWN, separate ceiling on API responses. This one is independent
+     * because a webhook body never passes through a transport — it comes from the caller's HTTP
+     * framework, and a guard that lives in a layer this path does not traverse is not a guard.
+     */
+    const val MAX_PAYLOAD_BYTES = 1024 * 1024
+
     private fun hmacHex(secret: String, timestamp: String, body: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(secret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
@@ -72,7 +93,7 @@ object Webhooks {
         payload: String,
         secret: String,
         timestampSec: Long = System.currentTimeMillis() / 1000,
-    ): String = sign(payload.toByteArray(StandardCharsets.UTF_8), secret, timestampSec)
+    ): String = sign(boundedBytes(payload), secret, timestampSec)
 
     private data class Header(val t: String, val v1: String)
 
@@ -172,7 +193,7 @@ object Webhooks {
         secret: String,
         toleranceSec: Long,
         nowSec: Long?,
-    ): WebhookEvent = parseAndVerifyAt(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
+    ): WebhookEvent = parseAndVerifyAt(boundedBytes(payload), signature, secret, toleranceSec, nowSec)
 
     /**
      * Verify ONLY the signature and return the parsed JSON body, without the event-schema checks.
@@ -202,6 +223,10 @@ object Webhooks {
         toleranceSec: Long,
         nowSec: Long?,
     ): Map<String, Any?> {
+        // FIRST, before the secret check, the signature parse, the UTF-8 copy, the HMAC and the
+        // parser. Every ByteArray path in this object funnels through here, so this is the one
+        // place the bound has to hold — and it holds before anything expensive happens.
+        assertWithinLimit(payload.size)
         if (secret.isEmpty()) {
             throw PaylodSignatureVerificationException(
                 SignatureFailureReason.MISSING_SIGNATURE,
@@ -310,7 +335,7 @@ object Webhooks {
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
     ): Map<String, Any?> = verifySignatureAt(
-        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, null,
+        boundedBytes(payload), signature, secret, toleranceSec, null,
     )
 
     /** The internal fixed-clock seam, `String` overload. */
@@ -321,7 +346,7 @@ object Webhooks {
         toleranceSec: Long,
         nowSec: Long?,
     ): Map<String, Any?> = verifySignatureAt(
-        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec,
+        boundedBytes(payload), signature, secret, toleranceSec, nowSec,
     )
 
     @JvmStatic
@@ -332,7 +357,7 @@ object Webhooks {
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
     ): WebhookEvent = parseAndVerifyAt(
-        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, null,
+        boundedBytes(payload), signature, secret, toleranceSec, null,
     )
 
     /**
@@ -375,16 +400,62 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-    ): Boolean = verifyAt(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, null)
+    ): Boolean = verifyAt(payload, signature, secret, toleranceSec, null)
 
-    /** The internal fixed-clock seam, `String` overload. */
+    /**
+     * The internal fixed-clock seam, `String` overload.
+     *
+     * The size check lives INSIDE the try, not in the argument expression: the boolean convenience
+     * must return `false` for every rejection uniformly, and an oversized body is a rejection like
+     * any other. Bounding it at the call site would have made this the one overload that throws.
+     */
     internal fun verifyAt(
         payload: String,
         signature: String?,
         secret: String,
         toleranceSec: Long,
         nowSec: Long?,
-    ): Boolean = verifyAt(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
+    ): Boolean = try {
+        verifyAt(boundedBytes(payload), signature, secret, toleranceSec, nowSec)
+    } catch (e: PaylodSignatureVerificationException) {
+        false
+    }
+
+    /**
+     * Refuse an oversized body BEFORE it is converted, hashed or parsed.
+     *
+     * Order is the entire point. Checking after the UTF-8 copy, or after the HMAC, would mean the
+     * allocation and the hashing — the actual costs — had already been paid on behalf of a sender
+     * who has proved nothing. The refusal happens on the length alone, which is free.
+     */
+    private fun assertWithinLimit(byteCount: Int) {
+        if (byteCount > MAX_PAYLOAD_BYTES) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INVALID_PAYLOAD,
+                "Webhook body is $byteCount bytes, past the $MAX_PAYLOAD_BYTES-byte limit this SDK " +
+                    "will process. It was refused WITHOUT computing a signature over it: these bytes " +
+                    "come from an unauthenticated sender, and hashing an unbounded body on their " +
+                    "say-so is work anyone could command. A genuine paylod event is a few hundred bytes.",
+            )
+        }
+    }
+
+    /**
+     * The `String` overloads' single conversion point, guarded BEFORE it converts.
+     *
+     * A UTF-8 encoding is never SHORTER than the character count, so a string past the limit in
+     * chars is necessarily past it in bytes — which lets the refusal happen before `toByteArray`
+     * allocates the very copy this bound exists to prevent. The post-conversion size is then
+     * checked too, because a multi-byte string can be under the limit in chars and over it in
+     * bytes. Every `String` overload routes through here rather than calling `toByteArray` itself,
+     * so there is no overload left that can convert an unbounded body.
+     */
+    private fun boundedBytes(payload: String): ByteArray {
+        if (payload.length > MAX_PAYLOAD_BYTES) assertWithinLimit(payload.length)
+        val bytes = payload.toByteArray(StandardCharsets.UTF_8)
+        assertWithinLimit(bytes.size)
+        return bytes
+    }
 
     /** Reject with a consistent, non-leaking message. */
     private fun invalid(detail: String): Nothing = throw PaylodSignatureVerificationException(
