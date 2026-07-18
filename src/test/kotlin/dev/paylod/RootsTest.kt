@@ -438,8 +438,22 @@ class RootsTest {
         // `simulate.outcome()` previously did no validation at all: it read the ack straight into a
         // Payment, so a body for a DIFFERENT payment, or a success with no evidence, came back as
         // this payment's outcome.
+        // `webhookQueued` is present for a REASON, and the non-vacuity harness is what surfaced it.
+        // Without it this fixture is rejected by the (unrelated) webhookQueued check, which throws
+        // the same indeterminate PaylodApiException the assertion below looks for — so the test
+        // passed even with the ID-BINDING check reverted, and reported a protection it was no
+        // longer exercising. Supplying the field forces the rejection to come from binding, which
+        // is the only thing this test claims to prove.
         val wrongPayment = testClient(
-            listOf(Step(status = 200, json = mapOf("paymentId" to "pay_OTHER", "status" to "success", "resultCode" to 0))),
+            listOf(
+                Step(
+                    status = 200,
+                    json = mapOf(
+                        "paymentId" to "pay_OTHER", "status" to "success", "resultCode" to 0,
+                        "webhookQueued" to true,
+                    ),
+                ),
+            ),
         )
         val err = assertThrows<PaylodApiException> {
             wrongPayment.first.simulate.outcome("pay_MINE", SimOutcomeId.APPROVE)

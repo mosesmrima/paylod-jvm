@@ -4,6 +4,96 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-18
+
+A sixth independent review, conducted against the threat model in `SECURITY.md`, found no
+criticals and the shortest defect list of the six rounds — a normal pre-release set. Every fix
+carries a test that is verified non-vacuously. Signing is unchanged (the shared golden webhook
+vector still matches byte-for-byte) and the Java interop suite still passes.
+
+### The non-vacuity harness could report CAUGHT for work it had not verified — fixed FIRST
+
+This is listed first because it invalidated the evidence for everything else. `scripts/non-vacuity.py`
+scraped the `NVCOUNT` line and returned, discarding two signals it already had:
+
+- **The gradle exit code.** Under `-PnvTag` the test task sets `ignoreFailures`, so a tagged run
+  exits 0 even when its tests fail — failure travels through the counters, never the exit status.
+  A non-zero exit therefore never means "a test failed"; it means the build did not finish. But
+  `NVCOUNT` is printed from `doLast` and was happily scraped out of exactly such a partial run, so
+  a crashed build could be accepted as a measurement — and if it crashed after some tests had
+  failed, accepted as CAUGHT.
+- **The skipped count**, captured by the regex as group 3 and then dropped. `ran` counts a skipped
+  test, so a case whose guarding test was disabled or filtered still cleared the liveness gate and
+  then "passed" the mutated run without ever executing. That is the vacuity the harness exists to
+  detect, wearing a green badge.
+
+A measurement is now trusted only with **exit code zero AND zero skipped tests**, on the clean run
+and the mutated run alike; anything else is classified as broken rather than as a verdict. Both
+runs are carried into the final table, so every number a verdict rests on is shown. The full sweep
+was re-run after this fix and every prior verdict re-confirmed.
+
+### A raw JSON `-0` was laundered into the canonical success code
+
+`DarajaCatalog.isCanonicalSuccessCode` names `-0` as an impostor and rejects it, and 0.6.0 proved
+that — for the *quoted* `"-0"`. A raw, unquoted `-0` never reached the check as `-0`: `"-0".toLong()`
+is `0L`, so the JSON reader handed downstream an integral zero with the sign already gone, and the
+exact-zero check correctly said yes to what it was given. The guard was right; a lower layer had
+normalized the impostor into canonical form before the guard could see it. A signed
+`{"resultCode":-0}` therefore manufactured SUCCESS evidence on both the status path and the webhook
+path — the difference between INDETERMINATE and PAID.
+
+- The reader now returns the `Double` `-0.0`, the one JVM value that represents negative zero
+  distinctly, so classification refuses it exactly as it always refused a float zero. It is
+  deliberately not rejected at parse time: `-0` is legal JSON and must round-trip inside an
+  arbitrary `metadata` map. Rejection belongs at classification.
+- The **writer** is fixed to match. `Json.write(-0.0)` emitted the token `0`, re-creating the same
+  laundering on the way out — which is why a raw impostor could not survive a round-trip through a
+  stub and the defect stayed invisible to any test built on one. The regression tests construct the
+  wire body as text.
+
+### A stalled response body could park the caller forever, hiding a live charge
+
+`BodyHandlers.ofInputStream()` completes as soon as the headers arrive, and `HttpRequest.timeout`
+stops applying at exactly that point — so every byte of the body was read outside the request timer
+with no deadline of any kind. A server that sent headers and then stopped writing parked the calling
+thread indefinitely, and the JDK's response stream swallows interrupts, so the thread could not
+reliably be broken out of even deliberately. The request had already been dispatched, so a charge
+may have been raised and the idempotency key needed to ask about it was held in the stuck frame.
+
+- The body is consumed by a bounded `BodySubscriber` driven through `sendAsync`, whose future
+  completes only once the body is fully read. One deadline now covers connect, headers **and** body,
+  with an explicit `cancel` on expiry so the exchange is torn down rather than leaked.
+- The size ceiling is still enforced *during* the read, so an oversized body is never materialised.
+- Verified against a real loopback server that sends headers and then stalls.
+
+### Webhook bodies are size-bounded before conversion, HMAC and parsing
+
+A webhook body arrives from an unauthenticated sender — that is the premise of the signature check,
+not an edge case. But the signature is computed over the body, so every byte was copied, HMAC'd and
+parsed before any verdict existed. A sender supplying a well-formed but bogus signature could hand
+over a body of any size and have the process allocate and hash all of it.
+
+- A 1 MiB ceiling is enforced first, on the length alone. It holds on **every** overload: the
+  `String` entry points no longer call `toByteArray` themselves but route through one guarded
+  conversion that refuses before allocating.
+
+### The simulator validated its own response fields permissively
+
+- Malformed outcome entries were **silently dropped** and missing `id`/`label`/`status` defaulted to
+  `""`, so a broken simulator response produced a shorter, quieter list and a green test.
+- `webhookQueued` was read as `ack["webhookQueued"] != false`, reporting **true** for a missing
+  field, a null, or a string — so "a webhook was queued" was asserted on the field's *absence*.
+- Both are now required and exactly typed, refused in the same INDETERMINATE posture the shared
+  payment validator uses.
+
+### A rejected `baseUrl` leaked its credentials into log output
+
+`assertSecureBaseUrl` interpolated the raw URL into every rejection. That message is thrown at
+construction — before a redactor exists — and goes wherever startup failures are logged. So it
+published userinfo (`https://svc:sup3rsecret@host/…`), `?token=` query strings and fragments: three
+of the shapes this very function *rejects*, meaning the rejection was the thing that leaked them.
+The URL is now rendered sanitized, keeping scheme, host, port and path so the error stays actionable.
+
 ## [0.6.0] - 2026-07-18
 
 **Breaking.** A fifth independent review found eight money-correctness defects that survived the
