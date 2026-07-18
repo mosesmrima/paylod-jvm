@@ -22,7 +22,7 @@ only the Kotlin standard library.
 
 ```kotlin
 dependencies {
-    implementation("dev.paylod:paylod:0.4.0")
+    implementation("dev.paylod:paylod:0.5.0")
 }
 ```
 
@@ -30,7 +30,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'dev.paylod:paylod:0.4.0'
+    implementation 'dev.paylod:paylod:0.5.0'
 }
 ```
 
@@ -40,7 +40,7 @@ dependencies {
 <dependency>
   <groupId>dev.paylod</groupId>
   <artifactId>paylod</artifactId>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
 </dependency>
 ```
 
@@ -243,12 +243,13 @@ hatches (you probably won't need them) live on `PaylodOptions`:
 
 | Option | Default |
 |---|---|
-| `apiKey` | `PAYLOD_API_KEY` env var |
+| `apiKey` | `PAYLOD_API_KEY` env var. **Write-only** — there is no getter, so the credential cannot be read back off the options object. |
 | `baseUrl` | `PAYLOD_BASE_URL` env var, else `https://paylod.dev/functions/v1`. **Must be `https://`** — a plaintext origin is refused so your key is never sent in the clear. |
-| `webhookSecret` | `PAYLOD_WEBHOOK_SECRET` env var |
+| `webhookSecret` | `PAYLOD_WEBHOOK_SECRET` env var. Write-only, same as `apiKey`. |
 | `timeoutMs` | `30000` |
 | `maxRetries` | `2` (transient failures only — network, 5xx, 429, and the explicit in-progress `409`) |
-| `transport` | JDK `HttpClient` (inject an `HttpTransport` for tests/proxies) |
+| `transport` | The SDK's own JDK `HttpClient` dispatch. Injecting an `HttpTransport` is a **test-only seam**: it requires `allowCustomTransport = true`, is refused for `mp_live_` keys, and receives **no credential** — the SDK adds the `Authorization` header after that boundary, from a private field. |
+| `allowCustomTransport` | `false` — the explicit opt-in a custom `HttpTransport` requires |
 | `simulate` | `false` (requires a `mp_test_` key) |
 | `allowInsecureBaseUrl` | `false` — test-only escape hatch permitting **loopback** `http://` (`localhost`/`127.0.0.1`), never with an `mp_live_` key |
 

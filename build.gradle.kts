@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "dev.paylod"
-version = "0.3.0"
+version = "0.5.0"
 
 repositories {
     mavenCentral()
@@ -40,10 +40,46 @@ java {
 }
 
 tasks.test {
-    useJUnitPlatform()
+    // `-PnvTag=<tag>` runs ONLY the tests carrying that JUnit tag. This is what the non-vacuity
+    // harness (scripts/non-vacuity.py) uses to select the single test that guards one protection.
+    //
+    // The harness must be able to prove a selector is LIVE — the Node SDK's equivalent harness
+    // caught selectors that matched ZERO tests while the runner still exited 0, which reads as
+    // "the mutation was not caught" when in truth nothing ever ran. So this task PRINTS the counts
+    // it actually executed, on a machine-readable line, and refuses to be trusted otherwise.
+    val nvTag = providers.gradleProperty("nvTag").orNull
+    useJUnitPlatform {
+        if (nvTag != null) includeTags(nvTag)
+    }
+    // A tag that matches nothing must not silently succeed.
+    filter { isFailOnNoMatchingTests = false }
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = false
+    }
+
+    var ran = 0
+    var failed = 0
+    var skipped = 0
+    afterTest(
+        KotlinClosure2<TestDescriptor, TestResult, Unit>({ _, result ->
+            ran++
+            if (result.resultType == TestResult.ResultType.FAILURE) failed++
+            if (result.resultType == TestResult.ResultType.SKIPPED) skipped++
+        }),
+    )
+    doLast {
+        logger.lifecycle("NVCOUNT tests=$ran failed=$failed skipped=$skipped")
+    }
+    // The count line must be emitted even when the run failed, since that is exactly the case the
+    // harness is measuring.
+    ignoreFailures = (nvTag != null)
+    doLast {
+        if (nvTag != null && failed > 0) {
+            logger.lifecycle("NVRESULT FAILED")
+        } else if (nvTag != null) {
+            logger.lifecycle("NVRESULT PASSED")
+        }
     }
 }
 

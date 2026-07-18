@@ -4,6 +4,125 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-18
+
+**Breaking.** Two architectural roots were closed rather than patched, mirroring the Node SDK's
+0.7.0. Four rounds of per-finding fixes had not converged because the same two shapes kept
+producing new findings: a credential that crossed a replaceable boundary, and a payment record
+judged by a scatter of per-field checks with no stated rules. Signing is unchanged — the shared
+golden webhook vector still matches byte-for-byte — and the Java interop suite still passes.
+
+### ROOT 1 — the transport owns the credential
+
+The fix is not "validate harder", it is making misuse unrepresentable.
+
+- **The API key never leaves the SDK.** Credentialed dispatch now happens inside an SDK-owned
+  `Transport` that builds its own URL and its own headers from a private field. Callers pass a
+  method, a path and a body; they never see the key, never construct headers, never supply a URL or
+  a redirect mode. Previously the bearer token was an ordinary entry in a public `Map` handed to
+  arbitrary caller-supplied code on every request, and the SDK tried to police the RESULT — which
+  is too late, because an injected transport can follow a cross-origin 302 itself and hand back an
+  ordinary `200` long after the credential has been replayed.
+- **A custom `HttpTransport` is a gated test seam.** It requires the new
+  `allowCustomTransport = true` opt-in and is refused outright for `mp_live_` keys — the same
+  posture `allowInsecureBaseUrl` already had — enforced BOTH in `Paylod`'s constructor and again
+  inside `Transport`, so the guarantee does not rest on one call site. It also receives an
+  `HttpRequestSpec` with **no credential in it at all**.
+- **The origin is pinned per dispatch**, recomputed and compared on every call rather than once at
+  construction.
+- **Redirects are refused in three layered ways**: a 3xx status, a transport that reports having
+  FOLLOWED a redirect, and a final responding URL that is off the pinned origin. The last two are
+  detections rather than preventions — the key is already gone — so both tell the caller to
+  **rotate the key**.
+- **`PaylodOptions` no longer exposes `apiKey`, `webhookSecret` or `transport`.** They were public
+  `@JvmField`s on an object that gets passed around, held by DI containers and printed by
+  debuggers. They are now write-only, and `toString()` renders `[redacted]`.
+
+### ROOT 2 — the semantic model
+
+New `Semantics.kt` states the model and the four laws that every sibling SDK mirrors.
+
+- A record makes ONE **CLAIM** (`status`) and carries **EVIDENCE** (`mpesaReceipt`, `resultCode`).
+  Neither ever substitutes for the other.
+- `evidenceFor()` → `NONE | SUCCESS | FAILURE | IN_FLIGHT | CONFLICT`; `judge()` resolves
+  (claim, evidence) through **one total table with no `else` branch**, so adding a status or an
+  evidence kind is a compile error rather than a silent fallthrough to a permissive default.
+  Defaults are exactly where the old logic went wrong, so there are none.
+- **L1 BINDING** — a status body whose `id` is not the id that was REQUESTED is rejected as
+  indeterminate before anything else is read. Nothing previously compared them, so any mechanism
+  returning a different payment's record (a mis-keyed cache, a proxy collapsing requests, a routing
+  bug, a crafted response) produced a body the SDK validated happily and classified on its own
+  merits — and if that other payment was paid, the caller shipped goods for an order nobody paid
+  for.
+- **L2 EVIDENCE** — `paid` requires a receipt OR result code 0. Success *without* a receipt stays
+  legitimate; receipts attach asynchronously.
+- **L3 CONSISTENCY** — a contradiction is INDETERMINATE, never a *retryable* failure.
+- **L4 RECEIPT** — a receipt forces paid-or-indeterminate, never failed and never in flight.
+- A collect acknowledgement now requires HTTP **202** with `status` the literal `"pending"`. A bare
+  `200` is what a cache, a proxy, a captive portal or a rewritten route produces; it is not a
+  dispatched charge.
+
+#### Behaviour changes you may see
+
+| record | 0.4.0 | 0.5.0 |
+| --- | --- | --- |
+| `pending` + `resultCode: 0` | **paid**, `receipt = null` | indeterminate (rendered `PENDING`) |
+| `failed` + receipt + `1032` | `CANCELLED`, **`retryable = true`** | indeterminate, never retryable |
+| `pending` + receipt | paid | indeterminate |
+| bare `success`, no evidence | indeterminate error | indeterminate outcome (rendered `PENDING`) |
+
+The second row is the one that mattered most: the SDK was telling a merchant it was safe to charge
+again for a payment carrying an M-Pesa confirmation receipt.
+
+### The simulator runs the same validators
+
+`simulate.collect()` now **generates an idempotency key** when the caller omits one (production
+always did, so a retried simulate-collect really could create a second payment), and runs the same
+202 acknowledgement validator. `simulate.outcome()` previously validated **nothing** — it read the
+ack straight into a `Payment` — so it could return `paid` with no evidence, or a body describing a
+different payment. It now runs the shared payment validator, ID binding included, and settles under
+a deterministic idempotency key.
+
+### Boundary fixes
+
+- **API error messages and bodies are deeply redacted.** Both were built from the raw response, so
+  a server that echoes the request back — a validation error quoting headers, a debug envelope, a
+  gateway rendering the request on a 502 — put the live bearer token into `PaylodApiException`
+  `message` and its public `body` field, and from there into every log sink. Redaction is
+  depth-capped rather than trusting the structure.
+- **`collectAndWait()` attaches the charge handles to ANY throwable.** It caught only
+  `PaylodException`, so a transport `IOException` or an `onPoll` listener blowing up escaped with no
+  idempotency key and no payment id — for a charge live on a handset. Non-`Paylod` throwables are
+  normalised into a `PaylodConnectionException` carrying both handles, with a redacted message and
+  no attached cause.
+- **The JSON reader rejects a duplicate object name.** Last-value-wins made a body mean different
+  things to different parsers, and the fields at stake are exactly the ones money depends on — the
+  bound id, the status claim, the receipt and the result code.
+- **Webhook events are fully validated.** Verification stopped at "`type` is a String and `data` is
+  a Map" and then built a typed event out of whatever else arrived, so `data.status`, `data.amount`
+  and `data.mpesaReceipt` were typed lies. Now: full shape, `type`/`data.status` consistency, and
+  evidence via the SAME `judge()` a status read uses — a `payment.success` with nothing proving
+  settlement, and a `payment.failed` carrying a receipt, are both refused. `Webhooks.verifySignature`
+  is new: the signature layer alone, which is what the cross-repo golden vector pins.
+
+### Non-vacuity
+
+`scripts/non-vacuity.py` reverts each protection in the source, requires the guarding test to
+**FAIL**, and restores. **24/24 mutations caught.** Every selector is proven to match a non-zero
+number of passing tests on clean source before its verdict is trusted — a Gradle tag that matches
+nothing exits 0, which reads as "not caught" when in truth nothing ran.
+
+### Migration
+
+- Add `.allowCustomTransport(true)` wherever you inject an `HttpTransport` in a test; a live key
+  can no longer use one at all.
+- `JdkHttpTransport` is gone. It was the default and never needed to be named.
+- `HttpRequestSpec.headers` no longer contains `authorization`.
+- Read `PaylodOptions.apiKey` / `.webhookSecret` / `.transport`? You cannot any more — keep your own
+  reference to the value you set.
+- A `pending` or contradictory record now renders as `PENDING` rather than paid or retryable. If you
+  branched on `outcome.retryable` to offer a retry button, that is the change you want.
+
 ## [0.4.0] - 2026-07-18
 
 Third-pass hardening from a codex review of 0.3.0, led by a **false-`paid`** bug in status decoding.
