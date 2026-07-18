@@ -4,6 +4,102 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-18
+
+**Breaking.** A fifth independent review found eight money-correctness defects that survived the
+0.5.0 architectural rework. Every one is fixed here, each with a test that is verified
+non-vacuously — the protection is reverted in the source and the test is required to fail. Signing
+is unchanged (the shared golden webhook vector still matches byte-for-byte) and the Java interop
+suite still passes.
+
+This release also adds `SECURITY.md`, an explicit threat model stating what the SDK defends against
+and — more importantly — what it does not.
+
+### The worst one: a detected credential compromise was RETRIED
+
+The redirect and off-origin detections were raised as `PaylodConnectionException`. That is the one
+exception type the client's retry loop catches and re-sends. So the sequence was: a transport
+follows a cross-origin 302 and replays `Authorization: Bearer mp_…` to a host we never addressed;
+the SDK detects it and raises "your key is compromised, rotate it now"; the retry loop catches that
+as a network blip and **sends the request again**, up to `maxRetries` more times. The SDK's own
+compromise detection was a trigger for replaying the compromised credential.
+
+- **New `PaylodSecurityException`** — extends `PaylodException` directly, NOT
+  `PaylodConnectionException`. The retry loop has no branch that catches it, so a security refusal
+  propagates on the FIRST occurrence with no further dispatch. That is structural: retrying one
+  would require someone to add a new `catch` for this exact type.
+- Off-origin request URLs, off-origin responding URLs and followed redirects all raise it. It
+  carries the idempotency key, because the request was dispatched and the money state is unknown.
+
+### Semantics: the last exception to law L3 is gone
+
+- **`FAILED` claim + in-flight evidence is now `INDETERMINATE`, not `IN_FLIGHT`.** That cell
+  resolved by picking a winner between two signals that contradict each other, which is precisely
+  what L3 forbids everywhere else in the table. What an integrator sees is unchanged — `Outcomes`
+  renders INDETERMINATE as `PENDING`, `paid = false`, `retryable = false`, so `wait()` still polls
+  and no caller is ever invited to charge again — but the SDK no longer claims to know the prompt
+  is live when it does not.
+
+### The lenient status parse is deleted, not merely unused
+
+- **`PaymentStatus.fromWire` (unknown -> `PENDING`) is removed.** It was documented as "only safe
+  after `parseWire` has vetted the body", and it was not used only there: the money path validated
+  with the strict parse and then BUILT the record from the same map with the lenient one. Two
+  readings of one body, and money used the permissive one.
+- **`PaymentValidators.assertPaymentBody` now RETURNS a typed `Payment`.** Validating and
+  constructing are one act, so the caller cannot reach a different conclusion from the bytes than
+  the validator that approved them. `Simulator.outcome()` had the identical double-read and is
+  fixed the same way.
+
+### Webhooks
+
+- **`data.decoded` is RECOMPUTED from the canonical catalog; the payload's claim is ignored.** A
+  signed payload could advertise `retryable = true` for a result code that is not retryable, and a
+  handler doing the documented `if (decoded.retryable) recharge()` charged again on the sender's
+  say-so. A signature proves who sent the bytes, not that their claims about M-Pesa semantics are
+  true. This also removes the raw-parser-exception path: `DarajaCategory.fromWire` throws on an
+  unknown category, and `retryable` was an unchecked cast.
+- **`data.amount` must be an exact, positive, whole, in-range value.** It was accepted as any
+  `Number` and then converted lossily: `100.7` TRUNCATED to `100`, and `4294967396` WRAPPED to
+  `100` via `Long.toInt()` — a four-billion-shilling event delivered as a hundred-shilling one.
+- **The replay window is bounded ABOVE as well as below** (`MAX_TOLERANCE_SEC`, one hour). A window
+  is disabled as effectively by making it enormous as by making it zero, and an enormous one has the
+  advantage of looking like a valid positive number in a config file.
+- **Clock injection is no longer a public parameter.** `nowSec` is gone from `Webhooks.verify` /
+  `verifySignature` / `parseAndVerify` and from `Paylod.verifyWebhook` / `parseWebhook`; it lives
+  behind an internal test seam. The anti-replay check is `abs(now - t) > tolerance`, so a
+  caller-supplied clock can move the window anywhere.
+
+### Bounded responses, bounded recursion
+
+- **Response bodies are bounded before allocation.** Dispatch streams the body and refuses past
+  1 MiB rather than accumulating it with `BodyHandlers.ofString()`. An `OutOfMemoryError` from a
+  path that has already dispatched a charge is not a `PaylodException`, so it escaped every block
+  that attaches the idempotency key — a live charge with no handle on it.
+- **JSON nesting is bounded before recursion**, both at the transport (by a flat scan that cannot
+  itself overflow) and inside the reader (because webhook bodies never pass through a transport).
+- Both raise the new **`PaylodIndeterminateException`**, terminal and key-carrying.
+
+### The charge handles survive every throwable
+
+- **`if (e is Error) throw e` is now `if (e is VirtualMachineError)`.** Every `Error` was rethrown
+  bare, with no idempotency key and no payment id, for a charge live on a handset. `AssertionError`
+  is thrown by ordinary application code in a healthy JVM — an `onPoll` listener with an assertion
+  in it is the routine case. Non-VM errors are wrapped like any other throwable; a genuine
+  `VirtualMachineError` is still rethrown unwrapped, but the handles are attached as a **suppressed
+  exception** so they appear in the stack trace instead of being lost.
+
+### Bounds and overflow
+
+- `timeoutMs` and `maxRetries` are validated at `Paylod` construction. `timeoutMs = 0` is not "no
+  limit" — `Duration.ofMillis(0)` expires every request immediately.
+- `WaitOptions.timeoutMs` is validated at construction. It used to be silently replaced by the
+  120s default when non-positive, so a caller who asked for something else waited two minutes
+  believing otherwise.
+- Wait deadlines use saturating addition. `monotonicMillis` is `nanoTime`-derived with an arbitrary
+  origin, so `startedAt + timeout` could wrap negative — making every poll "out of time", so
+  `wait()` returned instantly and reported a timeout on a payment it never looked at.
+
 ## [0.5.0] - 2026-07-18
 
 **Breaking.** Two architectural roots were closed rather than patched, mirroring the Node SDK's

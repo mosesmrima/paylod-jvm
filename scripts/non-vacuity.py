@@ -66,8 +66,46 @@ CASES = [
         id="R1-origin", tag="nv-r1-origin",
         what="the responding URL is not checked against the pinned origin",
         edits=[("src/main/kotlin/dev/paylod/Transport.kt",
-                'if (finalUrl != null) assertOnOrigin(finalUrl, "the responding URL")',
+                'if (finalUrl != null) assertOnOrigin(finalUrl, "the responding URL", idempotencyKey)',
                 "if (finalUrl != null) Unit")],
+    ),
+    dict(
+        id="R1-noretry", tag="nv-r1-noretry",
+        what="a DETECTED credential compromise is caught by the retry loop and replayed",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                """            } catch (e: PaylodConnectionException) {
+                lastError = e
+                attempt++
+                continue // network blip -> retry
+            }""",
+                """            } catch (e: PaylodConnectionException) {
+                lastError = e
+                attempt++
+                continue // network blip -> retry
+            } catch (e: PaylodSecurityException) {
+                lastError = e
+                attempt++
+                continue
+            }""")],
+    ),
+    dict(
+        id="R1-noretry-count", tag="nv-r1-noretry-count",
+        what="the same revert, measured by counting dispatches instead of by type",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                """            } catch (e: PaylodConnectionException) {
+                lastError = e
+                attempt++
+                continue // network blip -> retry
+            }""",
+                """            } catch (e: PaylodConnectionException) {
+                lastError = e
+                attempt++
+                continue // network blip -> retry
+            } catch (e: PaylodSecurityException) {
+                lastError = e
+                attempt++
+                continue
+            }""")],
     ),
     dict(
         id="R1-3xx", tag="nv-r1-3xx",
@@ -156,9 +194,10 @@ CASES = [
         what="a failed row carrying a pending code is reported as a terminal failure",
         edits=[("src/main/kotlin/dev/paylod/Semantics.kt",
                 """                PaymentEvidence.IN_FLIGHT ->
-                    PaymentVerdict.IN_FLIGHT to
-                        "status says failed but the result code means the prompt is still live and " +
-                        "the customer has not entered their PIN yet\"""",
+                    PaymentVerdict.INDETERMINATE to
+                        "status claims the payment failed terminally while the result code says it " +
+                        "is still in flight — the two contradict, so the record proves nothing; it " +
+                        "is neither settled nor safe to charge again\"""",
                 '                PaymentEvidence.IN_FLIGHT ->\n'
                 '                    PaymentVerdict.FAILED to "REVERTED"')],
     ),
@@ -175,12 +214,17 @@ CASES = [
         id="SIM-bind", tag="nv-sim-bind",
         what="simulate.outcome() validates nothing (no binding, no evidence)",
         edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
-                """        val ack = requester.request("POST", "/simulate/outcome", body, idempotencyKey) { map, status ->
-            PaymentValidators.assertPaymentBody(
+                """            validated = PaymentValidators.assertPaymentBody(
                 normalizeSettleAck(map), status, paymentId, "simulate.outcome()", redact,
+            )""",
+                """            validated = Payment(
+                paymentId,
+                PaymentStatus.parseWire(map["status"] as? String) ?: PaymentStatus.PENDING,
+                map["mpesaReceipt"] as? String,
+                map["resultCode"]?.toString(),
+                map["resultDesc"] as? String,
             )
-        }""",
-                '        val ack = requester.request("POST", "/simulate/outcome", body, idempotencyKey, null)')],
+            status.toString()""")],
     ),
 
     # ── The boundary fixes ────────────────────────────────────────────────────────────────────
@@ -237,6 +281,146 @@ CASES = [
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
                 'if (type == "payment.failed" && judgement.verdict != PaymentVerdict.FAILED) {',
                 "if (false) {")],
+    ),
+
+    # ── ROUND 5 — the remaining money-correctness defects ─────────────────────────────────────
+    dict(
+        id="R5-status-strict", tag="nv-status-strict",
+        what="an unknown wire status is coerced to PENDING instead of rejected",
+        edits=[("src/main/kotlin/dev/paylod/Validators.kt",
+                'val status = PaymentStatus.parseWire(wireStatus)\n'
+                '            ?: bad("status \\"$wireStatus\\" is not one of pending/success/failed")',
+                "val status = PaymentStatus.parseWire(wireStatus) ?: PaymentStatus.PENDING")],
+    ),
+    dict(
+        id="R5-no-lenient", tag="nv-no-lenient",
+        what="the lenient PaymentStatus.fromWire fallback is reintroduced",
+        edits=[("src/main/kotlin/dev/paylod/Types.kt",
+                "        fun parseWire(value: String?): PaymentStatus? = when (value) {",
+                "        fun fromWire(value: String?): PaymentStatus = parseWire(value) ?: PENDING\n\n"
+                "        fun parseWire(value: String?): PaymentStatus? = when (value) {")],
+    ),
+    dict(
+        id="R5-wh-decoded", tag="nv-wh-decoded-retryable",
+        what="webhook `decoded` is read from the payload instead of the canonical catalog",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                """        val decoded = if (rawType == "payment.failed") {
+            val code = data["resultCode"]
+            if (code == null) null else DarajaCatalog.decodeError(normalizeCode(code), asString(data["resultDesc"]))
+        } else {
+            null
+        }""",
+                """        val decodedMap = data["decoded"] as? Map<String, Any?>
+        val decoded = if (decodedMap != null) {
+            DecodedError(
+                code = decodedMap["code"]?.toString() ?: "",
+                title = decodedMap["title"]?.toString() ?: "",
+                cause = decodedMap["cause"]?.toString() ?: "",
+                fix = decodedMap["fix"]?.toString() ?: "",
+                category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
+                retryable = decodedMap["retryable"] as? Boolean ?: false,
+                customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
+            )
+        } else {
+            null
+        }""")],
+    ),
+    dict(
+        id="R5-wh-decoded-malformed", tag="nv-wh-decoded-malformed",
+        what="the same revert, seen as a raw parser exception escaping a handler",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                """        val decoded = if (rawType == "payment.failed") {
+            val code = data["resultCode"]
+            if (code == null) null else DarajaCatalog.decodeError(normalizeCode(code), asString(data["resultDesc"]))
+        } else {
+            null
+        }""",
+                """        val decodedMap = data["decoded"] as? Map<String, Any?>
+        val decoded = if (decodedMap != null) {
+            DecodedError(
+                code = decodedMap["code"]?.toString() ?: "",
+                title = decodedMap["title"]?.toString() ?: "",
+                cause = decodedMap["cause"]?.toString() ?: "",
+                fix = decodedMap["fix"]?.toString() ?: "",
+                category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
+                retryable = decodedMap["retryable"] as? Boolean ?: false,
+                customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
+            )
+        } else {
+            null
+        }""")],
+    ),
+    dict(
+        id="R5-wh-amount", tag="nv-wh-amount",
+        what="data.amount is accepted as any Number, then truncated/wrapped on conversion",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "if (wholeAmount(amount) == null) {", "if (amount !is Number) {")],
+    ),
+    dict(
+        id="R5-wh-tolerance", tag="nv-wh-tolerance-max",
+        what="an unbounded positive replay tolerance is accepted again",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "if (toleranceSec > MAX_TOLERANCE_SEC) {", "if (false) {")],
+    ),
+    dict(
+        id="R5-wh-clock", tag="nv-wh-noclock",
+        what="clock injection is put back on the PUBLIC webhook API",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "        toleranceSec: Long = DEFAULT_TOLERANCE_SEC,\n"
+                "    ): WebhookEvent = parseAndVerifyAt(payload, signature, secret, toleranceSec, null)",
+                "        toleranceSec: Long = DEFAULT_TOLERANCE_SEC,\n"
+                "        nowSec: Long? = null,\n"
+                "    ): WebhookEvent = parseAndVerifyAt(payload, signature, secret, toleranceSec, nowSec)")],
+    ),
+    dict(
+        id="R5-bound-size", tag="nv-bound-size",
+        what="the response size limit is removed, so an oversized body is accumulated",
+        edits=[("src/main/kotlin/dev/paylod/Transport.kt",
+                "if (body.length > MAX_RESPONSE_CHARS) {", "if (false) {")],
+    ),
+    dict(
+        id="R5-bound-depth", tag="nv-bound-depth",
+        what="the response depth limit is removed, so the parser is entered on a deep document",
+        edits=[("src/main/kotlin/dev/paylod/Transport.kt",
+                "if (depth > MAX_JSON_DEPTH) {", "if (false) {")],
+    ),
+    dict(
+        id="R5-json-depth", tag="nv-json-depth",
+        what="the JSON reader recurses without a depth limit (StackOverflowError, not an error)",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "if (depth > MAX_DEPTH) {", "if (false) {")],
+    ),
+    dict(
+        id="R5-keys-error", tag="nv-keys-assertionerror",
+        what="every Error is rethrown bare again, losing the key on a live charge",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "if (e is VirtualMachineError) {", "if (e is Error) {")],
+    ),
+    dict(
+        id="R5-keys-vm", tag="nv-keys-vmerror",
+        what="a VM error escapes without the charge context attached",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "e.addSuppressed(chargeContext(ack, e))", "Unit")],
+    ),
+    dict(
+        id="R5-opt-bounds", tag="nv-opt-bounds",
+        what="timeoutMs is accepted unbounded at construction",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "if (options.timeoutMs < MIN_TIMEOUT_MS || options.timeoutMs > MAX_TIMEOUT_MS) {",
+                "if (false) {")],
+    ),
+    dict(
+        id="R5-wait-bounds", tag="nv-wait-bounds",
+        what="a non-positive wait timeout is silently replaced by the default",
+        edits=[("src/main/kotlin/dev/paylod/WaitOptions.kt",
+                "if (timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_TIMEOUT_MS) {", "if (false) {")],
+    ),
+    dict(
+        id="R5-deadline", tag="nv-deadline-overflow",
+        what="the wait deadline is computed with wrapping addition",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "val deadline = saturatingAdd(startedAt, timeout)",
+                "val deadline = startedAt + timeout")],
     ),
 ]
 
