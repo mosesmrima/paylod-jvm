@@ -184,6 +184,70 @@ object DarajaCatalog {
         else -> false
     }
 
+    // ─── Canonical code FORM ──────────────────────────────────────────────────────────────────
+    //
+    // [isCanonicalSuccessCode] closed the SUCCESS direction at the CLASSIFIER. It did not close it
+    // at the DECODER, and it never addressed the failure direction at all. `normalizeCode` trims,
+    // and `decodeError` looked the entry up by the trimmed string, so BOTH of these held:
+    //
+    //   • `decodeError(" 0")`    → the SUCCESS entry. code "0", category SUCCESS, "Payment
+    //     received — thank you!" — rendered for a row that never paid, while `classifyStkResult`
+    //     on the very same value correctly said PENDING.
+    //   • `decodeError(" 1032")` → the cancelled-by-the-customer entry, `retryable = true`, "offer
+    //     a clear retry button" — a confident instruction to charge again for a payment whose real
+    //     state nobody knew.
+    //
+    // An exact check one layer up is worth nothing while a lower layer launders the impostor into
+    // canonical form first. So the FORM is judged on the bytes as they arrived, before any entry
+    // can be chosen.
+    //
+    // NOTE ON THE ANCHOR: these carry no `^`/`$` because [Regex.matches] is a FULL-region match.
+    // That is deliberate — an anchored `$` would reintroduce the sibling SDKs' hazard, since Java's
+    // `$` (like PCRE's, like Python's) also matches just before a trailing newline, which would
+    // accept `"1032\n"` as canonical with no trim involved. Never switch these to `containsMatchIn`.
+
+    /** A bare decimal code: no sign, no leading zeros, no exponent, no radix prefix, no fraction. */
+    private val CANONICAL_CODE_RE = Regex("(?:0|[1-9][0-9]*)")
+
+    /**
+     * A dotted Daraja business code — `500.001.1001`, `400.002.02`. Each segment is bare digits; the
+     * FIRST segment carries no leading zero, later segments may (`002` is how Daraja writes them).
+     */
+    private val CANONICAL_DOTTED_RE = Regex("(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){1,6}")
+
+    /** An alphanumeric result code — `C2B00011`. Always starts with a letter, never with a digit. */
+    private val CANONICAL_ALNUM_RE = Regex("[A-Za-z][A-Za-z0-9_]{0,31}")
+
+    /**
+     * Is this code written the way Daraja writes result codes?
+     *
+     * A code failing this is not a code with a formatting quirk — it is a string Daraja never sent.
+     * It is neither a success nor a proven failure, so it must not select a catalog entry.
+     */
+    @JvmStatic
+    fun isCanonicalCodeLexeme(code: String?): Boolean {
+        if (code == null) return false
+        return CANONICAL_CODE_RE.matches(code) ||
+            CANONICAL_DOTTED_RE.matches(code) ||
+            CANONICAL_ALNUM_RE.matches(code)
+    }
+
+    /**
+     * The code AS IT ARRIVED, or `null` when it has no lexeme.
+     *
+     * A `Boolean` is not a result code. A floating-point value has no lexeme: there is no lossless
+     * rendering of a `Double` back to the token the sender wrote (`0.0`, `-0.0`, `1032.0` and
+     * `1.0e3` all collapse), and the schema specifies an integer — so a float-typed code is refused
+     * rather than guessed at. Mirrors the PHP and Python SDKs exactly.
+     */
+    private fun codeLexeme(resultCode: Any?): String? = when (resultCode) {
+        null -> null
+        is Boolean -> null
+        is Byte, is Short, is Int, is Long -> resultCode.toString()
+        is String -> resultCode
+        else -> null
+    }
+
     /**
      * Classify a synchronous STK Query result. THE authoritative call — the decoder defers to this,
      * so a stale or wrong table entry can never resurrect the 4999 bug.
@@ -320,6 +384,16 @@ object DarajaCatalog {
 
         // An ABSENT code is not evidence of an in-flight payment — it is simply unknown.
         if (code.isEmpty()) return failedFallback("unknown", rawDesc)
+
+        // FORM BEFORE LOOKUP. A code that is not written the way Daraja writes them never reaches
+        // the catalog — it is neither evidence of success nor evidence of failure, so it decodes as
+        // the indeterminate, NON-RETRYABLE fallback. The ORIGINAL spelling is reported back rather
+        // than the tidied one: a caller debugging this needs to see the `" 0"` they actually
+        // received. See [isCanonicalCodeLexeme] for what this closed.
+        val lexeme = codeLexeme(resultCode)
+        if (lexeme == null || !isCanonicalCodeLexeme(lexeme)) {
+            return failedFallback(lexeme ?: code, rawDesc)
+        }
 
         val matches = allEntries.filter { it.code == code }
         val hasStk = matches.any { it.family == DarajaFamily.STK_RESULT }

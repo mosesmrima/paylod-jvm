@@ -561,6 +561,33 @@ CASES = [
         edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
                 '(got \\"${sanitizeUrl(parsed)}\\")', '(got \\"$baseUrl\\")')],
     ),
+    dict(
+        id="R6-decode-zero", tag="nv-s6-decode-zero",
+        what="the decoder trims before the catalog lookup again, so \" 0\" selects the SUCCESS entry",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt", """        val lexeme = codeLexeme(resultCode)
+        if (lexeme == null || !isCanonicalCodeLexeme(lexeme)) {
+            return failedFallback(lexeme ?: code, rawDesc)
+        }""", "")],
+    ),
+    dict(
+        id="R6-decode-terminal", tag="nv-s6-decode-terminal",
+        what="the decoder trims before the catalog lookup again, so \" 1032\" decodes as the retryable cancellation",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt", """        val lexeme = codeLexeme(resultCode)
+        if (lexeme == null || !isCanonicalCodeLexeme(lexeme)) {
+            return failedFallback(lexeme ?: code, rawDesc)
+        }""", "")],
+    ),
+    dict(
+        id="R6-decode-anchor", tag="nv-s6-decode-anchor",
+        what="the canonical form check goes back to a `$`-anchored partial match, which accepts a trailing newline",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                """        return CANONICAL_CODE_RE.matches(code) ||
+            CANONICAL_DOTTED_RE.matches(code) ||
+            CANONICAL_ALNUM_RE.matches(code)""",
+                """        return Regex("^(?:0|[1-9][0-9]*)$").containsMatchIn(code) ||
+            Regex("^(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){1,6}$").containsMatchIn(code) ||
+            Regex("^[A-Za-z][A-Za-z0-9_]{0,31}$").containsMatchIn(code)""")],
+    ),
 ]
 
 COUNT_RE = re.compile(r"NVCOUNT tests=(\d+) failed=(\d+) skipped=(\d+)")

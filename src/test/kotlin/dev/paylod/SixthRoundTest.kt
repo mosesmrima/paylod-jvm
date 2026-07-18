@@ -467,4 +467,70 @@ class SixthRoundTest {
             )
         }
     }
+
+    // ══ 12 — the DECODER refuses a non-canonical code, in BOTH directions ═════════════════════
+
+    /**
+     * `isCanonicalSuccessCode` closed the success direction at the CLASSIFIER only. `decodeError`
+     * trimmed first and looked the entry up by the trimmed string, so `" 0"` selected the SUCCESS
+     * entry — "Payment received — thank you!" — for a row that never paid, while the classifier on
+     * the very same value correctly said PENDING.
+     */
+    @Test
+    @Tag("nv-s6-decode-zero")
+    fun `a padded zero never decodes as the success entry`() {
+        for (impostor in listOf(" 0", "0 ", "\t0", "0\t", "\n0", " 0 ", "0\n", "00", "+0", "-0", "0e999")) {
+            val d = DarajaCatalog.decodeError(impostor)
+            assertNotEquals(
+                DarajaCategory.SUCCESS, d.category,
+                "<$impostor> decoded as SUCCESS — an impostor spelled itself into paid",
+            )
+            assertNotEquals("Success", d.title, "<$impostor> decoded as the success entry")
+            assertFalse(d.retryable, "<$impostor> is indeterminate and must never be retryable")
+        }
+        // The two schema-approved spellings are untouched.
+        assertEquals(DarajaCategory.SUCCESS, DarajaCatalog.decodeError(0).category)
+        assertEquals(DarajaCategory.SUCCESS, DarajaCatalog.decodeError("0").category)
+    }
+
+    /**
+     * The failure direction of the same laundering: `" 1032"` trimmed to `"1032"` and selected the
+     * cancelled-by-the-customer entry — `retryable = true`, "offer a clear retry button". That is a
+     * confident instruction to charge again for a payment whose real state nobody knew.
+     */
+    @Test
+    @Tag("nv-s6-decode-terminal")
+    fun `a padded failure code never decodes as a retryable catalog entry`() {
+        for (impostor in listOf(" 1032", "1032 ", "\t1032", "1032\n", " 1032 ", "1032\r\n")) {
+            val d = DarajaCatalog.decodeError(impostor)
+            assertFalse(
+                d.retryable,
+                "<$impostor> decoded as RETRYABLE — that is an instruction to charge again",
+            )
+            assertNotEquals(DarajaCategory.CUSTOMER, d.category, "<$impostor> reached the catalog")
+            assertNotEquals("Payment cancelled by the customer", d.title)
+        }
+        // The real 1032 keeps its retryable cancellation semantics.
+        val real = DarajaCatalog.decodeError("1032")
+        assertTrue(real.retryable)
+        assertEquals(DarajaCategory.CUSTOMER, real.category)
+        assertTrue(DarajaCatalog.decodeError(1032).retryable)
+    }
+
+    /**
+     * Java's `$` — like PCRE's and Python's — also matches just before a trailing newline, so an
+     * anchored `^…$` check accepts `"1032\n"` as canonical with no trim involved. `Regex.matches`
+     * is a full-region match and has no such hole; this pins that it stays that way.
+     */
+    @Test
+    @Tag("nv-s6-decode-anchor")
+    fun `the canonical form check has no trailing-newline hole`() {
+        for (bad in listOf("1032\n", "0\n", "500.001.1001\n", "C2B00011\n", " 1032", "1032 ")) {
+            assertFalse(DarajaCatalog.isCanonicalCodeLexeme(bad), "<$bad> was accepted as canonical")
+        }
+        // Every shape Daraja really emits still passes — the guard must not over-refuse.
+        for (good in listOf("0", "1", "1032", "4999", "500.001.1001", "400.002.02", "C2B00011")) {
+            assertTrue(DarajaCatalog.isCanonicalCodeLexeme(good), "<$good> was refused")
+        }
+    }
 }
