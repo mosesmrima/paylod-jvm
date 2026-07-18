@@ -7,8 +7,11 @@ plugins {
     signing
 }
 
-group = "dev.paylod"
-version = "0.5.0"
+// Read from gradle.properties, which is the single source of truth for the published coordinates.
+// These are NOT restated here: the two used to disagree (0.4.0 there, 0.5.0 here), and a fact
+// maintained in two places drifts the moment one of them is edited alone.
+group = property("group") as String
+version = property("version") as String
 
 repositories {
     mavenCentral()
@@ -92,7 +95,7 @@ publishing {
     publications {
         create<MavenPublication>("maven") {
             from(components["java"])
-            groupId = "dev.paylod"
+            groupId = project.group.toString()
             artifactId = "paylod"
             version = project.version.toString()
 
