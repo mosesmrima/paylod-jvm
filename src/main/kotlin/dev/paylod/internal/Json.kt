@@ -200,33 +200,74 @@ internal object Json {
                             'u' -> {
                                 if (pos + 4 > src.length) fail("bad unicode escape")
                                 val hex = src.substring(pos, pos + 4)
+                                // `toInt(16)` alone accepts "+12f" and " 12f"; RFC 8259 wants exactly
+                                // four hex digits.
+                                if (!hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+                                    fail("\\u escape must be followed by four hex digits, found \"$hex\"")
+                                }
                                 pos += 4
                                 sb.append(hex.toInt(16).toChar())
                             }
                             else -> fail("bad escape '\\$e'")
                         }
                     }
-                    else -> sb.append(c)
+                    else -> {
+                        // RFC 8259: a raw control character (U+0000..U+001F) inside a string is
+                        // ILLEGAL and must be escaped. Accepting it made this parser lenient in a way
+                        // that matters on a payments path: a body could carry required fields that
+                        // validate cleanly while the rest of it was not JSON at all, so a 2xx passed
+                        // validation on the strength of a document no conforming parser would accept.
+                        // A response we cannot parse strictly is a response we do not trust.
+                        if (c < ' ') {
+                            fail("unescaped control character U+%04X in a string".format(c.code))
+                        }
+                        sb.append(c)
+                    }
                 }
             }
         }
 
+        /**
+         * RFC 8259 grammar, strictly:
+         *
+         *     number = [ "-" ] int [ frac ] [ exp ]
+         *     int    = "0" / ( digit1-9 *DIGIT )
+         *     frac   = "." 1*DIGIT
+         *     exp    = ("e" / "E") [ "+" / "-" ] 1*DIGIT
+         *
+         * The previous implementation allowed every digit run to be EMPTY, so `-`, `1.`, `.5`, `1e`
+         * and `1e+` were all consumed as tokens; leading zeros (`007`) were accepted too. Most then
+         * failed the `toDoubleOrNull` at the end — but `-` did not (it consumed nothing and produced a
+         * confusing failure elsewhere), and `007` parsed happily. Enforce the grammar as written.
+         */
         private fun parseNumber(): Any {
             val start = pos
-            if (peek() == '-') pos++
-            while (pos < src.length && src[pos] in '0'..'9') pos++
+            if (pos < src.length && src[pos] == '-') pos++
+
+            // int: a bare "0", or a non-zero digit followed by any digits. No leading zeros.
+            if (pos >= src.length || src[pos] !in '0'..'9') fail("a number must have at least one digit")
+            if (src[pos] == '0') {
+                pos++
+                if (pos < src.length && src[pos] in '0'..'9') fail("a number must not have a leading zero")
+            } else {
+                while (pos < src.length && src[pos] in '0'..'9') pos++
+            }
+
             var isDouble = false
             if (pos < src.length && src[pos] == '.') {
                 isDouble = true
                 pos++
+                if (pos >= src.length || src[pos] !in '0'..'9') fail("a fraction must have at least one digit")
                 while (pos < src.length && src[pos] in '0'..'9') pos++
             }
             if (pos < src.length && (src[pos] == 'e' || src[pos] == 'E')) {
                 isDouble = true
                 pos++
                 if (pos < src.length && (src[pos] == '+' || src[pos] == '-')) pos++
+                if (pos >= src.length || src[pos] !in '0'..'9') fail("an exponent must have at least one digit")
                 while (pos < src.length && src[pos] in '0'..'9') pos++
             }
+
             val token = src.substring(start, pos)
             if (!isDouble) {
                 token.toLongOrNull()?.let { return it }

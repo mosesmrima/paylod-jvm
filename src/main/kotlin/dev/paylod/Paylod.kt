@@ -70,6 +70,10 @@ class Paylod internal constructor(
             )
         }
         apiKey = key.trim()
+        // Validate the key's SYNTAX before it can ever be interpolated into an Authorization header.
+        // The JDK's header validator would otherwise reject it later with the full token inside the
+        // exception message.
+        assertValidApiKey(apiKey)
 
         baseUrl = (options.baseUrl ?: env("PAYLOD_BASE_URL") ?: DEFAULT_BASE_URL).trimEnd('/')
         // Reject a plaintext / non-canonical origin BEFORE any key can leave the process. Loopback
@@ -133,7 +137,9 @@ class Paylod internal constructor(
             if (body != null) headers["content-type"] = "application/json"
             if (idempotencyKey != null) headers["idempotency-key"] = idempotencyKey
 
-            val spec = HttpRequestSpec(method, url, headers, bodyStr, perRequestTimeout)
+            // Wrapped so that PRINTING the header map — `spec.headers.toString()`, a string template,
+            // a structured-log field dump — can never render the bearer token. Lookups are unaffected.
+            val spec = HttpRequestSpec(method, url, RedactingHeaders(headers), bodyStr, perRequestTimeout)
 
             val response: HttpResponseSpec = try {
                 transport.execute(spec)
@@ -144,6 +150,25 @@ class Paylod internal constructor(
             }
             // A PaylodInterruptedException from the transport is deliberately NOT caught here: an
             // interrupt is a cancellation, not a transient blip, so it propagates without a retry.
+
+            // A 3xx is REFUSED here, not followed and not retried — and this is the check that actually
+            // enforces the no-redirect guarantee, because the SDK does not control an injected
+            // `HttpTransport`. A custom transport built on a redirect-following client would replay
+            // `Authorization: Bearer` to the 3xx target's host. We cannot stop third-party code from
+            // doing that, but the SDK itself never treats a redirect as something to chase: the API
+            // never legitimately redirects, so a 3xx is a misconfiguration or an attack, and it is
+            // terminal.
+            if (response.status in 300..399) {
+                throw PaylodApiException(
+                    "paylod responded ${response.status} (a redirect). The paylod API never redirects, " +
+                        "and a redirect is never followed: doing so would replay your API key to the " +
+                        "redirect target. Check baseUrl and any proxy in front of it.",
+                    response.status,
+                    null,
+                    idempotencyKey,
+                    indeterminate = true,
+                )
+            }
 
             val text = response.body
             val parsed: Any? = try {
@@ -184,9 +209,15 @@ class Paylod internal constructor(
         throw lastError ?: PaylodConnectionException("Request to $url failed")
     }
 
-    /** Remaining time to the deadline, or `null` when there is no deadline. */
+    /**
+     * Remaining time to the deadline, or `null` when there is no deadline.
+     *
+     * Deadlines are MONOTONIC. Using the wall clock here would mean an NTP step or a manual clock
+     * change moved the budget: a backwards adjustment during a `wait()` makes `remaining` grow, and
+     * polling continues past the deadline the caller was promised.
+     */
     private fun remaining(deadlineMs: Long?): Long? =
-        if (deadlineMs == null) null else deadlineMs - time.nowMillis()
+        if (deadlineMs == null) null else deadlineMs - time.monotonicMillis()
 
     /**
      * A sleep clamped to the operation deadline, so a backoff — or a server-dictated `Retry-After` —
@@ -282,25 +313,39 @@ class Paylod internal constructor(
             }
 
             val ack = request("POST", "/collect", body, idempotencyKey) { map, status ->
-                // A 2xx with no payment id is INDETERMINATE: the charge may have moved. Fail with the
-                // key attached rather than hand back an empty id a caller would treat as a new payment.
+                // Validate the WHOLE acknowledgement, not just the payment id. A 2xx that is missing
+                // any part of the ack shape is a response we do not understand, and the charge behind
+                // it may well have moved — so it is INDETERMINATE, never a silently-degraded ack with
+                // empty-string fields a caller would go on to use as a real checkout reference.
+                fun bad(why: String): Nothing = throw PaylodApiException(
+                    "paylod returned a 2xx collect response that is not a valid acknowledgement " +
+                        "($why) — the charge state is INDETERMINATE. Read the payment with this " +
+                        "idempotencyKey before starting any new attempt; do NOT mint a fresh key " +
+                        "(that risks a second charge).",
+                    status,
+                    map,
+                    idempotencyKey,
+                    indeterminate = true,
+                )
+
                 val id = map["paymentId"]
-                if (id !is String || id.isBlank()) {
-                    throw PaylodApiException(
-                        "paylod returned a 2xx response with no paymentId — the charge state is " +
-                            "INDETERMINATE. Read the payment with this idempotencyKey before starting " +
-                            "any new attempt; do NOT mint a fresh key (that risks a second charge).",
-                        status,
-                        map,
-                        idempotencyKey,
-                        indeterminate = true,
-                    )
+                if (id !is String || id.isBlank()) bad("no usable paymentId")
+                val checkout = map["checkoutRequestId"]
+                if (checkout !is String || checkout.isBlank()) bad("no usable checkoutRequestId")
+                // `POST /collect` ALWAYS answers 202 with a hardcoded `status: "pending"` — including
+                // for an idempotent REPLAY, which returns the STORED original ack rather than the
+                // current settled state. So there is no legitimate settled ack, and accepting one
+                // would mean trusting a shape the API never emits. Require the literal.
+                val wireStatus = map["status"]
+                if (wireStatus !is String) bad("status is missing or is not a string")
+                if (wireStatus != "pending") {
+                    bad("status is \"$wireStatus\", but a collect acknowledgement is always \"pending\"")
                 }
             }
             return CollectAck(
-                paymentId = ack["paymentId"]?.toString() ?: "",
+                paymentId = ack["paymentId"] as String,
                 status = PaymentStatus.PENDING,
-                checkoutRequestId = ack["checkoutRequestId"]?.toString() ?: "",
+                checkoutRequestId = ack["checkoutRequestId"] as String,
                 idempotencyKey = idempotencyKey,
             )
         } catch (e: PaylodException) {
@@ -328,18 +373,64 @@ class Paylod internal constructor(
         if (paymentId.isEmpty()) throw PaylodInvalidRequestException("paymentId is required.")
         val encoded = URLEncoder.encode(paymentId, StandardCharsets.UTF_8).replace("+", "%20")
         val p = request("GET", "/status/$encoded", null, null, deadlineMs) { map, status ->
-            // A 2xx status body with no id is malformed — surface it rather than return an empty Payment.
+            // Validate the COMPLETE, state-dependent status schema before a Payment is built from it.
+            //
+            // Checking only `id` was a false-PAID bug: `{"id":"pay_1","status":"success"}` sailed
+            // through, `PaymentStatus.fromWire` turned the string into SUCCESS, no result code meant
+            // the classifier never ran, and `Outcomes.of` returned `paid = true` with a null receipt.
+            // A caller doing the documented `if (outcome.paid) fulfil(...)` shipped the goods on a
+            // response carrying no evidence whatsoever that money had moved.
+            //
+            // So: the status STRING is never sufficient on its own. A terminal success must arrive
+            // with something M-Pesa actually said — a receipt, or a result code to classify — and any
+            // field of the wrong shape makes the whole body untrustworthy rather than partly usable.
+            // Every rejection is INDETERMINATE: not paid, and not proof of failure either.
+            fun bad(why: String): Nothing = throw PaylodApiException(
+                "paylod returned a malformed 2xx status body ($why). The payment state is " +
+                    "INDETERMINATE — this is NOT a confirmed payment and must NOT be fulfilled. Read " +
+                    "the payment again, or let the webhook settle it.",
+                status,
+                map,
+                null,
+                indeterminate = true,
+            )
+
             val id = map["id"]
-            if (id !is String || id.isBlank()) {
-                throw PaylodApiException(
-                    "paylod returned a 2xx status body with no payment id (malformed response).",
-                    status,
-                    map,
+            if (id !is String || id.isBlank()) bad("no payment id")
+
+            val wireStatus = map["status"]
+            if (wireStatus !is String) bad("status is missing or is not a string")
+            val parsedStatus = PaymentStatus.parseWire(wireStatus)
+                ?: bad("status \"$wireStatus\" is not one of pending/success/failed")
+
+            // `mpesaReceipt` is THE proof of settlement. A non-string, or a blank string pretending to
+            // be one, is not a receipt.
+            val receipt = map["mpesaReceipt"]
+            if (receipt != null && (receipt !is String || receipt.isBlank())) {
+                bad("mpesaReceipt is present but is not a non-empty string")
+            }
+
+            // `resultCode` drives the classifier, which outranks the raw status field. A shape it
+            // cannot read (a boolean, an object, an empty string) would be normalized into a junk
+            // string and decoded as an unknown code — silently changing the outcome.
+            val resultCode = map["resultCode"]
+            if (resultCode != null && resultCode !is String && resultCode !is Number) {
+                bad("resultCode is neither a string nor a number")
+            }
+            if (resultCode is String && resultCode.isBlank()) bad("resultCode is a blank string")
+
+            val resultDesc = map["resultDesc"]
+            if (resultDesc != null && resultDesc !is String) bad("resultDesc is present but is not a string")
+
+            if (parsedStatus == PaymentStatus.SUCCESS && receipt == null && resultCode == null) {
+                bad(
+                    "status is \"success\" but the body carries NEITHER an mpesaReceipt NOR a " +
+                        "resultCode, so nothing in it evidences that money actually moved",
                 )
             }
         }
         return Payment(
-            id = p["id"]?.toString() ?: paymentId,
+            id = p["id"] as String,
             status = PaymentStatus.fromWire(p["status"]?.toString()),
             mpesaReceipt = p["mpesaReceipt"]?.toString(),
             resultCode = normalizeResultCode(p["resultCode"]),
@@ -363,7 +454,9 @@ class Paylod internal constructor(
     @JvmOverloads
     fun wait(paymentId: String, options: WaitOptions = WaitOptions.DEFAULT): PaymentOutcome {
         val timeout = options.timeoutMs.takeIf { it > 0 } ?: DEFAULT_WAIT_TIMEOUT_MS
-        val startedAt = time.nowMillis()
+        // Monotonic: the caller's timeout is a DURATION, and must not be lengthened or shortened by a
+        // wall-clock adjustment landing mid-wait.
+        val startedAt = time.monotonicMillis()
         val deadline = startedAt + timeout
 
         var last: Payment? = null
@@ -378,12 +471,12 @@ class Paylod internal constructor(
             options.onPoll?.onPoll(payment)
 
             val delay = pollDelay(attempt)
-            if (time.nowMillis() + delay >= deadline) break
+            if (time.monotonicMillis() + delay >= deadline) break
             time.sleep(delay)
             attempt++
         }
 
-        throw PaylodTimeoutException(paymentId, last!!, time.nowMillis() - startedAt)
+        throw PaylodTimeoutException(paymentId, last!!, time.monotonicMillis() - startedAt)
     }
 
     /**
@@ -393,7 +486,22 @@ class Paylod internal constructor(
     @JvmOverloads
     fun collectAndWait(params: CollectParams, options: WaitOptions = WaitOptions.DEFAULT): PaymentOutcome {
         val ack = collect(params)
-        return wait(ack.paymentId, options)
+        try {
+            return wait(ack.paymentId, options)
+        } catch (e: PaylodException) {
+            // The collect was ACKNOWLEDGED before this threw — an STK prompt is live on a handset and a
+            // charge exists under `ack.idempotencyKey`. Every failure from here on (poll timeout,
+            // transport blip, 5xx, malformed status body, interrupt) previously arrived with
+            // idempotencyKey = null, because `wait()` reads a payment and never sees a key. A caller
+            // following the documented "retry with the key on the exception" rule then found none,
+            // minted a fresh one, and charged the customer a SECOND time.
+            //
+            // Attach both handles to the live charge, without overwriting anything already set deeper
+            // in the stack.
+            if (e.idempotencyKey == null) e.idempotencyKey = ack.idempotencyKey
+            if (e.paymentId == null) e.paymentId = ack.paymentId
+            throw e
+        }
     }
 
     /** Java-friendly overload of [collectAndWait]. */

@@ -4,6 +4,80 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-18
+
+Third-pass hardening from a codex review of 0.3.0, led by a **false-`paid`** bug in status decoding.
+Signing is unchanged — the shared golden webhook vector still passes byte-for-byte, and the Java
+interop suite is unchanged in shape.
+
+### Money-correctness
+
+- **A status response can no longer report `paid = true` with no evidence.** `GET /status/:id`
+  validated exactly one field, `id`. So `{"id":"pay_123","status":"success"}` was accepted, the
+  status STRING alone was trusted, no result code meant the classifier never ran, and `Outcomes.of`
+  returned `paid = true` with `receipt = null` and `code = null`. A caller doing the documented
+  `if (outcome.paid) fulfil(order)` shipped goods against a response that evidenced nothing. The
+  whole state-dependent schema is now validated before a `Payment` is constructed: `status` must be a
+  known wire value; `mpesaReceipt`, `resultCode` and `resultDesc` must have the right shapes when
+  present; and a terminal **success must carry a receipt or a result code**. Every malformed 2xx now
+  raises an **indeterminate** `PaylodApiException` (they previously omitted `indeterminate = true`
+  too, so even the one case that was caught did not read as a stop signal).
+
+- **`collectAndWait()` no longer discards the acknowledged idempotency key.** The collect succeeded
+  and returned a key; the subsequent `wait()` knows nothing about it, so every post-collect failure —
+  timeout, transport blip, 5xx, malformed poll body, interrupt — surfaced with
+  `idempotencyKey = null`. A caller following the documented "retry with the key from the exception"
+  rule found none, minted a fresh one, and fired a **second STK prompt** at a customer whose first
+  prompt was still live. Failures after the ack now carry both `idempotencyKey` and the new
+  `PaylodException.paymentId`.
+
+- **The whole collect acknowledgement is validated, not just `paymentId`.** A missing, blank or
+  wrong-typed `checkoutRequestId` previously produced a silent `CollectAck` carrying empty strings
+  that callers went on to use as real checkout references. `POST /collect` always answers `202` with
+  a hardcoded `status: "pending"` — an idempotent replay returns the *stored original* ack, not the
+  settled state — so the literal is now required too, and any malformed 2xx is an indeterminate,
+  key-bearing exception.
+
+- **Thread interrupts no longer escape raw from a sleep.** `RealTimeSource.sleep` let
+  `InterruptedException` propagate from retry, `Retry-After` and polling waits. That cleared the
+  interrupt flag on the way out AND, because it is not a `PaylodException`, slipped past the handlers
+  that attach the effective `Idempotency-Key` — leaving a caller with a possibly-live charge and no
+  key to retry it under. It now restores the flag and throws `PaylodInterruptedException`.
+
+- **Deadlines are measured on a monotonic clock.** `wait()` budgets and every remaining-time
+  calculation used `System.currentTimeMillis()`, so a backward wall-clock adjustment (NTP step, VM
+  resume, manual change) landing mid-wait extended polling past the promised deadline — unboundedly,
+  in the limit. `TimeSource` now exposes `monotonicMillis()` for all duration arithmetic; the wall
+  clock is retained only for HTTP-date `Retry-After` parsing, which genuinely needs civil time.
+
+### Security
+
+- **The API key can no longer leak through a header error.** A key carrying an embedded control
+  character reached the JDK's header validation *outside* the transport's `try`, and the
+  `IllegalArgumentException` it raises embeds the entire `Bearer …` value. API-key syntax is now
+  validated at construction (printable ASCII, with a message that names the offending code point and
+  never echoes the key), and header assembly is guarded so any failure is re-reported with the header
+  NAME only.
+
+- **The raw header map no longer prints secrets.** `HttpRequestSpec.toString()` redacted, but
+  `spec.headers` is a public field whose own `toString()` rendered `authorization` verbatim — which
+  is what string templates, structured-log field dumps and debuggers actually call. Headers are now
+  passed as a redacting map: lookups return the real value, printing never does.
+
+- **The no-redirect guarantee is no longer bypassable.** It applied only to the default constructor.
+  `JdkHttpTransport`'s client-taking constructor is now `private` (it was public JVM bytecode) behind
+  an internal factory, every instance is rejected unless `followRedirects() == NEVER`, and — since
+  the SDK cannot police an arbitrary injected `HttpTransport` — the client itself now refuses any
+  3xx outright rather than treating it as something to chase.
+
+### Correctness
+
+- **The JSON reader is RFC 8259-strict.** It accepted unescaped control characters inside strings,
+  leading zeros, and half-formed numbers (`-`, `1.`, `.5`, `1e+`), plus non-hex `\u` escapes. A
+  response could therefore carry valid required fields and pass 2xx validation while the document as
+  a whole was not JSON that any conforming parser would read. Malformed bodies are now rejected, which
+  routes them into the indeterminate path.
+
 ## [0.3.0] - 2026-07-18
 
 Second-pass hardening from a codex re-verification of 0.2.0. The first pass was directionally right

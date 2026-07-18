@@ -19,6 +19,11 @@ class Step(
     val json: Any? = emptyMap<String, Any?>(),
     val headers: Map<String, String> = emptyMap(),
     val throwable: Throwable? = null,
+    /**
+     * A RAW response body, sent verbatim instead of serialising [json]. The only way to test what the
+     * client does with a body that is not valid JSON — `Json.write` can only ever emit valid JSON.
+     */
+    val raw: String? = null,
 )
 
 /**
@@ -41,15 +46,24 @@ class StubTransport(private val steps: List<Step>) : HttpTransport {
         }
         index++
         step.throwable?.let { throw it }
-        return HttpResponseSpec(step.status, step.headers, Json.write(step.json))
+        return HttpResponseSpec(step.status, step.headers, step.raw ?: Json.write(step.json))
     }
 }
 
-/** A deterministic clock: `sleep` advances a virtual clock instead of blocking the suite. */
-class FakeTimeSource(var now: Long = 0) : TimeSource {
+/**
+ * A deterministic clock: `sleep` advances a virtual clock instead of blocking the suite.
+ *
+ * The wall clock ([now]) and the monotonic counter ([mono]) are tracked SEPARATELY, so a test can
+ * step the wall clock backwards — an NTP correction — and assert that deadlines do not move.
+ */
+class FakeTimeSource(var now: Long = 0, var mono: Long = 0) : TimeSource {
     override fun nowMillis(): Long = now
+    override fun monotonicMillis(): Long = mono
     override fun sleep(ms: Long) {
-        if (ms > 0) now += ms
+        if (ms > 0) {
+            now += ms
+            mono += ms
+        }
     }
 }
 

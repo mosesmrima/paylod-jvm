@@ -20,6 +20,16 @@ open class PaylodException internal constructor(
      */
     @JvmField
     var idempotencyKey: String? = null
+
+    /**
+     * The paylod payment id the failed operation was working on, when one is known.
+     *
+     * `collectAndWait()` sets this (alongside [idempotencyKey]) on ANY failure that happens after the
+     * collect was acknowledged — a poll timeout, a transport blip, a 5xx, a malformed status body.
+     * Without it, the caller of the one-liner has no handle on the charge that is already live.
+     */
+    @JvmField
+    var paymentId: String? = null
 }
 
 /** Bad input caught locally, before any network call (invalid amount, unparseable phone). */
@@ -105,6 +115,33 @@ internal fun assertValidIdempotencyKey(key: String) {
         throw PaylodInvalidRequestException(
             "idempotencyKey must be $MAX_IDEMPOTENCY_KEY_BYTES bytes or fewer when UTF-8 encoded " +
                 "(got $bytes).",
+        )
+    }
+}
+
+/**
+ * Reject an API key that cannot travel in an `Authorization` header, at CONSTRUCTION time.
+ *
+ * The key is interpolated into `Authorization: Bearer <key>`. If it carries a control character or a
+ * non-ASCII code point, the JDK's own header validation rejects it — and the `IllegalArgumentException`
+ * it raises embeds the ENTIRE offending header value, i.e. the full bearer token. That exception then
+ * travels into logs, error trackers and bug reports with the live key inside it. Catching it at the
+ * transport is not enough; the only safe place is before the key is ever put in a header.
+ *
+ * The error message below deliberately names the code point and its position, and NEVER echoes the
+ * key itself.
+ */
+internal fun assertValidApiKey(key: String) {
+    val bad = key.indexOfFirst { it.code < 0x20 || it.code > 0x7e }
+    if (bad >= 0) {
+        val c = key[bad]
+        throw PaylodConfigException(
+            "The paylod API key contains a character that cannot travel in an HTTP header: U+%04X at "
+                .format(c.code) +
+                "index $bad. An API key is printable ASCII (0x20-0x7E). This is usually a stray newline " +
+                "or a smart quote picked up when the key was copied into an env var or a secrets file — " +
+                "re-copy it. (The key itself is deliberately not echoed here: this message ends up in " +
+                "logs.)",
         )
     }
 }
@@ -205,15 +242,20 @@ class PaylodInterruptedException internal constructor(
  * explicitly: keep the order pending and let the webhook settle it.
  */
 class PaylodTimeoutException internal constructor(
-    @JvmField val paymentId: String,
+    timedOutPaymentId: String,
     /** The last `pending` snapshot we read before giving up. */
     @JvmField val payment: Payment,
     @JvmField val waitedMs: Long,
 ) : PaylodException(
-    "Payment $paymentId was still pending after ${Math.round(waitedMs / 1000.0)}s. " +
+    "Payment $timedOutPaymentId was still pending after ${Math.round(waitedMs / 1000.0)}s. " +
         "It is NOT failed — the customer may still complete it. Leave the order pending and " +
         "let the webhook (or a later paylod.status() call) settle it.",
-)
+) {
+    init {
+        // Inherited from PaylodException so EVERY post-collect failure carries the id uniformly.
+        this.paymentId = timedOutPaymentId
+    }
+}
 
 /** Why a webhook signature failed to verify. */
 enum class SignatureFailureReason {

@@ -7,12 +7,23 @@ enum class PaymentStatus {
     FAILED;
 
     internal companion object {
-        fun fromWire(value: String?): PaymentStatus = when (value) {
+        /**
+         * Strict: `null` for anything that is not an exact known wire value. Validators use this so an
+         * unrecognised status is REJECTED at the boundary rather than quietly coerced.
+         */
+        fun parseWire(value: String?): PaymentStatus? = when (value) {
             "pending" -> PENDING
             "success" -> SUCCESS
             "failed" -> FAILED
-            else -> PENDING
+            else -> null
         }
+
+        /**
+         * Lenient: unknown reads as PENDING. Only safe AFTER [parseWire] has already vetted the body —
+         * "keep polling" is the conservative default, but on its own it would silently mask a status
+         * the SDK does not understand.
+         */
+        fun fromWire(value: String?): PaymentStatus = parseWire(value) ?: PENDING
     }
 }
 
