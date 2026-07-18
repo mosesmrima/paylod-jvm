@@ -6,3 +6,6 @@ build/
 *.iml
 .DS_Store
 local.properties
+
+# Kotlin 2.x compiler scratch dir.
+.kotlin/

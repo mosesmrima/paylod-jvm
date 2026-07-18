@@ -536,6 +536,10 @@ for case in CASES:
             write(rel, text)
 
     results.append((case, status, f"{detail}; selector covers {ran} test(s)"))
+    # Report AS WE GO, flushed. The table used to be printed only at the very end, so a run that
+    # was interrupted — and a full pass takes a while — produced nothing at all, discarding every
+    # case it had already settled. Progress that only exists at the end is progress you can lose.
+    print(f"[{len(results)}/{len(CASES)}] {case['id']:<24} {status:<16} {detail}", flush=True)
 
 print("\n| id | reverted protection | guarding tag | result |")
 print("| --- | --- | --- | --- |")
