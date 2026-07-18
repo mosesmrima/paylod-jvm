@@ -62,6 +62,21 @@ internal object PaymentValidators {
         if (!isNonBlankString(ack["paymentId"])) bad("no usable paymentId")
         if (!isNonBlankString(ack["checkoutRequestId"])) bad("no usable checkoutRequestId")
 
+        // CREDENTIAL-BEARING IDENTIFIERS ARE REFUSED. `CollectAck` is a public data class, so its
+        // GENERATED `toString()` prints both of these, and a caller who logs the ack — which is the
+        // normal thing to do with an ack — publishes whatever the server put in them. A server that
+        // echoes the bearer token into `paymentId` has not named a payment; it has handed back our
+        // own credential. See [Redactor.containsCredential].
+        if (redact.containsCredential(ack["paymentId"] as? String)) {
+            bad("paymentId contains something shaped like an API credential, so it is not a payment id")
+        }
+        if (redact.containsCredential(ack["checkoutRequestId"] as? String)) {
+            bad(
+                "checkoutRequestId contains something shaped like an API credential, so it is not a " +
+                    "checkout request id",
+            )
+        }
+
         // `status` is a HARDCODED LITERAL "pending" on the backend, present on every 202 — including
         // an idempotent REPLAY, which returns the STORED original ack rather than the current settled
         // state. So there is no legitimate ack carrying a settled status, and no legitimate ack
@@ -134,6 +149,9 @@ internal object PaymentValidators {
 
         val id = p["id"]
         if (!isNonBlankString(id)) bad("no payment id")
+        if (redact.containsCredential(id as? String)) {
+            bad("the payment id contains something shaped like an API credential, so it is not an id")
+        }
 
         // ID BINDING, checked before anything else about the record's CONTENTS: if this fails then
         // every remaining field describes some other payment, and reasoning about them is not merely
@@ -157,6 +175,11 @@ internal object PaymentValidators {
         if (receipt != null && (receipt !is String || receipt.isBlank())) {
             bad("mpesaReceipt is present but is not a non-empty string")
         }
+        // An M-Pesa receipt is THE proof of settlement and it lands on a public field of a data
+        // class. A credential echoed into it is neither a receipt nor safe to expose.
+        if (redact.containsCredential(receipt as? String)) {
+            bad("mpesaReceipt contains something shaped like an API credential, so it is not a receipt")
+        }
 
         // `resultCode` is an input to the evidence function. A shape it cannot read (a boolean, an
         // object, an empty string) would be normalized into a junk string and classified as an
@@ -177,32 +200,41 @@ internal object PaymentValidators {
             status = status,
             mpesaReceipt = receipt as String?,
             resultCode = normalizeResultCode(resultCode),
-            resultDesc = resultDesc as String?,
+            // SCRUBBED, not refused. `resultDesc` is free-form server prose with no identity role,
+            // so a credential echoed into it is masked and the (still useful) rest of the sentence
+            // survives. It reaches `Payment.resultDesc`, `PaymentOutcome.payment.resultDesc` and the
+            // generated `toString()` of both, which is why it cannot be passed through raw.
+            resultDesc = redact.optionalText(resultDesc as String?),
         )
     }
 
     /**
-     * The wire `resultCode` as a string. JSON numbers arrive as `Long`/`Double`, and a whole `Double`
-     * must render as `"1032"` rather than `"1032.0"` — the catalog is keyed on the former, and the
-     * latter would classify as an unknown code and silently change the verdict.
+     * The wire `resultCode` as a string, WITHOUT changing its type.
      *
-     * ZERO IS THE EXCEPTION, and deliberately so. Collapsing a whole `Double` to its integer form is
-     * a convenience for CATALOG LOOKUP, where it is harmless: it only decides which entry describes
-     * a failure. Applied to zero it stops being a lookup convenience and becomes evidence
-     * laundering — it manufactures the canonical success code `"0"` out of a JSON `0.0`, which is
-     * not the schema-approved success value (see [DarajaCatalog.isCanonicalSuccessCode]). A float
-     * zero therefore keeps its own representation, fails the canonical-zero test downstream, and is
-     * classified as ambiguous rather than as proof that money moved.
+     * ── Why a whole `Double` no longer collapses to its integer form ──────────────────────
+     * It used to: `1032.0` became `"1032"` so the catalog lookup would find the entry. That is the
+     * round-6 root defect — NORMALIZATION BEFORE VALIDATION — surviving in the float path, and it
+     * is the single most dangerous shape it can take. A raw JSON `1032.0` or `1.032e3` was
+     * laundered into the canonical string `"1032"`, which selected the "customer cancelled" entry:
+     * `retryable = true`, "offer a clear retry button". A float that Daraja never sent was turned
+     * into a confident instruction to charge the customer again.
+     *
+     * [DarajaCatalog.codeLexeme] already refuses a float-typed code — there is no lossless
+     * rendering of a `Double` back to the token the sender wrote, since `0.0`, `-0.0`, `1032.0` and
+     * `1.032e3` all collapse, and the schema specifies an integer. That refusal was worth nothing
+     * while THIS function handed the catalog a laundered integer string one layer up.
+     *
+     * So a `Double` now keeps its own representation, unconditionally. `1032.0` stays `"1032.0"`,
+     * which is not a code any catalog entry is keyed on, so it decodes as the indeterminate,
+     * NON-RETRYABLE fallback — and a float zero still fails
+     * [DarajaCatalog.isCanonicalSuccessCode], as it has since round 6. Only an INTEGRAL JSON token
+     * (`Long`/`Int`/…) or an exact canonical string can select an entry.
      */
     private fun normalizeResultCode(v: Any?): String? = when (v) {
         null -> null
-        // `v != 0.0` is false for -0.0 as well, which is deliberate and load-bearing: IEEE equality
-        // merges the two zeros, so this one comparison holds BOTH back from the integer form. The
-        // negative case reaches here now that the JSON reader stops collapsing a raw `-0` into an
-        // integral zero, and it must be held back for the same reason the positive one is —
-        // `(-0.0).toLong().toString()` is the literal "0", the canonical success code spelled exactly.
-        is Double ->
-            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()
+        // No collapse, at any value. Not just at zero: the non-zero float path selected a RETRYABLE
+        // cancellation entry, which is strictly worse than manufacturing a success code.
+        is Double -> v.toString()
         else -> v.toString()
     }
 }

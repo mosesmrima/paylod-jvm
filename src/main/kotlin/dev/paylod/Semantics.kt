@@ -37,10 +37,12 @@ package dev.paylod
  *                    all. It is a hard, INDETERMINATE error. (Enforced at the transport boundary
  *                    in [PaymentValidators.assertPaymentBody] — a wrong-payment body must not
  *                    even reach this file.)
- *   L2  EVIDENCE     `PAID` requires SUCCESS evidence. A bare `status: "success"` with no receipt
- *                    and no result code proves nothing and is never paid. The converse is NOT
- *                    required: success WITHOUT a receipt is legitimate, because receipts attach
- *                    asynchronously — result code 0 is equally good evidence.
+ *   L2  EVIDENCE     A TERMINAL verdict requires evidence, in BOTH directions. A bare
+ *                    `status: "success"` with no receipt and no result code proves nothing and is
+ *                    never `PAID`; a bare `status: "failed"` with no result code proves nothing and
+ *                    is never `FAILED` (and so is never RETRYABLE). A receipt is not required for
+ *                    success — receipts attach asynchronously, and result code 0 is equally good
+ *                    evidence — but SOMETHING must be there.
  *   L3  CONSISTENCY  A claim that contradicts its evidence is INDETERMINATE — never a failure,
  *                    and in particular never a RETRYABLE failure. We cannot prove money did not
  *                    move, so we must not invite a second charge.
@@ -159,7 +161,7 @@ object PaymentSemantics {
      * claim \ evidence  NONE           SUCCESS         FAILURE         IN_FLIGHT      CONFLICT
      * SUCCESS           INDETERMINATE  PAID            INDETERMINATE   INDETERMINATE  INDETERMINATE
      * PENDING           IN_FLIGHT      INDETERMINATE   INDETERMINATE   IN_FLIGHT      INDETERMINATE
-     * FAILED            FAILED         INDETERMINATE   FAILED          INDETERMINATE  INDETERMINATE
+     * FAILED            INDETERMINATE  INDETERMINATE   FAILED          INDETERMINATE  INDETERMINATE
      * ```
      *
      * Note the shape of the IN_FLIGHT column: a `pending` claim beside in-flight evidence is the one
@@ -259,7 +261,32 @@ object PaymentSemantics {
                         "status claims the payment failed terminally while the result code says it " +
                         "is still in flight — the two contradict, so the record proves nothing; it " +
                         "is neither settled nor safe to charge again"
-                PaymentEvidence.NONE, PaymentEvidence.FAILURE ->
+                // L2, applied to the FAILURE direction — the law was only ever enforced on the
+                // success one.
+                //
+                // A record claiming `failed` with NO receipt and NO result code carries no
+                // evidence at all. It was accepted as terminal purely on its own say-so, which is
+                // exactly the claim-substituting-for-evidence move this file exists to forbid: the
+                // reasoning for it ("proving a payment did NOT happen is not something we require
+                // evidence for, because the safe action is the same either way") is false in the
+                // one direction that costs money. A terminal FAILED verdict is what makes
+                // `Outcomes.of` consult the catalog's `retryable` at all, so a bare `{status:
+                // "failed"}` — the shape a truncated row, a stubbed endpoint or a cached error
+                // envelope produces — was one catalog lookup away from telling a merchant to
+                // charge again for a payment whose real state nobody knew.
+                //
+                // So it is INDETERMINATE: rendered as PENDING, never paid, never retryable, and
+                // `wait()` keeps polling until the webhook settles it or the deadline expires.
+                //
+                // The CONVERSE is untouched, deliberately: `failed` beside genuine FAILURE evidence
+                // is still a terminal failure, and still retryable exactly where the catalog says
+                // so. This narrows the door; it does not close it.
+                PaymentEvidence.NONE ->
+                    PaymentVerdict.INDETERMINATE to
+                        "status claims the payment failed but the record carries neither a receipt " +
+                        "nor a result code, so there is no evidence it actually failed — a claim " +
+                        "is not evidence for itself"
+                PaymentEvidence.FAILURE ->
                     PaymentVerdict.FAILED to "the payment failed terminally"
                 PaymentEvidence.CONFLICT ->
                     PaymentVerdict.INDETERMINATE to CONFLICT_REASON

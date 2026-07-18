@@ -17,6 +17,29 @@ package dev.paylod.internal
  * A server cannot be trusted not to echo. So nothing derived from a response reaches a caller
  * without passing through here.
  */
+/**
+ * The credential SHAPES this SDK can recognise without holding the secret itself.
+ *
+ * Lifted out of [Redactor] because two callers need it and only one of them has a client: a webhook
+ * is verified by a static function with no [Redactor] in scope, and a webhook body is exactly as
+ * server-controlled as a status body.
+ */
+internal object CredentialShapes {
+
+    const val MASK = "[redacted]"
+
+    /** `mp_live_…` / `mp_test_…` and long bearer tokens, whoever they belong to. */
+    val KEY_SHAPED_RE = Regex("mp_(?:live|test)_[A-Za-z0-9_\\-]{4,}|(?i:bearer)\\s+[A-Za-z0-9._\\-]{12,}")
+
+    /** Does this server-supplied string carry something shaped like a credential? */
+    fun looksLikeCredential(value: String?): Boolean =
+        value != null && KEY_SHAPED_RE.containsMatchIn(value)
+
+    /** Scrub credential-shaped runs out of a string, preserving `null`. */
+    fun scrub(value: String?): String? =
+        if (value == null) null else KEY_SHAPED_RE.replace(value, MASK)
+}
+
 internal class Redactor(secrets: List<String?>) {
 
     /**
@@ -44,6 +67,39 @@ internal class Redactor(secrets: List<String?>) {
         // damage; a leaked key is not.
         return KEY_SHAPED_RE.replace(out, MASK)
     }
+
+    /**
+     * Does this server-supplied value carry a credential — ours, or one merely SHAPED like one?
+     *
+     * ── Why an identifier that echoes a token is REFUSED, not redacted ────────────────────
+     * `resultDesc`, `mpesaReceipt`, `paymentId` and `checkoutRequestId` are all server-controlled,
+     * and they land on PUBLIC fields of `CollectAck`, `Payment`, `PaymentOutcome` and
+     * `WebhookEvent` — which are Kotlin `data class`es, so `toString()` is GENERATED and prints
+     * every field. An API that echoes the request back (a validation error quoting the offending
+     * headers, a debug envelope, a proxy error page, a gateway rendering the whole request on a
+     * 502) therefore put a live `Authorization: Bearer mp_live_…` into an object that every
+     * integrator logs wholesale — by default, with no logging mistake required. The error paths
+     * were carefully redacted and the SUCCESS paths were not redacted at all.
+     *
+     * The two field kinds are handled differently ON PURPOSE:
+     *
+     *   • An IDENTIFIER carrying a credential is not a leak with a valid id inside it; it is not an
+     *     identifier at all. A `paymentId` that is a bearer token names no payment, so masking it
+     *     would produce a well-formed record pointing at `"[redacted]"` — and the SDK would go on
+     *     to bind, poll and reconcile against that. It is refused as INDETERMINATE, which is the
+     *     honest reading of a response we cannot make sense of.
+     *
+     *   • Optional server TEXT (`resultDesc`) has no identity role. It is diagnostic prose, so it
+     *     is scrubbed and passed on rather than turning a decodable failure into an unreadable one.
+     */
+    fun containsCredential(value: String?): Boolean {
+        if (value == null) return false
+        if (needles.any { value.contains(it) }) return true
+        return CredentialShapes.looksLikeCredential(value)
+    }
+
+    /** [text], but `null` in gives `null` out — for OPTIONAL fields, where `""` is not the same. */
+    fun optionalText(value: String?): String? = if (value == null) null else text(value)
 
     /**
      * Deep-redact a parsed response body.
@@ -76,11 +132,11 @@ internal class Redactor(secrets: List<String?>) {
     }
 
     private companion object {
-        const val MASK = "[redacted]"
+        const val MASK = CredentialShapes.MASK
         const val MIN_SECRET_LENGTH = 8
         const val MAX_DEPTH = 8
 
-        /** `mp_live_…` / `mp_test_…` and long bearer tokens, whoever they belong to. */
-        val KEY_SHAPED_RE = Regex("mp_(?:live|test)_[A-Za-z0-9_\\-]{4,}|(?i:bearer)\\s+[A-Za-z0-9._\\-]{12,}")
+        /** ONE definition, shared with the webhook path. See [CredentialShapes]. */
+        val KEY_SHAPED_RE = CredentialShapes.KEY_SHAPED_RE
     }
 }

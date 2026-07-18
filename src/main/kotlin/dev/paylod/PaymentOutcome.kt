@@ -39,7 +39,13 @@ data class PaymentOutcome(
     val receipt: String?,
     /** The raw M-Pesa `ResultCode`, normalized to a string. `null` when M-Pesa hasn't spoken. */
     val code: String?,
-    /** Title / cause / fix / category, for logs, support tickets and dashboards. */
+    /**
+     * Title / cause / fix / category, for logs, support tickets and dashboards.
+     *
+     * INVARIANT: `detail.retryable` is `true` only when [retryable] is `true`. On any verdict other
+     * than a proven terminal failure the catalog's `retryable` is overridden to `false` in a copy,
+     * so no field of this object can invite a second charge while another field forbids it.
+     */
     val detail: DecodedError?,
     /** The raw payment record, for anything the above doesn't cover. */
     val payment: Payment,
@@ -108,6 +114,25 @@ object Outcomes {
         // nested inside the status validator, and the gaps BETWEEN those three were where
         // `{status: pending, resultCode: 0}` came back paid and a receipt on a failed row came back
         // `retryable = true`.
+        // ── EVERY exposed `retryable`, not just the top-level one ────────────────────────────
+        //
+        // `outcome.retryable` was computed per verdict and `outcome.detail` was passed through
+        // UNTOUCHED, so `{status: "failed", mpesaReceipt: "SFF6XYZ123", resultCode: "1032"}` —
+        // an INDETERMINATE verdict — came back with `outcome.retryable = false` beside
+        // `outcome.detail.retryable = true`. The object still told the caller another charge was
+        // safe; it just made them read one field deeper to hear it. A merchant branching on
+        // `outcome.detail.retryable` (a perfectly reasonable thing to do with a field documented as
+        // "safe to charge again") double-charges a customer holding an M-Pesa receipt.
+        //
+        // `retryable` means SAFE TO CHARGE AGAIN, and that is a property of the VERDICT, not of the
+        // catalog row. The catalog's answer is only admissible on a FAILED verdict, where the SDK
+        // has actually established that no money moved and nothing is in flight. On every other
+        // verdict the honest value is `false`, so the detail is handed back as a verdict-adjusted
+        // COPY — the diagnostics (title, cause, fix, category, customer message) survive, the
+        // dangerous claim does not.
+        fun safeDetail(): DecodedError? =
+            if (detail == null || !detail.retryable) detail else detail.copy(retryable = false)
+
         return when (PaymentSemantics.judge(payment).verdict) {
             PaymentVerdict.PAID -> PaymentOutcome(
                 status = OutcomeStatus.SUCCEEDED,
@@ -117,7 +142,7 @@ object Outcomes {
                 paymentId = payment.id,
                 receipt = payment.mpesaReceipt,
                 code = code,
-                detail = detail,
+                detail = safeDetail(),
                 payment = payment,
             )
 
@@ -132,7 +157,7 @@ object Outcomes {
                 paymentId = payment.id,
                 receipt = null,
                 code = code,
-                detail = detail,
+                detail = safeDetail(),
                 payment = payment,
             )
 
@@ -146,7 +171,7 @@ object Outcomes {
                 paymentId = payment.id,
                 receipt = null,
                 code = code,
-                detail = detail,
+                detail = safeDetail(),
                 payment = payment,
             )
 

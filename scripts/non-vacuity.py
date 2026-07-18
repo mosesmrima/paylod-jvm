@@ -51,6 +51,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # a silent no-op mutation cannot masquerade as a caught one. `also` reverts a second site when a
 # guarantee has two independent implementations — reverting one alone would prove nothing, because
 # the other still holds the line, so the mutation has to remove the GUARANTEE.
+# The FAILED + NO-EVIDENCE cell, spelled out once and reverted by two cases (the semantic law
+# itself, and the webhook rule that leans on it). Kept as constants because the replacement text
+# contains quote runs that do not survive being inlined into a triple-quoted literal.
+FAILED_NONE_FIND = (
+    "                PaymentEvidence.NONE ->\n"
+    "                    PaymentVerdict.INDETERMINATE to\n"
+    '                        "status claims the payment failed but the record carries neither a receipt " +\n'
+    '                        "nor a result code, so there is no evidence it actually failed — a claim " +\n'
+    '                        "is not evidence for itself"'
+)
+FAILED_NONE_REPL = (
+    "                PaymentEvidence.NONE ->\n"
+    '                    PaymentVerdict.FAILED to "the payment failed terminally"'
+)
+
 CASES = [
     # ── ROOT 1 ────────────────────────────────────────────────────────────────────────────────
     dict(
@@ -588,6 +603,169 @@ CASES = [
             Regex("^(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){1,6}$").containsMatchIn(code) ||
             Regex("^[A-Za-z][A-Za-z0-9_]{0,31}$").containsMatchIn(code)""")],
     ),
+
+    # ── ROUND 7 ───────────────────────────────────────────────────────────────────────────────
+    dict(
+        id="R7-idem-required", tag="nv-idem-required",
+        what="the idempotency key is OPTIONAL again — omitting it generates one instead of throwing",
+        edits=[("src/main/kotlin/dev/paylod/Idempotency.kt",
+                'if (unsafeGenerated != true) throw PaylodInvalidRequestException(REQUIRED_MESSAGE(what))',
+                'if (false) throw PaylodInvalidRequestException(REQUIRED_MESSAGE(what))')],
+    ),
+    dict(
+        id="R7-idem-optout", tag="nv-idem-optout",
+        what="a FALSE opt-out is honoured as an opt-out (any value permits a generated key)",
+        edits=[("src/main/kotlin/dev/paylod/Idempotency.kt",
+                'if (unsafeGenerated != true) throw PaylodInvalidRequestException(REQUIRED_MESSAGE(what))',
+                'if (false) throw PaylodInvalidRequestException(REQUIRED_MESSAGE(what))')],
+    ),
+    dict(
+        id="R7-idem-warn-every", tag="nv-idem-warn-every",
+        what="the once-per-process warning latch is restored, so a loop of charges warns once",
+        edits=[("src/main/kotlin/dev/paylod/Idempotency.kt",
+                "    private fun warnUnprotectedCharge(what: String) {",
+                "    private val warnedOnce = java.util.concurrent.atomic.AtomicBoolean(false)\n\n"
+                "    private fun warnUnprotectedCharge(what: String) {\n"
+                "        if (!warnedOnce.compareAndSet(false, true)) return")],
+    ),
+    dict(
+        id="R7-float-status", tag="nv-float-status",
+        what="a whole FLOAT result code is collapsed to its integer form again, on the status path "
+             "and in the catalog alike",
+        edits=[("src/main/kotlin/dev/paylod/Validators.kt",
+                "        is Double -> v.toString()\n        else -> v.toString()",
+                "        is Double ->\n"
+                "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()\n"
+                "        else -> v.toString()"),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "        if (resultCode != null && codeLexeme(resultCode) == null) return StkOutcome.PENDING",
+                "        if (false) return StkOutcome.PENDING")],
+    ),
+    dict(
+        id="R7-float-webhook", tag="nv-float-webhook",
+        what="the webhook reader collapses a whole FLOAT result code to its integer form again",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "        is Double -> v.toString()\n        else -> v.toString()",
+                "        is Double ->\n"
+                "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()\n"
+                "        else -> v.toString()")],
+    ),
+    dict(
+        id="R7-detail-retryable", tag="nv-detail-retryable",
+        what="the nested detail is passed through unadjusted, so a non-FAILED verdict can expose "
+             "detail.retryable = true",
+        edits=[("src/main/kotlin/dev/paylod/PaymentOutcome.kt",
+                "            if (detail == null || !detail.retryable) detail else detail.copy(retryable = false)",
+                "            detail")],
+    ),
+    dict(
+        id="R7-echo-ident", tag="nv-echo-ident",
+        what="credential-bearing identifiers are accepted again on the ack and the status read",
+        edits=[("src/main/kotlin/dev/paylod/Validators.kt",
+                'if (redact.containsCredential(ack["paymentId"] as? String)) {',
+                "if (false) {"),
+               ("src/main/kotlin/dev/paylod/Validators.kt",
+                "if (redact.containsCredential(id as? String)) {",
+                "if (false) {"),
+               ("src/main/kotlin/dev/paylod/Validators.kt",
+                "if (redact.containsCredential(receipt as? String)) {",
+                "if (false) {"),
+               ("src/main/kotlin/dev/paylod/Validators.kt",
+                'if (redact.containsCredential(ack["checkoutRequestId"] as? String)) {',
+                "if (false) {")],
+    ),
+    dict(
+        id="R7-echo-text", tag="nv-echo-text",
+        what="optional server text is handed back raw, so an echoed token reaches a public toString()",
+        edits=[("src/main/kotlin/dev/paylod/Validators.kt",
+                "            resultDesc = redact.optionalText(resultDesc as String?),",
+                "            resultDesc = resultDesc as String?,")],
+    ),
+    dict(
+        id="R7-echo-webhook", tag="nv-echo-webhook",
+        what="the webhook reader accepts credential-bearing ids and exposes raw server text",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "        if (CredentialShapes.looksLikeCredential(paymentId)) {",
+                "        if (false) {"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                'if (CredentialShapes.looksLikeCredential(data["checkoutRequestId"] as? String)) {',
+                "if (false) {"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                'if (CredentialShapes.looksLikeCredential(data["mpesaReceipt"] as? String)) {',
+                "if (false) {"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                '                resultDesc = CredentialShapes.scrub(asString(data["resultDesc"])),',
+                '                resultDesc = asString(data["resultDesc"]),')],
+    ),
+    dict(
+        id="R7-failed-noevidence", tag="nv-failed-noevidence",
+        what="a FAILED claim with NO evidence is accepted as a terminal failure again",
+        edits=[("src/main/kotlin/dev/paylod/Semantics.kt",
+                FAILED_NONE_FIND, FAILED_NONE_REPL)],
+    ),
+    dict(
+        id="R7-wh-failed-needscode", tag="nv-wh-failed-needscode",
+        what="a payment.failed webhook no longer has to carry a canonical failure code (BOTH the "
+             "explicit check and the semantic backstop reverted)",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                '            if (lexeme == null || lexeme.isBlank() || !DarajaCatalog.isCanonicalCodeLexeme(lexeme)) {',
+                "            if (false) {"),
+               ("src/main/kotlin/dev/paylod/Semantics.kt",
+                FAILED_NONE_FIND, FAILED_NONE_REPL)],
+    ),
+
+    # ── PREVIOUSLY UNREGISTERED ───────────────────────────────────────────────────────────────
+    # These three carried an `nv-` tag and were never in this list, so the protections they name
+    # had never once been proven non-vacuous. The completeness assertion below now makes that
+    # impossible to repeat.
+    dict(
+        id="R5-status-typed", tag="nv-status-typed",
+        what="the validator asserts and the CALLER re-reads the map, so the record the verdict is "
+             "computed from is not the record that was approved",
+        edits=[("src/main/kotlin/dev/paylod/Validators.kt",
+                "            status = status,",
+                "            status = PaymentStatus.PENDING,")],
+    ),
+    dict(
+        id="R6-wh-decoded-canonical", tag="nv-wh-decoded-canonical",
+        what="the webhook's `decoded` block is taken from the payload instead of the catalog",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                """            if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }""",
+                """            @Suppress("UNCHECKED_CAST")
+            val block = data["decoded"] as? Map<String, Any?>
+            if (block != null) {
+                DecodedError(
+                    code = block["code"] as String,
+                    title = block["title"] as String,
+                    cause = block["cause"] as String,
+                    fix = block["fix"] as String,
+                    category = DarajaCategory.fromWire(block["category"] as String),
+                    retryable = block["retryable"] as Boolean,
+                    customerMessage = block["customerMessage"] as String,
+                )
+            } else if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }""")],
+    ),
+    dict(
+        id="R6-wh-failed-notfailed", tag="nv-wh-failed-notfailed",
+        what="a payment.failed whose record assesses as in-flight or indeterminate is delivered",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                'if (type == "payment.failed" && judgement.verdict != PaymentVerdict.FAILED) {',
+                "if (false) {")],
+    ),
 ]
 
 COUNT_RE = re.compile(r"NVCOUNT tests=(\d+) failed=(\d+) skipped=(\d+)")
@@ -668,6 +846,59 @@ def write(rel, text):
     with open(os.path.join(ROOT, rel), "w", encoding="utf-8") as f:
         f.write(text)
 
+
+# ── EVERY nv-TAGGED PROTECTION MUST BE LISTED ────────────────────────────────────────────────
+#
+# Three tests carried an `nv-` tag and were never registered here — nv-status-typed,
+# nv-wh-decoded-canonical and nv-wh-failed-notfailed — so three protections advertised themselves
+# as non-vacuity-verified and had never once been reverted. That is a worse failure than a missing
+# test: it is a missing test wearing the badge of a verified one, and nothing in the tooling could
+# see it, because the harness only ever looked at its own list.
+#
+# So the list is now checked against the SOURCE OF TRUTH — the tags actually present in the test
+# tree — before any case runs. An unlisted tag is a hard failure, not a warning: a warning at the
+# top of a fifteen-minute run is a warning nobody reads.
+# ASCII tag characters only. A looser `[^"]+` also matched the literal `@Tag("nv-…")` that appears
+# inside the KDoc of the test files, which is prose, not a tag.
+TAG_RE = re.compile(r'@Tag\("(nv-[A-Za-z0-9-]+)"\)')
+
+
+def discover_tags():
+    found = set()
+    for dirpath, _, filenames in os.walk(os.path.join(ROOT, "src", "test")):
+        for name in filenames:
+            if not name.endswith(".kt"):
+                continue
+            with open(os.path.join(dirpath, name), encoding="utf-8") as f:
+                found.update(TAG_RE.findall(f.read()))
+    return found
+
+
+declared = {c["tag"] for c in CASES}
+present = discover_tags()
+
+unlisted = sorted(present - declared)
+if unlisted:
+    print(
+        "UNREGISTERED nv TAGS — these protections claim non-vacuity verification and have never "
+        "been reverted:\n  " + "\n  ".join(unlisted),
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+# The converse is a failure too: a case naming a tag no test carries is a selector that will match
+# zero tests, which the per-case liveness gate catches — but catching it here costs nothing and
+# reports it as the bookkeeping error it is rather than as a broken selector.
+missing = sorted(declared - present)
+if missing:
+    print(
+        "CASES NAME TAGS THAT NO TEST CARRIES:\n  " + "\n  ".join(missing),
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+print(f"{len(declared)} nv tags declared, {len(present)} present in the test tree, all matched.\n",
+      flush=True)
 
 results = []
 

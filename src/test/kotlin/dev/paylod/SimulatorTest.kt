@@ -80,7 +80,8 @@ class SimulatorTest {
     fun `POSTs simulate collect with a normalised phone and returns a real pending payment`() {
         val (paylod, t) = testClient(listOf(Step(status = 202, json = simAck)))
         val sim = paylod.simulate.collect(
-            SimulateCollectParams.builder().phone("0712345678").amount(250).accountReference("order-1").build(),
+            SimulateCollectParams.builder().phone("0712345678").amount(250).accountReference("order-1")
+                .idempotencyKey("sim-1").build(),
         )
         assertTrue(t.calls[0].url.contains("/simulate/collect"))
         assertEquals(mapOf("phone" to "254712345678", "amount" to 250L, "accountRef" to "order-1"), t.calls[0].body)
@@ -90,9 +91,9 @@ class SimulatorTest {
     }
 
     @Test
-    fun `needs no arguments at all`() {
+    fun `needs nothing but the idempotency key`() {
         val (paylod, t) = testClient(listOf(Step(status = 202, json = simAck)))
-        paylod.simulate.collect()
+        paylod.simulate.collect(SimulateCollectParams(idempotencyKey = "sim-1"))
         assertEquals(mapOf("phone" to "254708374149", "amount" to 1L), t.calls[0].body)
     }
 
@@ -100,7 +101,9 @@ class SimulatorTest {
     fun `rejects a nonsense amount locally`() {
         val (paylod, t) = testClient(listOf(Step(status = 202, json = simAck)))
         assertThrows(PaylodInvalidRequestException::class.java) {
-            paylod.simulate.collect(SimulateCollectParams.builder().amount(0).build())
+            paylod.simulate.collect(
+                SimulateCollectParams.builder().amount(0).idempotencyKey("sim-1").build(),
+            )
         }
         assertEquals(0, t.count)
     }
@@ -219,7 +222,7 @@ class SimulatorTest {
         val (paylod, t) = testClient(
             listOf(Step(status = 202, json = simAck), Step(status = 200, json = settled(SimOutcomeId.USER_CANCELLED))),
         )
-        val r = paylod.simulate.pay(SimOutcomeId.USER_CANCELLED, SimulateCollectParams.builder().amount(99).build())
+        val r = paylod.simulate.pay(SimOutcomeId.USER_CANCELLED, SimulateCollectParams.builder().amount(99).idempotencyKey("sim-1").build())
         assertEquals("/simulate/collect", t.calls[0].url.substringAfter("/functions/v1"))
         assertEquals("/simulate/outcome", t.calls[1].url.substringAfter("/functions/v1"))
         assertEquals(OutcomeStatus.CANCELLED, r.status)

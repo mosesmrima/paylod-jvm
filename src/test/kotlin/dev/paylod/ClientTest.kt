@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 
 class ClientTest {
@@ -78,13 +79,61 @@ class ClientTest {
 
     // ── idempotency ───────────────────────────────────────────────────────────────────────
 
+    // THESE TWO TESTS USED TO ASSERT THE OPPOSITE.
+    //
+    // They positively checked that omitting the key generated one, and that two omitting calls
+    // generated DIFFERENT keys — i.e. they pinned, as desired behaviour, the exact property that
+    // makes an application-level retry fire a second STK prompt. A test suite that guards a defect
+    // is worse than no test: it makes fixing the defect look like a regression.
     @Test
-    fun `generates an Idempotency-Key by default and returns it on the ack`() {
+    @Tag("nv-idem-required")
+    fun `collect REQUIRES an idempotency key - omitting it never reaches the network`() {
         val (paylod, t) = testClient(listOf(Step(status = 202, json = ACK)))
-        val ack = paylod.collect(CollectParams("0712345678", 100))
+        val err = assertThrows(PaylodInvalidRequestException::class.java) {
+            paylod.collect(CollectParams("0712345678", 100))
+        }
+        assertTrue(err.message!!.contains("requires an idempotencyKey"), err.message)
+        assertTrue(err.message!!.contains("unsafeGeneratedIdempotencyKey"), err.message)
+        assertEquals(0, t.count, "a charge with no double-charge protection must not be dispatched")
+    }
+
+    @Test
+    @Tag("nv-idem-required")
+    fun `every collect surface requires the key - overload, wait, and the simulator alike`() {
+        val (paylod, t) = testClient(listOf(Step(status = 202, json = ACK)))
+        assertThrows(PaylodInvalidRequestException::class.java) { paylod.collect("0712345678", 100) }
+        assertThrows(PaylodInvalidRequestException::class.java) {
+            paylod.collectAndWait(CollectParams("0712345678", 100))
+        }
+        assertThrows(PaylodInvalidRequestException::class.java) {
+            paylod.collectAndWait("0712345678", 100)
+        }
+        val (sandbox, st) = testClient(listOf(Step(status = 202, json = ACK)))
+        assertThrows(PaylodInvalidRequestException::class.java) { sandbox.simulate.collect() }
+        assertEquals(0, t.count)
+        assertEquals(0, st.count)
+    }
+
+    @Test
+    @Tag("nv-idem-optout")
+    fun `only a primitive true opts out, and the generated key is returned on the ack`() {
+        val (paylod, t) = testClient(listOf(Step(status = 202, json = ACK)))
+        val ack = paylod.collect(
+            CollectParams("0712345678", 100, unsafeGeneratedIdempotencyKey = true),
+        )
         val sent = t.calls[0].headers["idempotency-key"]
         assertEquals(ack.idempotencyKey, sent)
         assertTrue(sent!!.matches(Regex("^[0-9a-f-]{36}$")))
+
+        // `false` is not an opt-out, and neither is anything that merely converts to one. The
+        // parameter is a Kotlin `Boolean` — a JVM primitive `boolean` — so a boxed `Boolean`, a
+        // `null` or a truthy non-boolean is a COMPILE error rather than a runtime opt-out. This
+        // asserts the only runtime case the type system leaves open.
+        val (p2, t2) = testClient(listOf(Step(status = 202, json = ACK)))
+        assertThrows(PaylodInvalidRequestException::class.java) {
+            p2.collect(CollectParams("0712345678", 100, unsafeGeneratedIdempotencyKey = false))
+        }
+        assertEquals(0, t2.count)
     }
 
     @Test
@@ -95,12 +144,44 @@ class ClientTest {
         assertEquals(mapOf("amount" to 100L, "phone" to "254712345678"), t.calls[0].body)
     }
 
+    /**
+     * THE empirical proof for the per-call warning: N looped opt-out charges, ONE process, ONE
+     * client, counting REAL writes to `System.err`.
+     *
+     * The old implementation held a single `AtomicBoolean` in the client's companion object, so a
+     * loop of a thousand unprotected charges warned about the first one and went silent — the
+     * warning was invisible in exactly the posture where the defect bites. There is no suppression
+     * state left to reset between calls, which is why this test can be written at all: a
+     * once-per-process latch would make the second iteration silent no matter how it were driven.
+     */
     @Test
-    fun `generates a different key per call`() {
-        val (paylod, t) = testClient(listOf(Step(status = 202, json = ACK), Step(status = 202, json = ACK)))
-        paylod.collect(CollectParams("0712345678", 100))
-        paylod.collect(CollectParams("0712345678", 100))
-        assertNotEquals(t.calls[0].headers["idempotency-key"], t.calls[1].headers["idempotency-key"])
+    @Tag("nv-idem-warn-every")
+    fun `N looped opt-out charges emit N warnings on real stderr, in one process`() {
+        val n = 5
+        val steps = (1..n).map { Step(status = 202, json = ACK) }
+        val (paylod, t) = testClient(steps)
+
+        val captured = java.io.ByteArrayOutputStream()
+        val original = System.err
+        val keys = mutableListOf<String>()
+        try {
+            System.setErr(java.io.PrintStream(captured, true, "UTF-8"))
+            repeat(n) {
+                keys += paylod.collect(
+                    CollectParams("0712345678", 100, unsafeGeneratedIdempotencyKey = true),
+                ).idempotencyKey
+            }
+        } finally {
+            System.setErr(original)
+        }
+
+        val text = captured.toString("UTF-8")
+        val warnings = Regex("\\[paylod\\] collect\\(\\) was called with unsafeGeneratedIdempotencyKey")
+            .findAll(text).count()
+        assertEquals(n, warnings, "expected one warning per unprotected charge, got $warnings in:\n$text")
+        assertEquals(n, t.count)
+        // And the keys really are all different — which is the reason the warning has to repeat.
+        assertEquals(n, keys.toSet().size)
     }
 
     @Test
@@ -158,7 +239,7 @@ class ClientTest {
         )
         val polls = mutableListOf<Payment>()
         val outcome = paylod.collectAndWait(
-            CollectParams("0712345678", 100),
+            CollectParams("0712345678", 100, idempotencyKey = "k"),
             WaitOptions.of(onPoll = { polls.add(it) }),
         )
         assertEquals(OutcomeStatus.SUCCEEDED, outcome.status)
@@ -176,7 +257,7 @@ class ClientTest {
                 Step(json = paymentJson(status = "failed", resultCode = 2001, resultDesc = "The initiator information is invalid.")),
             ),
         )
-        val r = paylod.collectAndWait(CollectParams("0712345678", 100))
+        val r = paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k"))
         assertEquals(OutcomeStatus.FAILED, r.status)
         assertFalse(r.paid)
         assertEquals("That M-Pesa PIN was incorrect. Please try again and enter the right PIN.", r.message)
@@ -193,7 +274,7 @@ class ClientTest {
                 Step(json = paymentJson(status = "failed", resultCode = 1032, resultDesc = "Request cancelled by user")),
             ),
         )
-        val r = paylod.collectAndWait(CollectParams("0712345678", 100))
+        val r = paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k"))
         assertEquals(OutcomeStatus.CANCELLED, r.status)
         assertTrue(r.retryable)
         assertEquals("Payment cancelled — you can try again whenever you're ready.", r.message)
@@ -209,7 +290,7 @@ class ClientTest {
                 Step(json = paymentJson(status = "success", resultCode = 0, mpesaReceipt = "SFF6XYZ123")),
             ),
         )
-        val r = paylod.collectAndWait(CollectParams("0712345678", 100))
+        val r = paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k"))
         assertEquals(OutcomeStatus.SUCCEEDED, r.status)
         assertEquals("SFF6XYZ123", r.receipt)
     }
@@ -242,7 +323,7 @@ class ClientTest {
             ),
         )
         val err = assertThrows(PaylodTimeoutException::class.java) {
-            paylod.collectAndWait(CollectParams("0712345678", 100), WaitOptions.of(timeoutMs = 8_000))
+            paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k"), WaitOptions.of(timeoutMs = 8_000))
         }
         assertEquals("pay_123", err.paymentId)
         assertEquals(PaymentStatus.PENDING, err.payment.status)
@@ -259,7 +340,7 @@ class ClientTest {
                 Step(json = paymentJson(status = "success", mpesaReceipt = "R1", resultCode = 0)),
             ),
         )
-        paylod.collectAndWait(CollectParams("0712345678", 1))
+        paylod.collectAndWait(CollectParams("0712345678", 1, idempotencyKey = "k"))
         assertEquals(3, t.count) // collect + 2 status reads, no more
     }
 
@@ -421,7 +502,9 @@ class ClientTest {
             maxRetries = 0,
         )
         val err = assertThrows(PaylodConnectionException::class.java) {
-            paylod.collect(CollectParams("0712345678", 100)) // no key -> SDK generates one
+            // The opt-out path still has to hand the key back on the error, or a caller who
+            // retries after a socket reset mints a fresh one and double-charges.
+            paylod.collect(CollectParams("0712345678", 100, unsafeGeneratedIdempotencyKey = true))
         }
         assertTrue(err.idempotencyKey!!.matches(Regex("^[0-9a-f-]{36}$")))
     }
@@ -515,7 +598,7 @@ class ClientTest {
             ),
         )
         assertThrows(PaylodTimeoutException::class.java) {
-            paylod.collectAndWait(CollectParams("0712345678", 100), WaitOptions.of(timeoutMs = 8_000))
+            paylod.collectAndWait(CollectParams("0712345678", 100, idempotencyKey = "k"), WaitOptions.of(timeoutMs = 8_000))
         }
         // The first status read (a GET) is capped to the 8s wait budget, not the 30s per-request default.
         val firstStatus = t.calls.first { it.method == "GET" }

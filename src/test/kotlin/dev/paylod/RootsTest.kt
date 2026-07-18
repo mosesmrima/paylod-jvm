@@ -419,14 +419,20 @@ class RootsTest {
 
     @Test
     @Tag("nv-sim-key")
-    fun `the simulator generates an idempotency key when one is omitted`() {
+    fun `the simulator requires an idempotency key, exactly as production does`() {
         // Production `collect()` generates one, so a network retry cannot create two payments. The
         // simulator did not — and a simulator whose double-charge behaviour is WEAKER than
         // production's makes a green "a double-click cannot charge twice" test a lie.
         val (paylod, t) = testClient(
             listOf(Step(status = 202, json = ACK + mapOf("outcomes" to emptyList<Any?>()))),
         )
-        paylod.simulate.collect()
+        // The simulator enforces the PRODUCTION rule: the key is required, and the only route to a
+        // generated one is the explicit opt-out. It used to silently generate one, which was still
+        // weaker than production once production started refusing.
+        assertThrows<PaylodInvalidRequestException> { paylod.simulate.collect() }
+        assertEquals(0, t.count, "an unprotected simulated charge must not be dispatched")
+
+        paylod.simulate.collect(SimulateCollectParams(unsafeGeneratedIdempotencyKey = true))
         val key = t.calls[0].headers["idempotency-key"]
         assertNotNull(key, "simulate.collect() sent NO Idempotency-Key at all")
         assertTrue(key!!.isNotBlank())

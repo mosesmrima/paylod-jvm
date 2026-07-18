@@ -162,7 +162,10 @@ class ThirdRoundTest {
             listOf(Step(status = 202, json = ACK), Step(json = paymentJson(status = "pending"))),
         )
         val err = assertThrows<PaylodTimeoutException> {
-            paylod.collectAndWait(CollectParams("0712345678", 100), WaitOptions.of(timeoutMs = 2_000))
+            paylod.collectAndWait(
+                CollectParams("0712345678", 100, unsafeGeneratedIdempotencyKey = true),
+                WaitOptions.of(timeoutMs = 2_000),
+            )
         }
         assertNotNull(err.idempotencyKey)
         assertTrue(err.idempotencyKey!!.matches(Regex("^[0-9a-f-]{36}$")))

@@ -265,7 +265,7 @@ class SixthRoundTest {
             simulate = true,
         )
         assertThrows<PaylodApiException>("a non-object outcome entry must be refused") {
-            paylod.simulate.collect()
+            paylod.simulate.collect(SimulateCollectParams(idempotencyKey = "sim-1"))
         }
 
         // A missing field inside an otherwise well-formed entry is refused too.
@@ -279,7 +279,7 @@ class SixthRoundTest {
             ),
             simulate = true,
         )
-        assertThrows<PaylodApiException> { missing.simulate.collect() }
+        assertThrows<PaylodApiException> { missing.simulate.collect(SimulateCollectParams(idempotencyKey = "sim-1")) }
 
         // A well-formed response still works.
         val (ok, _) = testClient(
@@ -292,7 +292,7 @@ class SixthRoundTest {
             ),
             simulate = true,
         )
-        val created = ok.simulate.collect()
+        val created = ok.simulate.collect(SimulateCollectParams(idempotencyKey = "sim-1"))
         assertEquals("pay_123", created.paymentId)
         assertEquals(1, created.outcomes.size)
     }

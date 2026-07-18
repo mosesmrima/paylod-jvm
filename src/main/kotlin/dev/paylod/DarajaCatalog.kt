@@ -129,17 +129,11 @@ object DarajaCatalog {
     private fun normalizeCode(resultCode: Any?): String =
         when (resultCode) {
             null -> ""
-            // A whole Double collapses to its integer form for CATALOG LOOKUP, except at zero.
-            // Zero of either sign keeps its own representation so this lookup key can never be the
-            // literal "0": `isCanonicalSuccessCode` is consulted separately and on the ORIGINAL
-            // value, and the impostor branch below relies on the key not already reading as the
-            // success code. -0.0 reaches here now that the JSON reader preserves a raw `-0`.
-            is Double ->
-                if (resultCode == Math.floor(resultCode) && resultCode != 0.0) {
-                    resultCode.toLong().toString()
-                } else {
-                    resultCode.toString()
-                }
+            // A Double keeps its OWN representation — no collapse, at any value. Collapsing a
+            // whole float to its integer form was a lookup convenience that manufactured a
+            // canonical code out of a token Daraja never sent; the zero carve-out closed only the
+            // success half of it. See [normalizeResultCode] in `Validators.kt`.
+            is Double -> resultCode.toString()
             else -> resultCode.toString().trim()
         }
 
@@ -255,6 +249,15 @@ object DarajaCatalog {
     @JvmStatic
     @JvmOverloads
     fun classifyStkResult(resultCode: Any?, resultDesc: String? = null): StkOutcome {
+        // A code with NO LEXEME is a value the sender cannot have written as a Daraja result code:
+        // a `Double`/`Float`/`BigDecimal` (no lossless rendering back to the token — `0.0`, `-0.0`,
+        // `1032.0` and `1.032e3` all collapse) or a `Boolean`. It is neither proof of success nor
+        // proof of failure, so it is AMBIGUOUS. Ambiguity is never force-failed: on a `success`
+        // claim it yields INDETERMINATE, on a `failed` claim it yields INDETERMINATE too, and the
+        // webhook or a later read settles it. Reaching the numeric branch below with a laundered
+        // float is what let `1032.0` classify as a terminal cancellation.
+        if (resultCode != null && codeLexeme(resultCode) == null) return StkOutcome.PENDING
+
         val raw = normalizeCode(resultCode)
         val desc = (resultDesc ?: "").trim()
 

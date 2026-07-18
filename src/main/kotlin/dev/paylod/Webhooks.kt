@@ -1,5 +1,6 @@
 package dev.paylod
 
+import dev.paylod.internal.CredentialShapes
 import dev.paylod.internal.Json
 import java.nio.charset.StandardCharsets
 import javax.crypto.Mac
@@ -514,6 +515,28 @@ object Webhooks {
         val paymentId = data["paymentId"]
         if (paymentId !is String || paymentId.isBlank()) invalid("data.paymentId is missing or empty")
 
+        // CREDENTIAL-BEARING IDENTIFIERS ARE REFUSED HERE TOO. A webhook body is exactly as
+        // server-controlled as a status body, `WebhookEventData` is a data class whose GENERATED
+        // `toString()` prints every field, and logging the event is the first thing a handler does.
+        // A signature proves WHO sent the bytes; it does not make an echoed bearer token an id.
+        // Only the SHAPE check is available here — this path holds no client secret — which is why
+        // [CredentialShapes] is separate from [Redactor].
+        if (CredentialShapes.looksLikeCredential(paymentId)) {
+            invalid("data.paymentId contains something shaped like an API credential, so it is not an id")
+        }
+        if (CredentialShapes.looksLikeCredential(data["checkoutRequestId"] as? String)) {
+            invalid(
+                "data.checkoutRequestId contains something shaped like an API credential, so it is " +
+                    "not a checkout request id",
+            )
+        }
+        if (CredentialShapes.looksLikeCredential(data["mpesaReceipt"] as? String)) {
+            invalid(
+                "data.mpesaReceipt contains something shaped like an API credential, so it is not a " +
+                    "receipt",
+            )
+        }
+
         val status = data["status"]
         if (status !is String) invalid("data.status is missing or is not a string")
         val parsedStatus = PaymentStatus.parseWire(status)
@@ -570,6 +593,38 @@ object Webhooks {
                     "that is how an order gets fulfilled for a payment that never settled",
             )
         }
+        // A `payment.failed` event must carry a CANONICAL FAILURE CODE, stated explicitly rather
+        // than left to the judge to infer. `PaymentSemantics` now sends FAILED + NONE to
+        // INDETERMINATE, so a codeless failure notice is already refused below — but this SDK does
+        // not rely on one check to enforce two separate rules, and "the webhook told us it failed"
+        // is precisely the claim-without-evidence a webhook is best placed to make. The code must
+        // exist, be non-blank, be written the way Daraja writes result codes, and actually classify
+        // as a failure.
+        if (type == "payment.failed") {
+            val lexeme = when (resultCode) {
+                null -> null
+                is String -> resultCode
+                is Byte, is Short, is Int, is Long -> resultCode.toString()
+                // A float has no lexeme — `1032.0` and `1.032e3` are not tokens Daraja sends.
+                else -> null
+            }
+            if (lexeme == null || lexeme.isBlank() || !DarajaCatalog.isCanonicalCodeLexeme(lexeme)) {
+                invalid(
+                    "it announces a failed payment but carries no canonical Daraja result code " +
+                        "(data.resultCode was ${if (resultCode == null) "absent" else "\"$resultCode\""}). " +
+                        "A failure notice with nothing behind it is a CLAIM, not evidence, and " +
+                        "accepting it as terminal is one catalog lookup away from telling you to " +
+                        "charge the customer again",
+                )
+            }
+            if (DarajaCatalog.classifyStkResult(lexeme, data["resultDesc"] as? String) != StkOutcome.FAILED) {
+                invalid(
+                    "it announces a failed payment but data.resultCode \"$lexeme\" does not " +
+                        "classify as a terminal failure",
+                )
+            }
+        }
+
         if (type == "payment.failed" && judgement.verdict != PaymentVerdict.FAILED) {
             invalid(
                 "it announces a failed payment but the record does not support that " +
@@ -632,18 +687,21 @@ object Webhooks {
     }
 
     /**
-     * As `PaymentValidators.normalizeResultCode`, including the zero exception: a whole `Double`
-     * collapses to its integer form for catalog lookup, but a float ZERO keeps its own
-     * representation so it cannot be laundered into the canonical success code `"0"`. See
-     * [DarajaCatalog.isCanonicalSuccessCode].
+     * As `PaymentValidators.normalizeResultCode`: a `Double` keeps its OWN representation, always.
+     *
+     * This function used to collapse a whole `Double` to its integer form for catalog lookup, with
+     * a carve-out at zero. The carve-out closed the SUCCESS direction and left the failure
+     * direction wide open on the same mechanism: a signed webhook carrying `resultCode: 1032.0`
+     * (or `1.032e3`) was laundered into the canonical `"1032"`, which selects the "customer
+     * cancelled" entry — `retryable = true`. `decoded` is recomputed from the offline catalog
+     * precisely so a payload cannot assert `retryable`, and the float path let it assert it anyway,
+     * one layer lower down. Both this reader and the status reader are fixed the same way, because
+     * a guarantee with two implementations has to be removed from both to be removed at all.
      */
     private fun normalizeCode(v: Any?): String? = when (v) {
         null -> null
-        // `v == 0.0` is true for -0.0 as well, which is deliberate: a raw JSON `-0` now survives
-        // the reader as -0.0 rather than as an integral zero, and it must be kept out of the
-        // integer form on this path too — `(-0.0).toLong().toString()` is the literal "0".
-        is Double ->
-            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()
+        // No collapse at any value. A float has no lexeme, so it can never select a catalog entry.
+        is Double -> v.toString()
         else -> v.toString()
     }
 
@@ -675,7 +733,14 @@ object Webhooks {
         // payload to assert.
         val decoded = if (rawType == "payment.failed") {
             val code = data["resultCode"]
-            if (code == null) null else DarajaCatalog.decodeError(normalizeCode(code), asString(data["resultDesc"]))
+            if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }
         } else {
             null
         }
@@ -699,7 +764,11 @@ object Webhooks {
                 mpesaReceipt = asString(data["mpesaReceipt"]),
                 checkoutRequestId = asString(data["checkoutRequestId"]),
                 resultCode = normalizeCode(data["resultCode"]),
-                resultDesc = asString(data["resultDesc"]),
+                // SCRUBBED. Free-form server prose with no identity role, landing on a data class
+                // whose generated `toString()` a handler logs. Masked rather than refused so a
+                // decodable failure stays readable. Identifiers take the other route — they are
+                // rejected outright in `assertEventSchema`.
+                resultDesc = CredentialShapes.scrub(asString(data["resultDesc"])),
                 decoded = decoded,
             ),
         )

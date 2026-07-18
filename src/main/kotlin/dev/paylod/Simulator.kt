@@ -70,15 +70,18 @@ class Simulator internal constructor(
                 "simulate.collect(): amount must be a positive whole number of KES (got $amount).",
             )
         }
-        // Same double-charge guard as production: reject a blank/whitespace/control-char key here too,
-        // so a simulator test cannot pass with a key that would be rejected against the real API.
-        params.idempotencyKey?.let { assertValidIdempotencyKey(it) }
-        // Production `collect()` GENERATES a key when the caller omits one, so a network retry of a
-        // single call cannot create two payments. This surface did not, so an omitted key meant NO
-        // Idempotency-Key header at all and a retried simulate-collect really could create a second
-        // simulated payment. A simulator whose double-charge behaviour is WEAKER than production's is
-        // precisely the divergence that makes a green "a double-click cannot charge twice" test a lie.
-        val idempotencyKey = params.idempotencyKey ?: java.util.UUID.randomUUID().toString()
+        // EXACTLY the production rule, through the one shared implementation: the key is REQUIRED,
+        // a blank/whitespace/control-char one is refused, and the only route to a generated key is
+        // the explicit primitive-`true` opt-out, which warns on every single call.
+        //
+        // A simulator whose double-charge behaviour is WEAKER than production's is precisely the
+        // divergence that makes a green "a double-click cannot charge twice" test a lie — and
+        // "the simulator quietly generates one for you" was exactly that weakness.
+        val idempotencyKey = Idempotency.resolve(
+            params.idempotencyKey,
+            params.unsafeGeneratedIdempotencyKey,
+            "simulate.collect()",
+        )
 
         val body = LinkedHashMap<String, Any?>()
         body["phone"] = if (params.phone != null) Phone.normalize(params.phone) else DEFAULT_SIM_PHONE

@@ -24,9 +24,20 @@ class CollectParams private constructor(
     /**
      * The thing that stops you charging a customer twice. It names ONE PAYMENT ATTEMPT — one press
      * of Pay. Mint it when the attempt begins, persist it, and never reuse it for a different charge.
-     * Omit it and the SDK generates a fresh key per call (and warns once).
+     *
+     * REQUIRED. Omitting it without [unsafeGeneratedIdempotencyKey] is a
+     * [PaylodInvalidRequestException] before any network call.
      */
     @JvmField val idempotencyKey: String? = null,
+    /**
+     * Opt out of the double-charge guard and let the SDK generate a throwaway key.
+     *
+     * A generated key is NOT idempotency — it is different on every call, so it collapses nothing
+     * and an application-level or job-queue retry fires a SECOND STK prompt. This exists for scratch
+     * scripts and nothing else. It is a primitive `boolean`, so only a literal `true` opts out, and
+     * every call that uses it warns on `System.err`. See [Idempotency].
+     */
+    @JvmField val unsafeGeneratedIdempotencyKey: Boolean = false,
 ) {
     /** Kotlin-friendly constructor with named, defaulted parameters. */
     @JvmOverloads
@@ -36,13 +47,18 @@ class CollectParams private constructor(
         accountReference: String? = null,
         description: String? = null,
         idempotencyKey: String? = null,
-    ) : this(phone, amount, accountReference, description, null, idempotencyKey)
+        unsafeGeneratedIdempotencyKey: Boolean = false,
+    ) : this(
+        phone, amount, accountReference, description, null, idempotencyKey,
+        unsafeGeneratedIdempotencyKey,
+    )
 
     class Builder(private var phone: String, private var amount: Int) {
         private var accountReference: String? = null
         private var description: String? = null
         private var metadata: Map<String, Any?>? = null
         private var idempotencyKey: String? = null
+        private var unsafeGeneratedIdempotencyKey: Boolean = false
 
         fun phone(value: String) = apply { this.phone = value }
         fun amount(value: Int) = apply { this.amount = value }
@@ -51,8 +67,14 @@ class CollectParams private constructor(
         fun metadata(value: Map<String, Any?>?) = apply { this.metadata = value }
         fun idempotencyKey(value: String?) = apply { this.idempotencyKey = value }
 
-        fun build(): CollectParams =
-            CollectParams(phone, amount, accountReference, description, metadata, idempotencyKey)
+        /** Primitive `boolean` — no boxed or nullable value can opt out. See [Idempotency]. */
+        fun unsafeGeneratedIdempotencyKey(value: Boolean) =
+            apply { this.unsafeGeneratedIdempotencyKey = value }
+
+        fun build(): CollectParams = CollectParams(
+            phone, amount, accountReference, description, metadata, idempotencyKey,
+            unsafeGeneratedIdempotencyKey,
+        )
     }
 
     companion object {

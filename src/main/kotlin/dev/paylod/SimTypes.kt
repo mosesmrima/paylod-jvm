@@ -33,7 +33,14 @@ class SimulateCollectParams private constructor(
     @JvmField val accountReference: String? = null,
     @JvmField val description: String? = null,
     @JvmField val metadata: Map<String, Any?>? = null,
+    /**
+     * REQUIRED, exactly as on production [CollectParams.idempotencyKey]. A simulator whose
+     * double-charge rules are WEAKER than production's is the divergence that makes a green
+     * "a double-click cannot charge twice" test a lie.
+     */
     @JvmField val idempotencyKey: String? = null,
+    /** The explicit, primitive-`true`-only opt-out. See [Idempotency]. */
+    @JvmField val unsafeGeneratedIdempotencyKey: Boolean = false,
 ) {
     @JvmOverloads
     constructor(
@@ -42,7 +49,11 @@ class SimulateCollectParams private constructor(
         accountReference: String? = null,
         description: String? = null,
         idempotencyKey: String? = null,
-    ) : this(phone, amount, accountReference, description, null, idempotencyKey)
+        unsafeGeneratedIdempotencyKey: Boolean = false,
+    ) : this(
+        phone, amount, accountReference, description, null, idempotencyKey,
+        unsafeGeneratedIdempotencyKey,
+    )
 
     class Builder {
         private var phone: String? = null
@@ -51,6 +62,7 @@ class SimulateCollectParams private constructor(
         private var description: String? = null
         private var metadata: Map<String, Any?>? = null
         private var idempotencyKey: String? = null
+        private var unsafeGeneratedIdempotencyKey: Boolean = false
 
         fun phone(value: String?) = apply { this.phone = value }
         fun amount(value: Int) = apply { this.amount = value }
@@ -59,11 +71,22 @@ class SimulateCollectParams private constructor(
         fun metadata(value: Map<String, Any?>?) = apply { this.metadata = value }
         fun idempotencyKey(value: String?) = apply { this.idempotencyKey = value }
 
-        fun build(): SimulateCollectParams =
-            SimulateCollectParams(phone, amount, accountReference, description, metadata, idempotencyKey)
+        /** Primitive `boolean` — no boxed or nullable value can opt out. See [Idempotency]. */
+        fun unsafeGeneratedIdempotencyKey(value: Boolean) =
+            apply { this.unsafeGeneratedIdempotencyKey = value }
+
+        fun build(): SimulateCollectParams = SimulateCollectParams(
+            phone, amount, accountReference, description, metadata, idempotencyKey,
+            unsafeGeneratedIdempotencyKey,
+        )
     }
 
     companion object {
+        /**
+         * The zero-argument shape. It carries NO idempotency key and does NOT opt out, so
+         * `simulate.collect()` with no arguments now throws rather than quietly minting a
+         * throwaway key — the same rule production `collect()` enforces.
+         */
         @JvmField
         val DEFAULT: SimulateCollectParams = SimulateCollectParams()
 

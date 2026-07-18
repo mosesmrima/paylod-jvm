@@ -8,7 +8,6 @@ import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
 
 /** The base URL. Identical for every paylod customer, so it is baked in — you never pass it. */
 const val DEFAULT_BASE_URL = "https://paylod.dev/functions/v1"
@@ -366,15 +365,18 @@ class Paylod internal constructor(
      * Send an STK Push. Returns as soon as the prompt is on the customer's phone — the payment is
      * pending. Settle it with [status], [wait], or a webhook.
      *
-     * Pass `idempotencyKey`, and mint ONE KEY PER PAYMENT ATTEMPT. See [CollectParams.idempotencyKey].
+     * `idempotencyKey` is REQUIRED — mint ONE KEY PER PAYMENT ATTEMPT. See
+     * [CollectParams.idempotencyKey] and [Idempotency].
      */
     fun collect(params: CollectParams): CollectAck {
         val body = buildCollectBody(params)
-        // A caller-supplied key is the double-charge guard — reject a blank/whitespace/control-char
-        // one loudly rather than silently drop protection. A generated key is always well-formed.
-        if (params.idempotencyKey == null) warnMissingIdempotencyKey()
-        else assertValidIdempotencyKey(params.idempotencyKey)
-        val idempotencyKey = params.idempotencyKey ?: UUID.randomUUID().toString()
+        // THE double-charge guard, resolved by the one shared implementation the simulator also
+        // uses. Omitting the key without the explicit opt-out throws here, before any network call.
+        val idempotencyKey = Idempotency.resolve(
+            params.idempotencyKey,
+            params.unsafeGeneratedIdempotencyKey,
+            "collect()",
+        )
 
         try {
             if (simulateMode) {
@@ -422,7 +424,13 @@ class Paylod internal constructor(
         accountReference: String? = null,
         description: String? = null,
         idempotencyKey: String? = null,
-    ): CollectAck = collect(CollectParams(phone, amount, accountReference, description, idempotencyKey))
+        unsafeGeneratedIdempotencyKey: Boolean = false,
+    ): CollectAck = collect(
+        CollectParams(
+            phone, amount, accountReference, description, idempotencyKey,
+            unsafeGeneratedIdempotencyKey,
+        ),
+    )
 
     /** Read a payment. `GET /status/:id`. */
     fun status(paymentId: String): Payment = readPayment(paymentId, null)
@@ -620,9 +628,15 @@ class Paylod internal constructor(
         accountReference: String? = null,
         description: String? = null,
         idempotencyKey: String? = null,
+        unsafeGeneratedIdempotencyKey: Boolean = false,
         options: WaitOptions = WaitOptions.DEFAULT,
-    ): PaymentOutcome =
-        collectAndWait(CollectParams(phone, amount, accountReference, description, idempotencyKey), options)
+    ): PaymentOutcome = collectAndWait(
+        CollectParams(
+            phone, amount, accountReference, description, idempotencyKey,
+            unsafeGeneratedIdempotencyKey,
+        ),
+        options,
+    )
 
     /**
      * Decode an M-Pesa result code offline. No network, no API key needed at call time. The strings
@@ -666,8 +680,6 @@ class Paylod internal constructor(
     ): WebhookEvent = Webhooks.parseAndVerify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
 
     private companion object {
-        val warned = AtomicBoolean(false)
-
         /**
          * A sentinel distinct from every value a validator could legitimately produce — including
          * `null`. `null` would be indistinguishable from a validator that legitimately returned it.
@@ -837,16 +849,5 @@ class Paylod internal constructor(
         /** Case-insensitive header lookup — a transport is not obliged to hand us lowercased keys. */
         fun headerValue(headers: Map<String, String>, name: String): String? =
             headers[name] ?: headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
-
-        fun warnMissingIdempotencyKey() {
-            if (!warned.compareAndSet(false, true)) return
-            System.err.println(
-                "[paylod] collect() was called without an `idempotencyKey`, so this charge is not " +
-                    "protected against being sent twice. A double-clicked Pay button, a refreshed tab, " +
-                    "or a redelivered job will fire a SECOND STK prompt and can charge your customer " +
-                    "twice. Pass ONE KEY PER PAYMENT ATTEMPT — an id you mint when the customer presses " +
-                    "Pay, and persist on that attempt. https://paylod.dev/docs/sdk#idempotency",
-            )
-        }
     }
 }
