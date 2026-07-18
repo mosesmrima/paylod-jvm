@@ -196,15 +196,13 @@ internal object PaymentValidators {
      */
     private fun normalizeResultCode(v: Any?): String? = when (v) {
         null -> null
-        // `isZeroOfAnySign` covers BOTH 0.0 and -0.0. The negative case reaches here now that the
-        // JSON reader stops collapsing a raw `-0` into an integral zero, and it must be held back
-        // from the integer form for the same reason the positive one is: `(-0.0).toLong()` is `0`,
-        // which is the canonical success code spelled exactly.
+        // `v != 0.0` is false for -0.0 as well, which is deliberate and load-bearing: IEEE equality
+        // merges the two zeros, so this one comparison holds BOTH back from the integer form. The
+        // negative case reaches here now that the JSON reader stops collapsing a raw `-0` into an
+        // integral zero, and it must be held back for the same reason the positive one is —
+        // `(-0.0).toLong().toString()` is the literal "0", the canonical success code spelled exactly.
         is Double ->
-            if (v == Math.floor(v) && !isZeroOfAnySign(v)) v.toLong().toString() else v.toString()
+            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()
         else -> v.toString()
     }
-
-    /** True for 0.0 and for -0.0. Written as a comparison because IEEE equality already merges them. */
-    private fun isZeroOfAnySign(v: Double): Boolean = v == 0.0
 }

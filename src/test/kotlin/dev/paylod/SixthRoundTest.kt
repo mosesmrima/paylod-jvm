@@ -118,6 +118,88 @@ class SixthRoundTest {
         assertEquals("0", event.data.resultCode)
     }
 
+    // ══ 2 — a stalled response body cannot park the caller forever ═══════════════════════════
+
+    /**
+     * A REAL loopback server that sends headers and then stops writing.
+     *
+     * The stub transport cannot express this defect at all: it hands back a complete `String`, so
+     * the hazard — a body that never finishes arriving — has no representation in it. Only a socket
+     * that goes quiet after the header block reproduces what a stalled peer actually does.
+     */
+    private class StallingServer : AutoCloseable {
+        private val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))
+        private val held = java.util.Collections.synchronizedList(mutableListOf<java.net.Socket>())
+        val port: Int get() = server.localPort
+
+        private val thread = Thread {
+            try {
+                while (!server.isClosed) {
+                    val socket = server.accept()
+                    held.add(socket)
+                    // Announce a body, send the headers, then never send the body. The socket stays
+                    // OPEN — this is a stall, not a close, and a close would surface as an ordinary
+                    // end-of-stream rather than the indefinite park under test.
+                    val out = socket.getOutputStream()
+                    out.write(
+                        (
+                            "HTTP/1.1 200 OK\r\n" +
+                                "Content-Type: application/json\r\n" +
+                                "Content-Length: 200\r\n\r\n"
+                            ).toByteArray()
+                    )
+                    out.flush()
+                }
+            } catch (e: Exception) {
+                // The socket closing during teardown is the expected way out of this loop.
+            }
+        }.apply { isDaemon = true; start() }
+
+        override fun close() {
+            synchronized(held) { held.forEach { runCatching { it.close() } } }
+            runCatching { server.close() }
+            thread.interrupt()
+        }
+    }
+
+    @Test
+    @Tag("nv-body-deadline")
+    fun `a response that stalls after the headers is abandoned, not waited on forever`() {
+        StallingServer().use { server ->
+            val paylod = Paylod(
+                "mp_test_abc123",
+                PaylodOptions.of(
+                    baseUrl = "http://127.0.0.1:${server.port}",
+                    allowInsecureBaseUrl = true,
+                    maxRetries = 0,
+                    timeoutMs = 1_000,
+                ),
+            )
+
+            val started = System.currentTimeMillis()
+            val err = assertThrows<PaylodException>(
+                "a stalled body must not park the caller indefinitely",
+            ) {
+                paylod.status("pay_123")
+            }
+            val elapsed = System.currentTimeMillis() - started
+
+            // The deadline is END-TO-END. Before this fix the request timer stopped at the headers
+            // and the body read had no bound at all, so this call never returned.
+            assertTrue(
+                elapsed < 20_000,
+                "the read was not bounded by the deadline: it took ${elapsed}ms",
+            )
+
+            // And the money state is reported honestly. The request WAS dispatched, so a charge may
+            // exist; the one thing that must not happen is a silent retry under a fresh key.
+            assertTrue(
+                err is PaylodIndeterminateException,
+                "a stalled body after dispatch is INDETERMINATE, not a clean failure: $err",
+            )
+        }
+    }
+
     // ══ 3 — a webhook body is size-bounded BEFORE any work is done on it ══════════════════════
 
     @Test

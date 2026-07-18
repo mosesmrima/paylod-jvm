@@ -470,6 +470,97 @@ CASES = [
                 "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()",
                 "            if (v == Math.floor(v)) v.toLong().toString() else v.toString()")],
     ),
+
+    # ── ROUND 6 ───────────────────────────────────────────────────────────────────────────────
+    dict(
+        id="R6-rawzero-parse", tag="nv-rawzero-parse",
+        what="the JSON reader collapses a raw -0 back into an integral zero",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                'if (token == "-0") return -0.0', 'if (false) return -0.0')],
+    ),
+    dict(
+        id="R6-rawzero-write", tag="nv-rawzero-parse",
+        what="the JSON writer re-launders -0.0 into the token 0 on the way out",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "if (isNegativeZero(value)) {\n                    sb.append(\"-0.0\")\n                } else if (value == Math.floor(value) && !value.isInfinite()) {",
+                "if (value == Math.floor(value) && !value.isInfinite()) {")],
+    ),
+    dict(
+        id="R6-rawzero-status", tag="nv-rawzero-status",
+        what="a raw -0 on the STATUS path is read as the canonical success code",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                'if (token == "-0") return -0.0', 'if (false) return -0.0')],
+    ),
+    dict(
+        id="R6-rawzero-webhook", tag="nv-rawzero-webhook",
+        what="a raw -0 on the WEBHOOK path is read as the canonical success code",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                'if (token == "-0") return -0.0', 'if (false) return -0.0')],
+    ),
+    dict(
+        id="R6-body-deadline", tag="nv-body-deadline",
+        what="the response body is read without the caller's end-to-end deadline",
+        # NOT reverted all the way to an unbounded `get()`: that never returns, and a mutation that
+        # hangs is a mutation that stalls the sweep rather than reporting. Widening the deadline
+        # past the test's own bound removes the GUARANTEE — the caller's timeout no longer governs
+        # the body read — while still terminating. Verified separately: at 120s this test fails, so
+        # the deadline really is what bounds the read and the JDK request timeout does not cover it.
+        edits=[("src/main/kotlin/dev/paylod/Transport.kt",
+                "future.get(request.timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)",
+                "future.get(30_000, java.util.concurrent.TimeUnit.MILLISECONDS)")],
+    ),
+    dict(
+        id="R6-wh-maxbytes", tag="nv-wh-maxbytes",
+        what="a webhook body is HMAC'd and parsed with no size bound (BOTH entry paths reverted)",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "assertWithinLimit(payload.size)", "Unit"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "if (payload.length > MAX_PAYLOAD_BYTES) assertWithinLimit(payload.length)\n"
+                "        val bytes = payload.toByteArray(StandardCharsets.UTF_8)\n"
+                "        assertWithinLimit(bytes.size)\n"
+                "        return bytes",
+                "return payload.toByteArray(StandardCharsets.UTF_8)")],
+    ),
+    dict(
+        id="R6-sim-fields", tag="nv-sim-fields",
+        what="malformed simulator outcomes are silently dropped instead of refused",
+        edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
+                """        val outcomesRaw = ack["outcomes"] as? List<Any?>
+            ?: simBad("outcomes is missing or is not an array", ackStatus)
+        val choices = outcomesRaw.mapIndexed { i, raw ->
+            @Suppress("UNCHECKED_CAST")
+            val o = raw as? Map<String, Any?> ?: simBad("outcomes[$i] is not an object", ackStatus)
+            SimOutcomeChoice(
+                id = simString(o["id"], "outcomes[$i].id", ackStatus),
+                label = simString(o["label"], "outcomes[$i].label", ackStatus),
+                status = simString(o["status"], "outcomes[$i].status", ackStatus),
+            )
+        }""",
+                """        val outcomesRaw = ack["outcomes"] as? List<Any?> ?: emptyList()
+        val choices = outcomesRaw.mapNotNull { raw ->
+            @Suppress("UNCHECKED_CAST")
+            val o = raw as? Map<String, Any?> ?: return@mapNotNull null
+            SimOutcomeChoice(
+                id = o["id"]?.toString() ?: "",
+                label = o["label"]?.toString() ?: "",
+                status = o["status"]?.toString() ?: "",
+            )
+        }""")],
+    ),
+    dict(
+        id="R6-sim-webhookqueued", tag="nv-sim-webhookqueued",
+        what="a missing webhookQueued is reported as true instead of refused",
+        edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
+                """        val webhookQueued = ack["webhookQueued"] as? Boolean
+            ?: simBad("webhookQueued is missing or is not a boolean", settleStatus)""",
+                """        val webhookQueued = ack["webhookQueued"] != false""")],
+    ),
+    dict(
+        id="R6-baseurl-redact", tag="nv-baseurl-redact",
+        what="a rejected baseUrl is echoed verbatim, userinfo and query string included",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                '(got \\"${sanitizeUrl(parsed)}\\")', '(got \\"$baseUrl\\")')],
+    ),
 ]
 
 COUNT_RE = re.compile(r"NVCOUNT tests=(\d+) failed=(\d+) skipped=(\d+)")

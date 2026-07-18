@@ -208,43 +208,79 @@ internal class Transport(
         }
         builder.method(request.method, publisher)
 
-        // `BodyHandlers.ofInputStream()` rather than `ofString()`: `ofString` accumulates the ENTIRE
-        // body into memory with no ceiling, so the size limit could only ever be checked after the
-        // allocation that is the actual hazard. Streaming lets the limit be enforced DURING the read,
-        // so an oversized body is abandoned at the boundary instead of being materialised first.
-        val response: HttpResponse<java.io.InputStream> = try {
-            client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        // ── THE BODY IS READ UNDER AN INDEPENDENT, END-TO-END DEADLINE ────────────────────────
+        //
+        // This used to be `client.send(…, BodyHandlers.ofInputStream())` followed by a blocking read
+        // of that stream. `ofInputStream` completes as soon as the HEADERS arrive, and
+        // `HttpRequest.timeout` stops applying at exactly that point — so every byte of the body was
+        // read OUTSIDE the request timer, with no deadline of any kind. A server that sent headers
+        // and then simply stopped writing parked the calling thread indefinitely; the JDK's response
+        // stream also swallows interrupts, so the thread could not reliably be broken out of even
+        // deliberately.
+        //
+        // On this path that is not merely a hang. The request has already been DISPATCHED, so a
+        // charge may well have been raised, and the idempotency key that is the only safe way to
+        // ask about it is held in the frame that is now stuck. A stalled body could therefore hide a
+        // live charge, and its key, for as long as the peer cared to keep the socket open.
+        //
+        // So the body is consumed by a BOUNDED SUBSCRIBER (below) driven through `sendAsync`, whose
+        // future completes only once the body is fully read. That gives one deadline covering
+        // connect, headers AND body, enforced by `get(timeout)`, with an explicit `cancel` that
+        // tears the exchange down rather than leaking it. The size ceiling is still enforced DURING
+        // the read — the subscriber cancels the moment the limit is passed — so an oversized body is
+        // never materialised, which is the property `ofInputStream` was chosen for in the first place.
+        val handler = HttpResponse.BodyHandler { info: HttpResponse.ResponseInfo ->
+            // A declared `Content-Length` past the limit is refused without subscribing to the body
+            // at all. Only a fast path: a chunked response declares no length and a hostile one can
+            // simply lie, so the subscriber below is the real enforcement.
+            val declared = info.headers().firstValueAsLong("content-length")
+            if (declared.isPresent && declared.asLong > MAX_RESPONSE_BYTES) {
+                BoundedBodySubscriber(0L, request.idempotencyKey)
+            } else {
+                BoundedBodySubscriber(MAX_RESPONSE_BYTES, request.idempotencyKey)
+            }
+        }
+
+        val future = client.sendAsync(builder.build(), handler)
+        val response: HttpResponse<String> = try {
+            future.get(request.timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            // Cancel EXPLICITLY. Abandoning the future would leave the exchange and its socket alive
+            // behind us, which is how a "timeout" becomes a leak rather than a bound.
+            future.cancel(true)
+            throw PaylodIndeterminateException(
+                redact.text(
+                    "paylod did not finish sending its response to $url within " +
+                        "${request.timeoutMs}ms, so the read was abandoned. The request WAS " +
+                        "dispatched, so the money state is INDETERMINATE: read the payment with " +
+                        "this idempotencyKey rather than retrying, and never mint a fresh key.",
+                ),
+                request.idempotencyKey,
+            )
         } catch (e: InterruptedException) {
             // A thread interrupt is a deliberate cancellation, NOT a transient network blip. Restore
             // the interrupt flag and abort without retrying — retrying would ignore the cancellation.
+            // Unlike the old stream read, this one is genuinely interruptible.
+            future.cancel(true)
             Thread.currentThread().interrupt()
             throw PaylodInterruptedException(redact.text("Request to $url was interrupted."), e)
-        } catch (e: Exception) {
-            // The lower-level exception is NOT attached as a cause: a JDK/TLS/proxy exception can
-            // embed the request line and headers, which is exactly what must not reach a log sink.
-            throw PaylodConnectionException(redact.text("Could not reach paylod at $url: ${e.message}"))
+        } catch (e: java.util.concurrent.ExecutionException) {
+            when (val cause = e.cause) {
+                // The subscriber's own refusal keeps its money-state classification.
+                is PaylodException -> throw cause
+                else ->
+                    // The lower-level exception is NOT attached as a cause: a JDK/TLS/proxy exception
+                    // can embed the request line and headers, which must not reach a log sink.
+                    throw PaylodConnectionException(
+                        redact.text("Could not reach paylod at $url: ${cause?.message}"),
+                    )
+            }
         }
 
         val headers = HashMap<String, String>()
         response.headers().map().forEach { (k, v) -> if (v.isNotEmpty()) headers[k.lowercase()] = v[0] }
 
-        // A declared `Content-Length` past the limit is refused without reading a single byte of the
-        // body. This is only a fast path — the streaming read below is the real enforcement, because
-        // a chunked response declares no length and a hostile one can simply lie.
-        val declared = response.headers().firstValueAsLong("content-length")
-        if (declared.isPresent && declared.asLong > MAX_RESPONSE_BYTES) {
-            throw PaylodIndeterminateException(
-                redact.text(
-                    "paylod declared a ${declared.asLong}-byte response, past the " +
-                        "${MAX_RESPONSE_BYTES}-byte limit this SDK will read. The request WAS " +
-                        "dispatched, so the money state is INDETERMINATE: read the payment with this " +
-                        "idempotencyKey rather than retrying.",
-                ),
-                request.idempotencyKey,
-            )
-        }
-
-        val body = readBounded(response.body(), request.idempotencyKey, url)
+        val body = response.body()
         return HttpResponseSpec(
             status = response.statusCode(),
             headers = headers,
@@ -258,46 +294,87 @@ internal class Transport(
     }
 
     /**
-     * Read at most [MAX_RESPONSE_BYTES] from the response stream, refusing the moment it is exceeded.
+     * Accumulate at most [maxBytes] of the response body, cancelling the exchange the moment the
+     * limit is passed.
      *
-     * The buffer grows from a small initial size rather than being pre-sized to the limit, so a
-     * normal few-hundred-byte response costs a few hundred bytes — the ceiling bounds the WORST
-     * case, it does not become the allocation for the ordinary one.
+     * This is the streaming size enforcement that used to live in a blocking read loop. Expressed as
+     * a subscriber it keeps the property that mattered — an oversized body is abandoned at the
+     * boundary rather than materialised and then measured — while letting the whole exchange sit
+     * under one `CompletableFuture`, and therefore under one deadline. A `maxBytes` of zero is how
+     * the handler refuses a response whose declared `Content-Length` is already past the limit,
+     * without subscribing to a single byte of it.
+     *
+     * The buffer grows from a small initial size rather than being pre-sized to the ceiling, so a
+     * normal few-hundred-byte response costs a few hundred bytes: the limit bounds the WORST case,
+     * it does not become the allocation for the ordinary one.
      */
-    private fun readBounded(stream: java.io.InputStream, idempotencyKey: String?, url: String): String {
-        val out = java.io.ByteArrayOutputStream(INITIAL_BODY_BUFFER)
-        val chunk = ByteArray(8 * 1024)
-        try {
-            stream.use { s ->
-                while (true) {
-                    val n = s.read(chunk)
-                    if (n < 0) break
-                    if (out.size().toLong() + n > MAX_RESPONSE_BYTES) {
-                        throw PaylodIndeterminateException(
-                            redact.text(
-                                "paylod's response exceeded the ${MAX_RESPONSE_BYTES}-byte limit " +
-                                    "this SDK will read, so it was abandoned rather than " +
-                                    "accumulated. The request WAS dispatched, so the money state is " +
-                                    "INDETERMINATE: read the payment with this idempotencyKey " +
-                                    "rather than retrying, and never mint a fresh key.",
-                            ),
-                            idempotencyKey,
-                        )
-                    }
-                    out.write(chunk, 0, n)
-                }
+    private inner class BoundedBodySubscriber(
+        private val maxBytes: Long,
+        /** Carried so an oversized body still names the key the caller must read the payment with. */
+        private val idempotencyKey: String?,
+    ) : HttpResponse.BodySubscriber<String> {
+
+        private val result = java.util.concurrent.CompletableFuture<String>()
+        private val buffer = java.io.ByteArrayOutputStream(INITIAL_BODY_BUFFER)
+        private var subscription: java.util.concurrent.Flow.Subscription? = null
+        private var total = 0L
+
+        override fun getBody(): java.util.concurrent.CompletionStage<String> = result
+
+        override fun onSubscribe(subscription: java.util.concurrent.Flow.Subscription) {
+            this.subscription = subscription
+            if (maxBytes <= 0L) {
+                refuse(0L)
+                return
             }
-        } catch (e: PaylodException) {
-            throw e
-        } catch (e: Exception) {
-            // A genuine mid-body network failure. This used to happen INSIDE `client.send`, which
-            // surfaced it as a retryable connection error, and that classification is preserved:
-            // an interrupted read really is the transient case the retry loop exists for.
-            throw PaylodConnectionException(
-                redact.text("Could not read paylod's response from $url: ${e.message}"),
+            subscription.request(Long.MAX_VALUE)
+        }
+
+        override fun onNext(items: MutableList<java.nio.ByteBuffer>) {
+            for (b in items) {
+                val n = b.remaining()
+                if (total + n > maxBytes) {
+                    refuse(total + n)
+                    return
+                }
+                total += n
+                val arr = ByteArray(n)
+                b.get(arr)
+                buffer.write(arr, 0, n)
+            }
+        }
+
+        override fun onError(throwable: Throwable) {
+            // A genuine mid-body network failure stays RETRYABLE, exactly as it was when it happened
+            // inside the blocking read: an interrupted read really is the transient case the retry
+            // loop exists for, and reclassifying it would turn a blip into a hard failure.
+            result.completeExceptionally(
+                PaylodConnectionException(
+                    redact.text("Could not read paylod's response: ${throwable.message}"),
+                ),
             )
         }
-        return out.toString(java.nio.charset.StandardCharsets.UTF_8)
+
+        override fun onComplete() {
+            result.complete(buffer.toString(java.nio.charset.StandardCharsets.UTF_8))
+        }
+
+        /** Cancel the exchange and fail with the money-state classification an oversized body carries. */
+        private fun refuse(seen: Long) {
+            subscription?.cancel()
+            result.completeExceptionally(
+                PaylodIndeterminateException(
+                    redact.text(
+                        "paylod's response exceeded the ${MAX_RESPONSE_BYTES}-byte limit this SDK " +
+                            "will read (saw at least $seen), so it was abandoned rather than " +
+                            "accumulated. The request WAS dispatched, so the money state is " +
+                            "INDETERMINATE: read the payment with this idempotencyKey rather than " +
+                            "retrying, and never mint a fresh key.",
+                    ),
+                    idempotencyKey,
+                ),
+            )
+        }
     }
 
     /**
