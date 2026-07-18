@@ -90,7 +90,7 @@ internal class Transport(
      */
     fun send(request: TransportRequest): TransportResponse {
         val url = "$baseUrl${request.path}"
-        assertOnOrigin(url, "the request URL")
+        assertOnOrigin(url, "the request URL", request.idempotencyKey)
 
         // The headers a custom transport is allowed to see. No credential, ever.
         val publicHeaders = LinkedHashMap<String, String>()
@@ -112,8 +112,64 @@ internal class Transport(
             dispatch(request, url, publicHeaders)
         }
 
-        assertNotRedirected(response, url)
+        assertNotRedirected(response, url, request.idempotencyKey)
+        // The body is bounded BEFORE anyone parses it. `dispatch` already refuses to accumulate more
+        // than MAX_RESPONSE_BYTES, but a custom transport hands us a `String` it built itself, so the
+        // size check is repeated here for that path — and the DEPTH check has to live here either
+        // way, because it is a property of the document rather than of the byte count.
+        assertBoundedBody(response.body, request.idempotencyKey)
         return TransportResponse(response.status, response.headers, response.body)
+    }
+
+    /**
+     * Refuse a response we are not willing to parse, BEFORE anything recurses through it.
+     *
+     * Two independent bounds, for two independent ways the old code died AFTER the request had been
+     * dispatched:
+     *
+     *   • SIZE. `BodyHandlers.ofString()` accumulates whatever arrives, without limit. A hostile or
+     *     broken endpoint answering a `POST /collect` with a multi-gigabyte body produced an
+     *     `OutOfMemoryError` — not a [PaylodException], so it escaped the block that attaches the
+     *     effective `Idempotency-Key`, and the caller was holding a possibly-live charge with no key
+     *     to settle it under. paylod's real responses are a few hundred bytes.
+     *
+     *   • DEPTH. The JSON reader is a recursive-descent parser, so nesting depth is stack depth.
+     *     `[[[[[…` a hundred thousand deep is a `StackOverflowError` from inside the parser, with
+     *     exactly the same consequence. The depth is measured HERE, by a flat scan that cannot
+     *     itself overflow, so the parser is never entered with a document that would blow the stack.
+     *
+     * Both become a [PaylodIndeterminateException] carrying the key: the request reached the server,
+     * so the money state is genuinely unknown, and re-dispatching is the one thing that must not
+     * happen.
+     */
+    private fun assertBoundedBody(body: String, idempotencyKey: String?) {
+        // Measured in UTF-16 units rather than encoded bytes on purpose: it is an upper bound on the
+        // memory already committed, it needs no second encoding pass, and it can only ever refuse
+        // EARLIER than a byte count would.
+        if (body.length > MAX_RESPONSE_CHARS) {
+            throw PaylodIndeterminateException(
+                redact.text(
+                    "paylod's response exceeded the ${MAX_RESPONSE_CHARS}-character limit this SDK " +
+                        "will parse (got ${body.length}). The request WAS dispatched, so the money " +
+                        "state is INDETERMINATE: read the payment with this idempotencyKey rather " +
+                        "than retrying, and never mint a fresh key.",
+                ),
+                idempotencyKey,
+            )
+        }
+
+        val depth = maxJsonDepth(body)
+        if (depth > MAX_JSON_DEPTH) {
+            throw PaylodIndeterminateException(
+                redact.text(
+                    "paylod's response nests JSON $depth levels deep, past the $MAX_JSON_DEPTH-level " +
+                        "limit this SDK will recurse through — parsing it would overflow the stack. " +
+                        "The request WAS dispatched, so the money state is INDETERMINATE: read the " +
+                        "payment with this idempotencyKey rather than retrying.",
+                ),
+                idempotencyKey,
+            )
+        }
     }
 
     /** The SDK-owned, credentialed dispatch. The only place the API key is ever written down. */
@@ -152,8 +208,12 @@ internal class Transport(
         }
         builder.method(request.method, publisher)
 
-        val response: HttpResponse<String> = try {
-            client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
+        // `BodyHandlers.ofInputStream()` rather than `ofString()`: `ofString` accumulates the ENTIRE
+        // body into memory with no ceiling, so the size limit could only ever be checked after the
+        // allocation that is the actual hazard. Streaming lets the limit be enforced DURING the read,
+        // so an oversized body is abandoned at the boundary instead of being materialised first.
+        val response: HttpResponse<java.io.InputStream> = try {
+            client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
         } catch (e: InterruptedException) {
             // A thread interrupt is a deliberate cancellation, NOT a transient network blip. Restore
             // the interrupt flag and abort without retrying — retrying would ignore the cancellation.
@@ -167,16 +227,77 @@ internal class Transport(
 
         val headers = HashMap<String, String>()
         response.headers().map().forEach { (k, v) -> if (v.isNotEmpty()) headers[k.lowercase()] = v[0] }
+
+        // A declared `Content-Length` past the limit is refused without reading a single byte of the
+        // body. This is only a fast path — the streaming read below is the real enforcement, because
+        // a chunked response declares no length and a hostile one can simply lie.
+        val declared = response.headers().firstValueAsLong("content-length")
+        if (declared.isPresent && declared.asLong > MAX_RESPONSE_BYTES) {
+            throw PaylodIndeterminateException(
+                redact.text(
+                    "paylod declared a ${declared.asLong}-byte response, past the " +
+                        "${MAX_RESPONSE_BYTES}-byte limit this SDK will read. The request WAS " +
+                        "dispatched, so the money state is INDETERMINATE: read the payment with this " +
+                        "idempotencyKey rather than retrying.",
+                ),
+                request.idempotencyKey,
+            )
+        }
+
+        val body = readBounded(response.body(), request.idempotencyKey, url)
         return HttpResponseSpec(
             status = response.statusCode(),
             headers = headers,
-            body = response.body() ?: "",
+            body = body,
             url = response.uri()?.toString(),
             // Present exactly when the client followed at least one redirect to get here. With
             // `Redirect.NEVER` it never is — which is the point: if it ever becomes true, something
             // has replaced the guarantee and the caller needs to hear about it.
             redirected = response.previousResponse().isPresent,
         )
+    }
+
+    /**
+     * Read at most [MAX_RESPONSE_BYTES] from the response stream, refusing the moment it is exceeded.
+     *
+     * The buffer grows from a small initial size rather than being pre-sized to the limit, so a
+     * normal few-hundred-byte response costs a few hundred bytes — the ceiling bounds the WORST
+     * case, it does not become the allocation for the ordinary one.
+     */
+    private fun readBounded(stream: java.io.InputStream, idempotencyKey: String?, url: String): String {
+        val out = java.io.ByteArrayOutputStream(INITIAL_BODY_BUFFER)
+        val chunk = ByteArray(8 * 1024)
+        try {
+            stream.use { s ->
+                while (true) {
+                    val n = s.read(chunk)
+                    if (n < 0) break
+                    if (out.size().toLong() + n > MAX_RESPONSE_BYTES) {
+                        throw PaylodIndeterminateException(
+                            redact.text(
+                                "paylod's response exceeded the ${MAX_RESPONSE_BYTES}-byte limit " +
+                                    "this SDK will read, so it was abandoned rather than " +
+                                    "accumulated. The request WAS dispatched, so the money state is " +
+                                    "INDETERMINATE: read the payment with this idempotencyKey " +
+                                    "rather than retrying, and never mint a fresh key.",
+                            ),
+                            idempotencyKey,
+                        )
+                    }
+                    out.write(chunk, 0, n)
+                }
+            }
+        } catch (e: PaylodException) {
+            throw e
+        } catch (e: Exception) {
+            // A genuine mid-body network failure. This used to happen INSIDE `client.send`, which
+            // surfaced it as a retryable connection error, and that classification is preserved:
+            // an interrupted read really is the transient case the retry loop exists for.
+            throw PaylodConnectionException(
+                redact.text("Could not read paylod's response from $url: ${e.message}"),
+            )
+        }
+        return out.toString(java.nio.charset.StandardCharsets.UTF_8)
     }
 
     /**
@@ -195,7 +316,7 @@ internal class Transport(
      *
      * None of these is retryable: a redirect is a configuration error or an attack, never a blip.
      */
-    private fun assertNotRedirected(response: HttpResponseSpec, requested: String) {
+    private fun assertNotRedirected(response: HttpResponseSpec, requested: String, idempotencyKey: String?) {
         if (response.status in 300..399) {
             throw PaylodApiException(
                 redact.text(
@@ -211,44 +332,120 @@ internal class Transport(
             )
         }
 
+        // A DETECTED CREDENTIAL COMPROMISE IS TERMINAL, NEVER RETRIED.
+        //
+        // This is a `PaylodSecurityException` rather than a `PaylodConnectionException` for one
+        // reason, and it is the whole reason the type exists: the client's retry loop catches
+        // `PaylodConnectionException` and RE-SENDS. So this detection — "your bearer token has
+        // already been replayed to another host, rotate it now" — used to be followed immediately
+        // by the SDK replaying the very same credentialed request, up to `maxRetries` more times.
+        // The loop has no branch that catches this type, so it propagates on the first occurrence.
         if (response.redirected) {
-            throw PaylodConnectionException(
+            throw PaylodSecurityException(
                 redact.text(
                     "The HTTP transport FOLLOWED a redirect even though this SDK dispatches with " +
                         "Redirect.NEVER. Your Authorization header may ALREADY have been replayed to " +
-                        "another host — treat this API key as COMPROMISED and rotate it now. This is " +
-                        "only reachable through the test-only custom-transport seam, which is why " +
-                        "that seam is refused for mp_live_ keys.",
+                        "another host — treat this API key as COMPROMISED and rotate it now. This " +
+                        "request will NOT be retried: retrying a request whose credential we believe " +
+                        "has leaked would hand it over again. This is only reachable through the " +
+                        "test-only custom-transport seam, which is why that seam is refused for " +
+                        "mp_live_ keys.",
                 ),
+                idempotencyKey,
             )
         }
 
         // A null URL is "not reported" (the normal case for a stub) and is not evidence of anything.
         val finalUrl = response.url
-        if (finalUrl != null) assertOnOrigin(finalUrl, "the responding URL")
+        if (finalUrl != null) assertOnOrigin(finalUrl, "the responding URL", idempotencyKey)
     }
 
-    /** Recomputed and compared on EVERY dispatch, so no path can walk a request off-origin. */
-    private fun assertOnOrigin(candidate: String, what: String) {
+    /**
+     * Recomputed and compared on EVERY dispatch, so no path can walk a request off-origin.
+     *
+     * Also terminal, for the same reason as the redirect detection: an off-origin RESPONSE means a
+     * redirect was followed and the credential is already gone, and an off-origin REQUEST is a
+     * configuration error or an attack. Neither is a transient blip, and neither gets a second
+     * dispatch.
+     */
+    private fun assertOnOrigin(candidate: String, what: String, idempotencyKey: String?) {
         val candidateOrigin = originOf(candidate)
-            ?: throw PaylodConnectionException(
+            ?: throw PaylodSecurityException(
                 redact.text("$what is not a valid absolute URL ($candidate)."),
+                idempotencyKey,
             )
         if (candidateOrigin != origin) {
-            throw PaylodConnectionException(
+            throw PaylodSecurityException(
                 redact.text(
                     "Refusing a request that is not addressed to the pinned paylod origin: $what " +
                         "resolves to \"$candidateOrigin\", but this client is pinned to \"$origin\". " +
                         "Your API key is a bearer credential and is sent on every request, so it may " +
                         "only ever be addressed to the origin it was configured for. If this happened " +
-                        "on a RESPONSE, a redirect was followed and the key must be rotated.",
+                        "on a RESPONSE, a redirect was followed and the key must be rotated. This " +
+                        "request is NOT retried.",
                 ),
+                idempotencyKey,
             )
         }
     }
 
     internal companion object {
         const val LIVE_PREFIX = "mp_live_"
+
+        /**
+         * The most a paylod response may be. Real ones are a few hundred bytes — an ack, a payment
+         * record, or an error envelope. 1 MiB is roughly three orders of magnitude of headroom and
+         * still small enough that the worst case is harmless.
+         */
+        const val MAX_RESPONSE_BYTES = 1L shl 20
+
+        /** The same ceiling expressed in chars, for the already-materialised custom-transport path. */
+        const val MAX_RESPONSE_CHARS = 1 shl 20
+
+        /** Start small; the ceiling bounds the worst case, it is not the ordinary allocation. */
+        const val INITIAL_BODY_BUFFER = 8 * 1024
+
+        /**
+         * The deepest JSON this SDK will recurse through. paylod's shapes are flat — the deepest
+         * legitimate nesting is a caller's own `metadata` object echoed back, and 64 levels is far
+         * past anything a payment carries.
+         */
+        const val MAX_JSON_DEPTH = 64
+
+        /**
+         * The maximum `{`/`[` nesting depth in [text], measured by a FLAT scan.
+         *
+         * Deliberately iterative: the entire point is to learn the depth of a document WITHOUT
+         * recursing to the bottom of it, since recursing is the thing that overflows. Brackets
+         * inside string literals do not nest, so the scan tracks string and escape state; it is a
+         * depth counter, not a parser, and it never needs to be one — over-counting is impossible
+         * and under-counting only for input the real parser will reject anyway.
+         */
+        fun maxJsonDepth(text: String): Int {
+            var depth = 0
+            var max = 0
+            var inString = false
+            var escaped = false
+            for (c in text) {
+                if (inString) {
+                    when {
+                        escaped -> escaped = false
+                        c == '\\' -> escaped = true
+                        c == '"' -> inString = false
+                    }
+                    continue
+                }
+                when (c) {
+                    '"' -> inString = true
+                    '{', '[' -> {
+                        depth++
+                        if (depth > max) max = depth
+                    }
+                    '}', ']' -> if (depth > 0) depth--
+                }
+            }
+            return max
+        }
 
         /** `scheme://host[:port]`, lowercased, or `null` when the URL is not usable. */
         fun originOf(url: String): String? {

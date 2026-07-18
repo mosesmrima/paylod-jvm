@@ -28,6 +28,21 @@ object Webhooks {
     /** Default anti-replay window, seconds. Mirrors the server's `maxSkewSeconds`. */
     const val DEFAULT_TOLERANCE_SEC = 300L
 
+    /**
+     * The widest anti-replay window this SDK will accept: **one hour**.
+     *
+     * Rejecting `toleranceSec <= 0` was only half the rule. Replay protection is a WINDOW, and a
+     * window can be disabled by making it enormous just as effectively as by making it zero — the
+     * check is `abs(now - t) > toleranceSec`, so `toleranceSec = Long.MAX_VALUE` accepts a captured
+     * webhook of literally any age while looking, in a config file, like a positive number that
+     * passed validation. `31536000` ("a year, to stop the flaky timestamp errors") is the realistic
+     * version of that mistake and it is the same hole.
+     *
+     * An hour is far beyond any legitimate clock skew between a webhook sender and a receiver, so
+     * nothing real is refused, and the window can no longer be widened into non-existence.
+     */
+    const val MAX_TOLERANCE_SEC = 3_600L
+
     private fun hmacHex(secret: String, timestamp: String, body: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(secret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
@@ -113,7 +128,20 @@ object Webhooks {
      * Verify a paylod webhook and return the typed event. Throws
      * [PaylodSignatureVerificationException] on any failure — never returns a half-trusted value.
      *
-     * @param nowSec injectable clock (unix seconds); defaults to the system clock.
+     * ── There is deliberately no `nowSec` parameter ────────────────────────────────────────
+     * Clock injection used to be a PUBLIC parameter on every entry point here. That makes "what time
+     * is it, for replay-protection purposes" an argument an application supplies — and the anti-replay
+     * check is `abs(nowSec - t) > toleranceSec`, so a caller-supplied clock can move the window
+     * anywhere, including onto a captured webhook from last year. It existed for one reason, which
+     * was verifying pinned fixtures in this SDK's own tests, and a test-only need does not justify a
+     * production parameter that can switch off a security control. It now lives behind an internal
+     * seam ([parseAndVerifyAt]) that only this module can reach.
+     *
+     * Note what this is NOT claiming: `internal` compiles to a public JVM method and is not a
+     * security boundary against in-process code. See SECURITY.md. It is an API-hygiene boundary —
+     * the parameter is gone from the surface an ordinary application can reach through the SDK's
+     * documented API, so it cannot be passed by accident, by a config binding, or by a well-meaning
+     * "make the flaky timestamp test pass" edit.
      */
     @JvmStatic
     @JvmOverloads
@@ -122,12 +150,29 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
+    ): WebhookEvent = parseAndVerifyAt(payload, signature, secret, toleranceSec, null)
+
+    /** The internal fixed-clock seam. Test-only; see the note on [parseAndVerify]. */
+    internal fun parseAndVerifyAt(
+        payload: ByteArray,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long,
+        nowSec: Long?,
     ): WebhookEvent {
-        val root = verifySignature(payload, signature, secret, toleranceSec, nowSec)
+        val root = verifySignatureAt(payload, signature, secret, toleranceSec, nowSec)
         assertEventSchema(root)
         return toEvent(root)
     }
+
+    /** The internal fixed-clock seam, `String` overload. */
+    internal fun parseAndVerifyAt(
+        payload: String,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long,
+        nowSec: Long?,
+    ): WebhookEvent = parseAndVerifyAt(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
 
     /**
      * Verify ONLY the signature and return the parsed JSON body, without the event-schema checks.
@@ -147,7 +192,15 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
+    ): Map<String, Any?> = verifySignatureAt(payload, signature, secret, toleranceSec, null)
+
+    /** The internal fixed-clock seam. Test-only; see the note on [parseAndVerify]. */
+    internal fun verifySignatureAt(
+        payload: ByteArray,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long,
+        nowSec: Long?,
     ): Map<String, Any?> {
         if (secret.isEmpty()) {
             throw PaylodSignatureVerificationException(
@@ -194,7 +247,18 @@ object Webhooks {
                 SignatureFailureReason.INSECURE_TOLERANCE,
                 "toleranceSec must be a positive number of seconds — a non-positive tolerance would " +
                     "disable webhook replay protection entirely. To verify a pinned fixture, keep a " +
-                    "normal tolerance and inject the fixture's own clock via nowSec.",
+                    "normal tolerance and use the SDK's internal fixed-clock test seam.",
+            )
+        }
+        // BOUNDED ABOVE AS WELL AS BELOW. A window is disabled just as thoroughly by making it
+        // enormous as by making it zero, and an enormous one has the advantage of looking valid.
+        if (toleranceSec > MAX_TOLERANCE_SEC) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INSECURE_TOLERANCE,
+                "toleranceSec must be at most ${MAX_TOLERANCE_SEC}s (one hour) — a wider window " +
+                    "accepts a captured webhook of essentially any age, which is replay protection " +
+                    "in name only. An hour already exceeds any legitimate clock skew; if timestamps " +
+                    "are failing, the clock is wrong, not the window.",
             )
         }
         // An injected clock is still a clock: a negative or absurd `nowSec` is a caller bug that would
@@ -245,8 +309,18 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
-    ): Map<String, Any?> = verifySignature(
+    ): Map<String, Any?> = verifySignatureAt(
+        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, null,
+    )
+
+    /** The internal fixed-clock seam, `String` overload. */
+    internal fun verifySignatureAt(
+        payload: String,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long,
+        nowSec: Long?,
+    ): Map<String, Any?> = verifySignatureAt(
         payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec,
     )
 
@@ -257,9 +331,8 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
-    ): WebhookEvent = parseAndVerify(
-        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec,
+    ): WebhookEvent = parseAndVerifyAt(
+        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, null,
     )
 
     /**
@@ -273,9 +346,17 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
+    ): Boolean = verifyAt(payload, signature, secret, toleranceSec, null)
+
+    /** The internal fixed-clock seam. Test-only; see the note on [parseAndVerify]. */
+    internal fun verifyAt(
+        payload: ByteArray,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long,
+        nowSec: Long?,
     ): Boolean = try {
-        parseAndVerify(payload, signature, secret, toleranceSec, nowSec)
+        parseAndVerifyAt(payload, signature, secret, toleranceSec, nowSec)
         true
     } catch (e: PaylodSignatureVerificationException) {
         false
@@ -294,8 +375,16 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
-    ): Boolean = verify(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
+    ): Boolean = verifyAt(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, null)
+
+    /** The internal fixed-clock seam, `String` overload. */
+    internal fun verifyAt(
+        payload: String,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long,
+        nowSec: Long?,
+    ): Boolean = verifyAt(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
 
     /** Reject with a consistent, non-leaking message. */
     private fun invalid(detail: String): Nothing = throw PaylodSignatureVerificationException(
@@ -359,8 +448,15 @@ object Webhooks {
         val parsedStatus = PaymentStatus.parseWire(status)
             ?: invalid("data.status was \"$status\", not one of pending/success/failed")
 
+        // Not merely "is a Number": an exact, positive, whole, in-range KES amount. See [wholeAmount].
         val amount = data["amount"]
-        if (amount !is Number) invalid("data.amount is not a number")
+        if (wholeAmount(amount) == null) {
+            invalid(
+                "data.amount is not a positive whole number of KES within the supported range " +
+                    "(1..$MAX_AMOUNT) — a fractional or out-of-range amount cannot be delivered " +
+                    "without silently truncating or wrapping the value a merchant reconciles against",
+            )
+        }
 
         val envValue = data["env"]
         if (envValue != null && envValue != "sandbox" && envValue != "production") {
@@ -415,13 +511,44 @@ object Webhooks {
 
     private fun asString(v: Any?): String? = v?.toString()
 
-    private fun asInt(v: Any?): Int? = when (v) {
-        null -> null
-        is Long -> v.toInt()
-        is Int -> v
-        is Double -> v.toInt()
-        is String -> v.toIntOrNull()
-        else -> null
+    /** The largest amount a paylod event can carry, in whole KES. Comfortably past any M-Pesa limit. */
+    private const val MAX_AMOUNT = Int.MAX_VALUE.toLong()
+
+    /**
+     * `data.amount` as an EXACT positive whole number of KES, or `null` if it is not one.
+     *
+     * The old check was `if (amount !is Number) invalid(...)`, and the conversion was
+     * `asInt`: `is Double -> v.toInt()`, `is Long -> v.toInt()`. Both of those are lossy in ways
+     * that change the number a merchant reconciles against:
+     *
+     *   • `100.7` TRUNCATED to `100` — a fractional amount is not a KES amount at all, and silently
+     *     dropping the fraction is worse than refusing it.
+     *   • `4294967396` (2^32 + 100) WRAPPED to `100` via `Long.toInt()`. A four-billion-shilling
+     *     event was delivered to a handler as a hundred-shilling one, with no error anywhere.
+     *   • `0` and negatives sailed through as perfectly good `Number`s.
+     *
+     * So the value must be finite, whole, at least 1, and within range — and it is then converted
+     * exactly, or refused. The `d != floor(d)` test runs before the range test so a `Double` too
+     * large to be whole cannot pass on rounding.
+     */
+    private fun wholeAmount(v: Any?): Int? {
+        if (v !is Number) return null
+        val d = v.toDouble()
+        if (!d.isFinite() || d != Math.floor(d)) return null
+        val l = when (v) {
+            is Long -> v
+            is Int -> v.toLong()
+            is Short -> v.toLong()
+            is Byte -> v.toLong()
+            else -> {
+                // A non-integral Number type (Double, BigDecimal, …). It is already known to be whole
+                // and finite; reject anything that cannot be represented exactly as a Long.
+                if (d < Long.MIN_VALUE.toDouble() || d > Long.MAX_VALUE.toDouble()) return null
+                d.toLong()
+            }
+        }
+        if (l < 1 || l > MAX_AMOUNT) return null
+        return l.toInt()
     }
 
     private fun asLong(v: Any?): Long? = when (v) {
@@ -444,17 +571,30 @@ object Webhooks {
         val rawType = root["type"] as String
         val data = root["data"] as Map<String, Any?>
 
-        val decodedMap = data["decoded"] as? Map<String, Any?>
-        val decoded = if (decodedMap != null) {
-            DecodedError(
-                code = decodedMap["code"]?.toString() ?: "",
-                title = decodedMap["title"]?.toString() ?: "",
-                cause = decodedMap["cause"]?.toString() ?: "",
-                fix = decodedMap["fix"]?.toString() ?: "",
-                category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
-                retryable = decodedMap["retryable"] as? Boolean ?: false,
-                customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
-            )
+        // ── `decoded` IS RECOMPUTED, NEVER READ FROM THE PAYLOAD ──────────────────────────────
+        //
+        // It used to be built field-by-field out of `data.decoded`, which made the payload the
+        // authority on two things it must never be the authority on:
+        //
+        //   • `retryable`. That field means SAFE TO CHARGE AGAIN. A payload advertising
+        //     `retryable: true` beside result code 1032 (customer cancelled — non-retryable in the
+        //     canonical table) went straight to `event.data.decoded.retryable`, and a handler doing
+        //     the documented `if (decoded.retryable) recharge()` charged a second time on the
+        //     sender's say-so. A signature proves WHO sent the body; it does not make the body's
+        //     claims about M-Pesa semantics true, and a compromised signer or an upstream bug
+        //     produces correctly-signed nonsense.
+        //
+        //   • the shape. `DarajaCategory.fromWire` THROWS `IllegalArgumentException` on an unknown
+        //     category, and `retryable` was an unchecked cast — so a malformed value escaped as a
+        //     raw parser exception from inside a webhook handler rather than as a typed rejection.
+        //
+        // The result code is signed and IS authoritative. Everything derived from it comes from the
+        // offline catalog — the same table `paylod.decodeError()` and the status path use — so the
+        // payload's own `decoded` object is ignored entirely. There is nothing left for a hostile
+        // payload to assert.
+        val decoded = if (rawType == "payment.failed") {
+            val code = data["resultCode"]
+            if (code == null) null else DarajaCatalog.decodeError(normalizeCode(code), asString(data["resultDesc"]))
         } else {
             null
         }
@@ -467,8 +607,12 @@ object Webhooks {
                 paymentId = asString(data["paymentId"]) ?: "",
                 applicationId = asString(data["applicationId"]),
                 env = asString(data["env"]),
-                status = if (data.containsKey("status")) PaymentStatus.fromWire(asString(data["status"])) else null,
-                amount = asInt(data["amount"]),
+                // `parseWire`, the STRICT parse. This was `fromWire`, which mapped anything it did
+                // not recognise to `PENDING`. `assertEventSchema` has already required this field to
+                // be one of the three known values, so the lenient fallback could only ever have
+                // masked a disagreement between the two — and the lenient function no longer exists.
+                status = PaymentStatus.parseWire(asString(data["status"])),
+                amount = wholeAmount(data["amount"]),
                 phone = asString(data["phone"]),
                 accountRef = asString(data["accountRef"]),
                 mpesaReceipt = asString(data["mpesaReceipt"]),

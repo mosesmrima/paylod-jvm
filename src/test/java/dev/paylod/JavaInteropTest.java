@@ -106,15 +106,20 @@ class JavaInteropTest {
         String body = "{\"type\":\"payment.success\",\"created\":1700000000,"
             + "\"data\":{\"paymentId\":\"pay_9\",\"status\":\"success\",\"amount\":100,"
             + "\"mpesaReceipt\":\"SFF6XYZ123\",\"resultCode\":0}}";
-        String header = Webhooks.sign(body, secret, 1700000000L);
+        // Signed with the REAL current clock. There is deliberately no `nowSec` parameter on the
+        // public API any more — clock injection is an internal test seam, and `internal` is not
+        // callable from Java — so this fixture is made fresh rather than pinned. That is exactly the
+        // posture a production Java caller is in, which is what an interop test should exercise.
+        long signedAt = System.currentTimeMillis() / 1000;
+        String header = Webhooks.sign(body, secret, signedAt);
 
-        // Replay protection stays ON. The pinned fixture keeps a normal window and moves the clock.
-        assertTrue(paylod.verifyWebhook(body, header, secret, 300L, 1700000000L));
-        assertFalse(paylod.verifyWebhook(body, header, "wrong_secret", 300L, 1700000000L));
-        // A disabled tolerance is refused from Java too.
-        assertFalse(paylod.verifyWebhook(body, header, secret, 0L, 1700000000L));
+        assertTrue(paylod.verifyWebhook(body, header, secret, 300L));
+        assertFalse(paylod.verifyWebhook(body, header, "wrong_secret", 300L));
+        // A disabled tolerance is refused from Java too — in BOTH directions.
+        assertFalse(paylod.verifyWebhook(body, header, secret, 0L));
+        assertFalse(paylod.verifyWebhook(body, header, secret, Webhooks.MAX_TOLERANCE_SEC + 1));
 
-        WebhookEvent event = paylod.parseWebhook(body, header, secret, 300L, 1700000000L);
+        WebhookEvent event = paylod.parseWebhook(body, header, secret, 300L);
         assertEquals("pay_9", event.getData().getPaymentId());
         assertEquals(WebhookEventType.PAYMENT_SUCCESS, event.getType());
     }

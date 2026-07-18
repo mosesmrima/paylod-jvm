@@ -220,9 +220,17 @@ class ClientTest {
             listOf(Step(json = paymentJson(status = "failed", resultCode = "500.001.1001", resultDesc = "The transaction is being processed"))),
         )
         val r = paylod.check("pay_123")
+        // The claim (`failed`) and the evidence (a pending code) contradict, so the verdict is
+        // INDETERMINATE — rendered as PENDING, never paid, and never retryable. The message is the
+        // indeterminate one rather than the "check your phone" one precisely because the SDK does
+        // NOT know the prompt is live; it knows the record disagrees with itself.
         assertEquals(OutcomeStatus.PENDING, r.status)
         assertFalse(r.retryable)
-        assertEquals("Check your phone and enter your M-Pesa PIN to complete this payment.", r.message)
+        assertFalse(r.paid)
+        assertEquals(
+            "We couldn't confirm this payment yet. Please wait — do not retry — while it settles.",
+            r.message,
+        )
     }
 
     @Test

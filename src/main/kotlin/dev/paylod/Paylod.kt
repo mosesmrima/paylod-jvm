@@ -14,7 +14,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 const val DEFAULT_BASE_URL = "https://paylod.dev/functions/v1"
 
 private const val MAX_AMOUNT = 150_000
-private const val DEFAULT_WAIT_TIMEOUT_MS = 120_000L
 
 // The ceiling on any single sleep when the operation has no absolute deadline of its own.
 private const val MAX_UNBOUNDED_SLEEP_MS = 60_000L
@@ -87,6 +86,31 @@ class Paylod internal constructor(
         // HTTP is allowed only behind an explicit test-only flag, and never with a live key.
         assertSecureBaseUrl(baseUrl, apiKey, options.allowInsecureBaseUrl)
         webhookSecret = options.webhookSecretOrNull() ?: env("PAYLOD_WEBHOOK_SECRET")
+        // BOUNDED AT CONSTRUCTION, not trusted at use. Both of these were taken verbatim, so
+        // `timeoutMs = 0` (or negative) built a client whose every request timed out instantly —
+        // `Duration.ofMillis(0)` is not "no timeout", it is "already expired" — and `timeoutMs =
+        // Long.MAX_VALUE` built one that could park a request thread effectively forever. A negative
+        // `maxRetries` skipped the loop entirely and threw a `PaylodConnectionException("Request to
+        // … failed")` with no attempt ever made, while a huge one turned a transient 5xx into a
+        // multi-hour retry storm under a single idempotency key. None of those are configurations
+        // anyone wants; all of them were reachable by a typo in a config file, and every one of them
+        // failed in a way that pointed nowhere near the setting that caused it.
+        if (options.timeoutMs < MIN_TIMEOUT_MS || options.timeoutMs > MAX_TIMEOUT_MS) {
+            throw PaylodConfigException(
+                "timeoutMs must be between $MIN_TIMEOUT_MS and $MAX_TIMEOUT_MS (got " +
+                    "${options.timeoutMs}). A non-positive timeout expires every request " +
+                    "immediately rather than disabling the limit, and an unbounded one can hold a " +
+                    "request thread open indefinitely.",
+            )
+        }
+        if (options.maxRetries < 0 || options.maxRetries > MAX_RETRIES_LIMIT) {
+            throw PaylodConfigException(
+                "maxRetries must be between 0 and $MAX_RETRIES_LIMIT (got ${options.maxRetries}). " +
+                    "A negative value would skip the request loop entirely and report a failure " +
+                    "that never happened; a very large one turns a transient error into a long " +
+                    "retry storm under a single idempotency key.",
+            )
+        }
         timeoutMs = options.timeoutMs
         maxRetries = options.maxRetries
         redact = Redactor(listOf(apiKey, webhookSecret))
@@ -138,6 +162,38 @@ class Paylod internal constructor(
         this(options.apiKeyOrNull(), options, RealTimeSource, java.util.Random())
 
     // ── HTTP ────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * [request], but the validator PRODUCES the typed value the caller goes on to use.
+     *
+     * The point is that validating and constructing are the same act. When they were separate, the
+     * caller re-read the raw map after the check and could — and did — interpret it differently
+     * from the validator that approved it.
+     */
+    private fun <T> requestValidated(
+        method: String,
+        path: String,
+        body: Any?,
+        idempotencyKey: String?,
+        deadlineMs: Long? = null,
+        validate: (Map<String, Any?>, Int) -> T,
+    ): T {
+        var produced: Any? = NOT_PRODUCED
+        request(method, path, body, idempotencyKey, deadlineMs) { map, status ->
+            produced = validate(map, status)
+        }
+        if (produced === NOT_PRODUCED) {
+            // Unreachable: `request` either invokes the validator or throws. It is a hard error rather
+            // than a silent default because the alternative on a money path is inventing a record.
+            throw PaylodIndeterminateException(
+                "paylod returned a response that was never validated — refusing to act on it. The " +
+                    "request WAS dispatched, so read the payment rather than retrying.",
+                idempotencyKey,
+            )
+        }
+        @Suppress("UNCHECKED_CAST")
+        return produced as T
+    }
 
     private fun request(
         method: String,
@@ -377,16 +433,12 @@ class Paylod internal constructor(
         // THE shared validator, with law L1 (ID BINDING) at the front: the body must describe the
         // payment that was ASKED about. Whether it proves settlement is a separate question, decided
         // afterwards by the one semantic model in `Semantics.kt` — shape here, meaning there.
-        val p = request("GET", "/status/$encoded", null, null, deadlineMs) { map, status ->
+        // The validator BUILDS the record it approved and hands it back. This function no longer
+        // re-reads the map, so there is no second, laxer interpretation of the same bytes for the
+        // money path to use instead of the one that was checked.
+        return requestValidated("GET", "/status/$encoded", null, null, deadlineMs) { map, status ->
             PaymentValidators.assertPaymentBody(map, status, paymentId, "paylod", redact)
         }
-        return Payment(
-            id = p["id"] as String,
-            status = PaymentStatus.fromWire(p["status"]?.toString()),
-            mpesaReceipt = p["mpesaReceipt"]?.toString(),
-            resultCode = normalizeResultCode(p["resultCode"]),
-            resultDesc = p["resultDesc"]?.toString(),
-        )
     }
 
     /** [status], but already decoded and renderable. This is the one you usually want. */
@@ -404,11 +456,23 @@ class Paylod internal constructor(
      */
     @JvmOverloads
     fun wait(paymentId: String, options: WaitOptions = WaitOptions.DEFAULT): PaymentOutcome {
-        val timeout = options.timeoutMs.takeIf { it > 0 } ?: DEFAULT_WAIT_TIMEOUT_MS
+        // `options.timeoutMs` is validated at WaitOptions CONSTRUCTION, so it is positive and bounded
+        // by the time it arrives here. It used to be `takeIf { it > 0 } ?: DEFAULT_WAIT_TIMEOUT_MS`:
+        // a caller who passed 0 or a negative value — a units mix-up, an unset config field — silently
+        // got the 120s default instead of the timeout they asked for, and nothing anywhere said so.
+        // Silently substituting a DIFFERENT value for the one a caller supplied is the failure mode,
+        // not the absence of a default.
+        val timeout = options.timeoutMs
         // Monotonic: the caller's timeout is a DURATION, and must not be lengthened or shortened by a
         // wall-clock adjustment landing mid-wait.
         val startedAt = time.monotonicMillis()
-        val deadline = startedAt + timeout
+        // OVERFLOW-SAFE. `monotonicMillis` has an arbitrary origin (it is `nanoTime`-derived), so it
+        // can sit anywhere in the `Long` range — including near the top, where `startedAt + timeout`
+        // wraps NEGATIVE. A negative deadline makes `remaining()` negative on the very first check,
+        // so every poll is "out of time": `wait()` returns instantly and `collectAndWait` reports a
+        // timeout on a payment it never once looked at. Saturating is the correct behaviour — a
+        // deadline that cannot be represented is, for practical purposes, infinitely far away.
+        val deadline = saturatingAdd(startedAt, timeout)
 
         var last: Payment? = null
         var attempt = 0
@@ -422,7 +486,10 @@ class Paylod internal constructor(
             options.onPoll?.onPoll(payment)
 
             val delay = pollDelay(attempt)
-            if (time.monotonicMillis() + delay >= deadline) break
+            // Saturating here too: `now + delay` overflows for the same reason `startedAt + timeout`
+            // does, and a wrapped-negative sum compares as `< deadline`, so the loop would sleep and
+            // poll straight through the deadline it was given.
+            if (saturatingAdd(time.monotonicMillis(), delay) >= deadline) break
             time.sleep(delay)
             attempt++
         }
@@ -463,13 +530,40 @@ class Paylod internal constructor(
             // The narrow catch made the guarantee conditional on which layer failed, which is exactly
             // the kind of "safe most of the time" that charges people twice.
             //
-            // An `Error` (OOM, StackOverflow) is deliberately NOT re-wrapped — the JVM is not in a
-            // state where wrapping helps — but it is still not allowed to escape unlabelled: nothing
-            // else in this method can attach the handles, so a normalising wrapper is the only place
-            // they can come from. Everything else becomes a `PaylodConnectionException` carrying both
-            // handles, with a REDACTED message and NO cause attached (an arbitrary third-party
-            // exception can embed a request line, headers, or a URL with credentials in it).
-            if (e is Error) throw e
+            // ── `Error` IS NOT A FREE PASS ────────────────────────────────────────────────────
+            //
+            // This used to be `if (e is Error) throw e` — every `Error` rethrown bare, with no
+            // idempotency key and no payment id, for a charge that is live on a handset. The
+            // justification was "the JVM is not in a state where wrapping helps", and that is true of
+            // exactly one branch of the `Error` hierarchy: `VirtualMachineError` (OOM, StackOverflow,
+            // InternalError). It is not true of the rest, and `Error` is not a closed set:
+            //
+            //   • `AssertionError` is thrown by ordinary application code — `assert`, Kotlin's
+            //     `error()`-adjacent helpers, most assertion libraries. An `onPoll` listener doing
+            //     `assert(payment.status == PENDING)` is a caller-controlled, entirely routine way to
+            //     land here, in a perfectly healthy JVM.
+            //   • `LinkageError` / `NoClassDefFoundError` is a classpath problem, not a dying VM.
+            //
+            // So the split is by whether the VM is actually in trouble, not by whether the class name
+            // happens to end in "Error". Everything else is wrapped exactly like a `RuntimeException`
+            // would be: a `PaylodConnectionException` carrying BOTH handles, with a REDACTED message
+            // and NO cause attached (an arbitrary third-party throwable can embed a request line,
+            // headers, or a URL with credentials in it).
+            //
+            // And a genuine `VirtualMachineError` still does not escape unlabelled. It is rethrown —
+            // wrapping it would allocate on the way out of an OOM, which is precisely the wrong move —
+            // but the charge handles are attached to it first, as a SUPPRESSED exception. That costs
+            // one small object, is itself guarded, and means the key and the payment id appear in the
+            // stack trace the caller logs instead of being lost with the only handles on a live charge.
+            if (e is VirtualMachineError) {
+                try {
+                    e.addSuppressed(chargeContext(ack, e))
+                } catch (ignored: Throwable) {
+                    // If even that allocation fails, the original Error still propagates untouched.
+                    // Losing the annotation is acceptable; swallowing the OOM would not be.
+                }
+                throw e
+            }
             val wrapped = PaylodConnectionException(
                 redact.text(
                     "The collect was ACKNOWLEDGED and an STK prompt is live, but waiting for it to " +
@@ -483,6 +577,24 @@ class Paylod internal constructor(
             wrapped.paymentId = ack.paymentId
             throw wrapped
         }
+    }
+
+    /**
+     * The charge handles, as a throwable that can be attached to something we must not replace.
+     *
+     * Used for a [VirtualMachineError], which is rethrown as-is: this rides along as a suppressed
+     * exception so the idempotency key and the payment id are in the stack trace rather than lost.
+     */
+    private fun chargeContext(ack: CollectAck, cause: Throwable): PaylodException {
+        val ctx = PaylodIndeterminateException(
+            "The collect was ACKNOWLEDGED and an STK prompt is live for payment ${ack.paymentId}, " +
+                "but waiting for it to settle died with a ${cause.javaClass.simpleName}. The charge " +
+                "state is INDETERMINATE. Read that payment, or retry with the idempotencyKey on " +
+                "this exception — never a fresh one.",
+            ack.idempotencyKey,
+        )
+        ctx.paymentId = ack.paymentId
+        return ctx
     }
 
     /** Java-friendly overload of [collectAndWait]. */
@@ -515,8 +627,7 @@ class Paylod internal constructor(
         signatureHeader: String?,
         secret: String? = null,
         toleranceSec: Long = Webhooks.DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
-    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec, nowSec)
+    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
 
     /** ByteArray overload of [verifyWebhook] — pass the exact raw bytes that arrived. */
     @JvmOverloads
@@ -525,8 +636,7 @@ class Paylod internal constructor(
         signatureHeader: String?,
         secret: String? = null,
         toleranceSec: Long = Webhooks.DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
-    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec, nowSec)
+    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
 
     /**
      * Verify a webhook and return the typed [WebhookEvent]. Throws
@@ -538,17 +648,29 @@ class Paylod internal constructor(
         signatureHeader: String?,
         secret: String? = null,
         toleranceSec: Long = Webhooks.DEFAULT_TOLERANCE_SEC,
-        nowSec: Long? = null,
-    ): WebhookEvent = Webhooks.parseAndVerify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec, nowSec)
-
-    private fun normalizeResultCode(v: Any?): String? = when (v) {
-        null -> null
-        is Double -> if (v == Math.floor(v)) v.toLong().toString() else v.toString()
-        else -> v.toString()
-    }
+    ): WebhookEvent = Webhooks.parseAndVerify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
 
     private companion object {
         val warned = AtomicBoolean(false)
+
+        /**
+         * A sentinel distinct from every value a validator could legitimately produce — including
+         * `null`. `null` would be indistinguishable from a validator that legitimately returned it.
+         */
+        val NOT_PRODUCED = Any()
+
+        /** A per-request timeout below this is not a timeout, it is an immediate failure. */
+        const val MIN_TIMEOUT_MS = 1L
+
+        /** Ten minutes. Past this a "timeout" is not bounding anything a caller can wait for. */
+        const val MAX_TIMEOUT_MS = 600_000L
+
+        /** Retries are for transient blips. Beyond ten, the answer is not going to change. */
+        const val MAX_RETRIES_LIMIT = 10
+
+        /** `a + b`, saturating at [Long.MAX_VALUE] instead of wrapping negative. */
+        fun saturatingAdd(a: Long, b: Long): Long =
+            if (b > 0 && a > Long.MAX_VALUE - b) Long.MAX_VALUE else a + b
 
         /**
          * A `409` retried only when it is explicitly the "same key still running" case. Every other

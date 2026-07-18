@@ -159,8 +159,13 @@ object PaymentSemantics {
      * claim \ evidence  NONE           SUCCESS         FAILURE         IN_FLIGHT      CONFLICT
      * SUCCESS           INDETERMINATE  PAID            INDETERMINATE   INDETERMINATE  INDETERMINATE
      * PENDING           IN_FLIGHT      INDETERMINATE   INDETERMINATE   IN_FLIGHT      INDETERMINATE
-     * FAILED            FAILED         INDETERMINATE   FAILED          IN_FLIGHT      INDETERMINATE
+     * FAILED            FAILED         INDETERMINATE   FAILED          INDETERMINATE  INDETERMINATE
      * ```
+     *
+     * Note the shape of the IN_FLIGHT column: a `pending` claim beside in-flight evidence is the one
+     * cell where the two AGREE, and it is the only one that yields IN_FLIGHT. A `failed` claim beside
+     * in-flight evidence is a CONTRADICTION and goes to INDETERMINATE like every other contradiction
+     * in the table — there are no exceptions to L3 left.
      *
      * This table is TOTAL: every (claim, evidence) pair has exactly one verdict, every pair is
      * ENUMERATED rather than derived, and there is **no `else` branch anywhere**. Adding a
@@ -175,9 +180,11 @@ object PaymentSemantics {
      *   • A failure claim is believed on failure evidence or on silence: proving a payment did NOT
      *     happen is not something we require evidence for, because the safe action (do not ship,
      *     do not capture) is the same either way.
-     *   • In-flight evidence outranks a terminal `FAILED` claim: a `failed` row carrying 4999 means
-     *     the prompt is STILL LIVE and the customer is mid-PIN. Reporting that as a failure is the
-     *     revenue-losing bug this codebase already shipped twice.
+     *   • A `FAILED` claim beside in-flight evidence is NOT a terminal failure. Reporting it as one
+     *     is the revenue-losing bug this codebase already shipped twice — but neither is it a
+     *     confident "the prompt is live". It is a contradiction, so it is INDETERMINATE, which
+     *     renders as PENDING and never as retryable. The safe behaviour is identical; the claim the
+     *     SDK makes about what it knows is now honest.
      */
     @JvmStatic
     fun judge(payment: Payment): PaymentJudgement {
@@ -230,10 +237,28 @@ object PaymentSemantics {
                     PaymentVerdict.INDETERMINATE to
                         "status claims failed but the evidence proves the payment succeeded — " +
                         "refusing to report a payment that carries proof of settlement as a failure"
+                // L3, applied to the cell that used to be the one exception to it.
+                //
+                // This resolved to IN_FLIGHT: "in-flight evidence outranks a terminal claim". That
+                // reasoning picks a WINNER between two signals that contradict each other, which is
+                // precisely the move L3 exists to forbid — everywhere else in this table, a claim
+                // that disagrees with its evidence is INDETERMINATE, and this cell was carved out on
+                // the strength of one plausible story about how it arises (a `failed` row carrying
+                // 4999 while the customer is mid-PIN). Other stories fit the same bytes just as well:
+                // a genuinely failed payment whose result code was written from a stale read, or a
+                // record mid-write. We cannot tell them apart, and "cannot tell" is INDETERMINATE by
+                // definition, not IN_FLIGHT.
+                //
+                // Nothing an integrator SEES changes: `Outcomes.of` renders INDETERMINATE exactly as
+                // it renders IN_FLIGHT — `OutcomeStatus.PENDING`, `paid = false` and, critically,
+                // `retryable = false` — so `wait()` still keeps polling and lets the webhook settle
+                // it, and no caller is ever invited to charge again. What changes is that the SDK no
+                // longer CLAIMS to know the prompt is live when it does not.
                 PaymentEvidence.IN_FLIGHT ->
-                    PaymentVerdict.IN_FLIGHT to
-                        "status says failed but the result code means the prompt is still live and " +
-                        "the customer has not entered their PIN yet"
+                    PaymentVerdict.INDETERMINATE to
+                        "status claims the payment failed terminally while the result code says it " +
+                        "is still in flight — the two contradict, so the record proves nothing; it " +
+                        "is neither settled nor safe to charge again"
                 PaymentEvidence.NONE, PaymentEvidence.FAILURE ->
                     PaymentVerdict.FAILED to "the payment failed terminally"
                 PaymentEvidence.CONFLICT ->

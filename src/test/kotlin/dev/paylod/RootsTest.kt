@@ -109,18 +109,80 @@ class RootsTest {
     fun `ROOT 1 - REFUSES a 2xx the transport reached by FOLLOWING a redirect`() {
         // A detection, not a prevention: by the time this is true the credential is already gone.
         // It exists so the failure is loud and the caller learns the key is burned.
-        val err = assertThrows<PaylodConnectionException> {
+        val err = assertThrows<PaylodSecurityException> {
             transportWith(HttpResponseSpec(200, emptyMap(), "{}", redirected = true))
                 .send(collectRequest)
         }
         assertTrue(err.message!!.contains("rotate"), "must tell the caller to rotate: ${err.message}")
+
+        // IT IS NOT A CONNECTION ERROR. That is the whole point of the type: the client's retry loop
+        // catches `PaylodConnectionException`, so raising this as one meant the SDK responded to
+        // "your bearer token has leaked" by sending the credentialed request again.
+        assertFalse(
+            err is PaylodConnectionException,
+            "a compromise detection must not be a retryable connection error",
+        )
+        assertTrue(err.indeterminate, "a security refusal never proves the money state")
+    }
+
+    @Test
+    @Tag("nv-r1-noretry")
+    fun `ROOT 1 - a detected credential compromise is TERMINAL and is never retried`() {
+        // The end-to-end version of the above, through the real client and its real retry loop.
+        // `maxRetries = 3` means a `PaylodConnectionException` here would produce FOUR dispatches —
+        // four more chances for the attacker's host to receive the bearer token after the SDK had
+        // already concluded it was compromised. Exactly ONE call is the fix.
+        val transport = StubTransport(
+            List(4) { Step(status = 200, json = ACK) },
+        )
+        val paylod = Paylod(
+            "mp_test_abc123",
+            PaylodOptions.of(
+                maxRetries = 3,
+                transport = { _ -> HttpResponseSpec(200, emptyMap(), Json.write(ACK), redirected = true) },
+                allowCustomTransport = true,
+            ),
+            FakeTimeSource(),
+            java.util.Random(1),
+        )
+
+        val err = assertThrows<PaylodSecurityException> {
+            paylod.collect(CollectParams("0712345678", 100, idempotencyKey = "k-compromise"))
+        }
+        assertTrue(err.message!!.contains("rotate"))
+        // The key still rides along, because the request WAS dispatched and the money state is
+        // unknown — the caller must read the payment, not mint a fresh key.
+        assertEquals("k-compromise", err.idempotencyKey)
+        assertEquals(0, transport.count, "the stub must never be reached a second time")
+    }
+
+    @Test
+    @Tag("nv-r1-noretry-count")
+    fun `ROOT 1 - the compromise detection fires exactly once, not maxRetries times`() {
+        // Counts the dispatches directly. A retried security refusal shows up here as 4.
+        var dispatches = 0
+        val paylod = Paylod(
+            "mp_test_abc123",
+            PaylodOptions.of(
+                maxRetries = 3,
+                transport = { _ ->
+                    dispatches++
+                    HttpResponseSpec(200, emptyMap(), "{}", redirected = true)
+                },
+                allowCustomTransport = true,
+            ),
+            FakeTimeSource(),
+            java.util.Random(1),
+        )
+        assertThrows<PaylodSecurityException> { paylod.status("pay_123") }
+        assertEquals(1, dispatches, "a compromised credential must be sent EXACTLY once, never replayed")
     }
 
     @Test
     @Tag("nv-r1-origin")
     fun `ROOT 1 - refuses a 2xx whose responding URL is off the pinned origin`() {
         // Catches an implementation that follows a redirect while lying about having done so.
-        val err = assertThrows<PaylodConnectionException> {
+        val err = assertThrows<PaylodSecurityException> {
             transportWith(
                 HttpResponseSpec(200, emptyMap(), "{}", url = "https://evil.example/functions/v1/collect"),
             ).send(collectRequest)
@@ -283,12 +345,23 @@ class RootsTest {
 
     @Test
     @Tag("nv-r2-inflight")
-    fun `ROOT 2 - in-flight evidence outranks a terminal FAILED claim`() {
-        // A `failed` row carrying 4999 means the prompt is STILL LIVE and the customer is mid-PIN.
-        // Reporting that as a failure is the revenue-losing bug this codebase shipped twice.
-        val judgement = PaymentSemantics.judge(Payment("p", PaymentStatus.FAILED, null, "4999", null))
-        assertEquals(PaymentVerdict.IN_FLIGHT, judgement.verdict)
-        assertFalse(Outcomes.of(Payment("p", PaymentStatus.FAILED, null, "4999", null)).retryable)
+    fun `ROOT 2 - a FAILED claim beside in-flight evidence is INDETERMINATE, never terminal`() {
+        // A `failed` row carrying 4999 is a CONTRADICTION: the claim says terminal, the code says
+        // still in flight. This used to resolve to IN_FLIGHT — picking a winner between two signals
+        // that disagree, which is the one thing L3 forbids everywhere else in the table. It is now
+        // INDETERMINATE like every other contradiction.
+        val payment = Payment("p", PaymentStatus.FAILED, null, "4999", null)
+        val judgement = PaymentSemantics.judge(payment)
+        assertEquals(PaymentVerdict.INDETERMINATE, judgement.verdict)
+
+        // What an integrator SEES is unchanged, and that is the safety argument: still PENDING (so
+        // `wait()` keeps polling and the webhook settles it), still not paid, and above all still
+        // NOT retryable. Reporting this as a terminal failure is the revenue-losing bug this
+        // codebase shipped twice; reporting it as retryable would be the double-charge bug.
+        val outcome = Outcomes.of(payment)
+        assertEquals(OutcomeStatus.PENDING, outcome.status)
+        assertFalse(outcome.retryable)
+        assertFalse(outcome.paid)
     }
 
     @Test
@@ -454,7 +527,7 @@ class RootsTest {
         val body =
             """{"type":"payment.success","created":1700000000,"data":{"paymentId":"pay_1","status":"success","amount":100}}"""
         val err = assertThrows<PaylodSignatureVerificationException> {
-            Webhooks.parseAndVerify(body, Webhooks.sign(body, secret, now), secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(body, Webhooks.sign(body, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.INVALID_PAYLOAD, err.reason)
 
@@ -463,7 +536,7 @@ class RootsTest {
             """{"type":"payment.success","created":1700000000,"data":{"paymentId":"pay_1","status":"success","amount":100,"resultCode":0}}"""
         assertEquals(
             "pay_1",
-            Webhooks.parseAndVerify(good, Webhooks.sign(good, secret, now), secret, nowSec = now).data.paymentId,
+            Webhooks.parseAndVerifyAt(good, Webhooks.sign(good, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now).data.paymentId,
         )
     }
 
@@ -475,7 +548,7 @@ class RootsTest {
         val body =
             """{"type":"payment.success","created":1700000000,"data":{"paymentId":"pay_1","status":"failed","amount":100,"resultCode":1032}}"""
         val err = assertThrows<PaylodSignatureVerificationException> {
-            Webhooks.parseAndVerify(body, Webhooks.sign(body, secret, now), secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(body, Webhooks.sign(body, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.INVALID_PAYLOAD, err.reason)
         assertTrue(err.message!!.contains("contradicts"), "unhelpful message: ${err.message}")
@@ -491,7 +564,7 @@ class RootsTest {
         val body =
             """{"type":"payment.failed","created":1700000000,"data":{"paymentId":"pay_1","status":"failed","amount":100,"mpesaReceipt":"SFF6XYZ123","resultCode":1032}}"""
         val err = assertThrows<PaylodSignatureVerificationException> {
-            Webhooks.parseAndVerify(body, Webhooks.sign(body, secret, now), secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(body, Webhooks.sign(body, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.INVALID_PAYLOAD, err.reason)
     }

@@ -225,6 +225,72 @@ class PaylodConnectionException internal constructor(
 ) : PaylodException(message, cause)
 
 /**
+ * A SECURITY control refused, or DETECTED, something on the credentialed path. **Terminal.**
+ *
+ * ── Why this type exists at all ───────────────────────────────────────────────────────────
+ * The redirect and off-origin detections used to be raised as [PaylodConnectionException]. That is
+ * the ONE exception type the client's retry loop catches and retries. So the sequence was:
+ *
+ *   1. a transport follows a cross-origin 302, replaying `Authorization: Bearer mp_…` to a host we
+ *      never addressed — the credential is now in someone else's log;
+ *   2. the SDK DETECTS that and raises a "your key is compromised, rotate it now" error;
+ *   3. the retry loop catches it as a network blip and **sends the request again**.
+ *
+ * The SDK's own compromise detection was, in other words, a trigger for replaying the compromised
+ * credential — up to `maxRetries` more times, each one another chance for the attacker's host to
+ * receive it. The detection was correct and the response to it was the worst possible one.
+ *
+ * This class is not a [PaylodConnectionException] and is not a subclass of one. It extends
+ * [PaylodException] directly and the retry loop has no branch that catches it, so a security
+ * refusal propagates to the caller on the FIRST occurrence, always, with no further dispatch. That
+ * property is structural rather than a matter of the loop remembering to check: to retry one of
+ * these, someone would have to add a new `catch` for this exact type.
+ *
+ * A security refusal is also INDETERMINATE for money purposes — we do not know what the other end
+ * did with the request — so it carries [PaylodException.idempotencyKey] like every other
+ * post-dispatch failure. Read the payment; never mint a fresh key.
+ */
+class PaylodSecurityException internal constructor(
+    message: String,
+    idempotencyKey: String? = null,
+) : PaylodException(message) {
+    init {
+        this.idempotencyKey = idempotencyKey
+    }
+
+    /** Always `true`. A security refusal never proves the money state either way. */
+    @JvmField
+    val indeterminate: Boolean = true
+}
+
+/**
+ * A response could not be safely CONSUMED, so the money state is unknown. **Terminal.**
+ *
+ * Raised when a response exceeds the bounds the SDK is willing to allocate for or recurse through —
+ * an unbounded body, or JSON nested past the depth limit. Both of those used to be met by actually
+ * trying: accumulating the whole body into memory and recursing to the bottom of the document. An
+ * OOM or a `StackOverflowError` at that point is thrown from a code path that has ALREADY dispatched
+ * the request, and it is not a [PaylodException], so it escaped every block that attaches the
+ * effective `Idempotency-Key`. The caller was left with a possibly-live charge and no key.
+ *
+ * Refusing BEFORE allocating or recursing turns that into an ordinary, typed, key-carrying error.
+ * Like [PaylodSecurityException] this extends [PaylodException] directly and is never retried: the
+ * request reached the server, and re-dispatching it is exactly what must not happen.
+ */
+class PaylodIndeterminateException internal constructor(
+    message: String,
+    idempotencyKey: String? = null,
+) : PaylodException(message) {
+    init {
+        this.idempotencyKey = idempotencyKey
+    }
+
+    /** Always `true`. That is the entire point of the type. */
+    @JvmField
+    val indeterminate: Boolean = true
+}
+
+/**
  * The calling thread was interrupted mid-request. Deliberately NOT a [PaylodConnectionException]:
  * an interrupt is a cancellation, not a transient blip, so the client must NOT retry it. The
  * interrupt flag is restored before this is thrown.

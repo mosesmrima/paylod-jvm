@@ -96,6 +96,20 @@ internal object PaymentValidators {
      * A mismatch is INDETERMINATE rather than a plain error because that is the honest reading: we
      * now know nothing about the payment we asked about. "I do not know" must never collapse to
      * "failed" (reported as retryable, so the customer is charged twice) or to "paid".
+     *
+     * ── Why this RETURNS a [Payment] rather than just asserting ───────────────────────────
+     * It used to be `Unit`: it vetted the map, and then the CALLER re-read the same map and built a
+     * [Payment] from it independently — with `PaymentStatus.fromWire`, a lenient parse that mapped
+     * anything unrecognised to `PENDING`. Two readings of one body, and the money path used the
+     * permissive one. The strict check and the value that money decisions were actually made from
+     * were different objects, so the guard could be satisfied while the constructed record said
+     * something the guard never approved, and any future edit that moved, weakened or bypassed the
+     * assert left the lenient construction standing on its own.
+     *
+     * Returning the typed record collapses the two into one. The ONLY way to obtain a [Payment] from
+     * a wire body is to go through the validation that produced it, `parseWire` (strict, nullable) is
+     * the only status parse left in the SDK, and there is no lenient fallback anywhere for a future
+     * caller to reach for — it was deleted rather than merely left unused.
      */
     fun assertPaymentBody(
         parsed: Any?,
@@ -103,7 +117,7 @@ internal object PaymentValidators {
         expectedId: String,
         what: String,
         redact: Redactor,
-    ) {
+    ): Payment {
         fun bad(detail: String): Nothing = throw PaylodApiException(
             redact.text(
                 "$what returned a status body this SDK cannot trust ($detail). The payment state is " +
@@ -134,7 +148,7 @@ internal object PaymentValidators {
 
         val wireStatus = p["status"]
         if (wireStatus !is String) bad("status is missing or is not a string")
-        PaymentStatus.parseWire(wireStatus)
+        val status = PaymentStatus.parseWire(wireStatus)
             ?: bad("status \"$wireStatus\" is not one of pending/success/failed")
 
         // `mpesaReceipt` is THE proof of settlement. A non-string, or a blank string pretending to
@@ -155,5 +169,26 @@ internal object PaymentValidators {
 
         val resultDesc = p["resultDesc"]
         if (resultDesc != null && resultDesc !is String) bad("resultDesc is present but is not a string")
+
+        // Built HERE, from the values that were just vetted, and handed back. The caller does not get
+        // a second look at the map, so it cannot reach a different conclusion from it.
+        return Payment(
+            id = id as String,
+            status = status,
+            mpesaReceipt = receipt as String?,
+            resultCode = normalizeResultCode(resultCode),
+            resultDesc = resultDesc as String?,
+        )
+    }
+
+    /**
+     * The wire `resultCode` as a string. JSON numbers arrive as `Long`/`Double`, and a whole `Double`
+     * must render as `"1032"` rather than `"1032.0"` — the catalog is keyed on the former, and the
+     * latter would classify as an unknown code and silently change the verdict.
+     */
+    private fun normalizeResultCode(v: Any?): String? = when (v) {
+        null -> null
+        is Double -> if (v == Math.floor(v)) v.toLong().toString() else v.toString()
+        else -> v.toString()
     }
 }

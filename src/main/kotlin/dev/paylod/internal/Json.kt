@@ -109,8 +109,25 @@ internal object Json {
 
     class JsonParseException(message: String) : RuntimeException(message)
 
+    /**
+     * The deepest document this reader will descend into.
+     *
+     * This is a recursive-descent parser, so nesting depth IS stack depth: `[[[[[…` a few tens of
+     * thousands deep is a `StackOverflowError` thrown from inside `parseValue`. An `Error` is not a
+     * [JsonParseException] and not a `PaylodException`, so it escaped every `catch` that classifies
+     * a bad body or attaches an idempotency key — a body the SDK could not read became a stack
+     * overflow in the caller's request handler instead of a rejected response.
+     *
+     * The transport refuses an over-deep body before this parser is ever entered, but this limit is
+     * enforced here as well and independently, because [Webhooks] parses caller-supplied bytes that
+     * never pass through a transport at all. A guard with one implementation is a guard with one
+     * point of failure.
+     */
+    const val MAX_DEPTH = 64
+
     private class Parser(private val src: String) {
         private var pos = 0
+        private var depth = 0
 
         fun parseTopLevel(): Any? {
             skipWhitespace()
@@ -135,12 +152,28 @@ internal object Json {
             }
         }
 
+        /**
+         * Enter one nesting level, refusing BEFORE the recursive call rather than after it. Checking
+         * on the way out would be checking from a stack frame that may not exist.
+         */
+        private fun enter() {
+            depth++
+            if (depth > MAX_DEPTH) {
+                fail(
+                    "JSON nested deeper than $MAX_DEPTH levels — refusing to recurse through it, " +
+                        "because doing so would overflow the stack rather than return an error",
+                )
+            }
+        }
+
         private fun parseObjectValue(): Map<String, Any?> {
+            enter()
             expect('{')
             val out = LinkedHashMap<String, Any?>()
             skipWhitespace()
             if (peek() == '}') {
                 pos++
+                depth--
                 return out
             }
             while (true) {
@@ -167,18 +200,23 @@ internal object Json {
                 skipWhitespace()
                 when (val c = next()) {
                     ',' -> continue
-                    '}' -> return out
+                    '}' -> {
+                        depth--
+                        return out
+                    }
                     else -> fail("expected ',' or '}' but found '$c'")
                 }
             }
         }
 
         private fun parseArray(): List<Any?> {
+            enter()
             expect('[')
             val out = ArrayList<Any?>()
             skipWhitespace()
             if (peek() == ']') {
                 pos++
+                depth--
                 return out
             }
             while (true) {
@@ -186,7 +224,10 @@ internal object Json {
                 skipWhitespace()
                 when (val c = next()) {
                     ',' -> continue
-                    ']' -> return out
+                    ']' -> {
+                        depth--
+                        return out
+                    }
                     else -> fail("expected ',' or ']' but found '$c'")
                 }
             }

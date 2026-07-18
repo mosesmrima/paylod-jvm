@@ -48,7 +48,7 @@ class WebhookTest {
         // the event schema, which has its own tests rather than being covered by editing these
         // cross-repo-pinned literals. The fixed vector pins the CLOCK via `nowSec` and keeps a
         // NORMAL positive tolerance — replay protection is never disabled, not even here.
-        val body = Webhooks.verifySignature(
+        val body = Webhooks.verifySignatureAt(
             payload = goldenBody,
             signature = goldenHeader,
             secret = goldenSecret,
@@ -63,7 +63,7 @@ class WebhookTest {
         // evidences a settled payment, so the full parser refuses it. A signature proves who sent
         // the bytes, never that they mean what a handler would assume.
         assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(
+            Webhooks.parseAndVerifyAt(
                 goldenBody, goldenHeader, goldenSecret,
                 toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = goldenT,
             )
@@ -72,7 +72,7 @@ class WebhookTest {
 
     @Test
     fun `accepts a valid signature and returns the typed event`() {
-        val event = Webhooks.parseAndVerify(raw, Webhooks.sign(raw, secret, now), secret, nowSec = now)
+        val event = Webhooks.parseAndVerifyAt(raw, Webhooks.sign(raw, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         assertEquals(WebhookEventType.PAYMENT_SUCCESS, event.type)
         assertEquals("SFF6XYZ123", event.data.mpesaReceipt)
         assertEquals(PaymentStatus.SUCCESS, event.data.status)
@@ -83,7 +83,7 @@ class WebhookTest {
         val header = Webhooks.sign(raw, secret, now)
         val tampered = raw.replace("\"amount\":100", "\"amount\":1")
         val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(tampered, header, secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(tampered, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.NO_MATCH, err.reason)
     }
@@ -92,7 +92,7 @@ class WebhookTest {
     fun `rejects a signature made with the wrong secret`() {
         val header = Webhooks.sign(raw, "whsec_attacker", now)
         val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, header, secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.NO_MATCH, err.reason)
     }
@@ -101,7 +101,7 @@ class WebhookTest {
     fun `rejects a STALE timestamp outside the tolerance (replay)`() {
         val header = Webhooks.sign(raw, secret, now)
         val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, header, secret, nowSec = now + 301)
+            Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now + 301)
         }
         assertEquals(SignatureFailureReason.STALE_TIMESTAMP, err.reason)
     }
@@ -110,14 +110,14 @@ class WebhookTest {
     fun `rejects a FUTURE-dated timestamp too`() {
         val header = Webhooks.sign(raw, secret, now + 3_600)
         assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, header, secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
     }
 
     @Test
     fun `accepts a timestamp just inside the tolerance`() {
         val header = Webhooks.sign(raw, secret, now)
-        val event = Webhooks.parseAndVerify(raw, header, secret, nowSec = now + 299)
+        val event = Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now + 299)
         assertEquals("pay_123", event.data.paymentId)
     }
 
@@ -146,7 +146,7 @@ class WebhookTest {
     fun `rejects a correctly-signed body that is not a paylod event`() {
         val body = """{"hello":"world"}"""
         val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(body, Webhooks.sign(body, secret, now), secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(body, Webhooks.sign(body, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.INVALID_PAYLOAD, err.reason)
     }
@@ -165,7 +165,7 @@ class WebhookTest {
     fun `verifies an ancient fixture by pinning the clock with nowSec and a NORMAL tolerance`() {
         val header = Webhooks.sign(raw, secret, 1) // ancient
         // The sanctioned way to verify a pinned fixture: keep replay protection on, move the clock.
-        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 300, nowSec = 1)
+        val event = Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = 300, nowSec = 1)
         assertEquals("pay_123", event.data.paymentId)
     }
 
@@ -186,7 +186,7 @@ class WebhookTest {
         assertEquals(
             SignatureFailureReason.INSECURE_TOLERANCE,
             assertThrows(PaylodSignatureVerificationException::class.java) {
-                Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0, nowSec = now)
+                Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = 0, nowSec = now)
             }.reason,
         )
     }
@@ -200,11 +200,11 @@ class WebhookTest {
         assertEquals(
             SignatureFailureReason.INSECURE_TOLERANCE,
             assertThrows(PaylodSignatureVerificationException::class.java) {
-                Webhooks.parseAndVerify(raw, header, secret, toleranceSec = -5, nowSec = now)
+                Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = -5, nowSec = now)
             }.reason,
         )
         // The boolean convenience must agree — no silent `true`.
-        assertFalse(Webhooks.verify(raw, header, secret, toleranceSec = -5, nowSec = now))
+        assertFalse(Webhooks.verifyAt(raw, header, secret, toleranceSec = -5, nowSec = now))
     }
 
     @Test
@@ -213,7 +213,7 @@ class WebhookTest {
         assertEquals(
             SignatureFailureReason.INSECURE_TOLERANCE,
             assertThrows(PaylodSignatureVerificationException::class.java) {
-                Webhooks.parseAndVerify(raw, header, secret, nowSec = -1)
+                Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = -1)
             }.reason,
         )
     }
@@ -227,7 +227,7 @@ class WebhookTest {
         for (bad in listOf("1e3", "+1000", "-1000", "0x3e8", "1_000", "1000.0")) {
             val header = "t=$bad,v1=${"0".repeat(64)}"
             val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-                Webhooks.parseAndVerify(raw, header, secret, nowSec = now)
+                Webhooks.parseAndVerifyAt(raw, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
             }
             assertEquals(SignatureFailureReason.MALFORMED_SIGNATURE, err.reason, "accepted t=$bad")
         }
@@ -240,10 +240,10 @@ class WebhookTest {
         // A second, forged pair appended — last-value-wins must NOT accept it.
         val combined = "t=$now,v1=$v1,t=9999999999,v1=$v1"
         val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, combined, secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(raw, combined, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.MALFORMED_SIGNATURE, err.reason)
-        assertFalse(Webhooks.verify(raw, combined, secret, nowSec = now))
+        assertFalse(Webhooks.verifyAt(raw, combined, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now))
     }
 
     @Test
@@ -252,12 +252,12 @@ class WebhookTest {
         val v1 = header.substringAfter("v1=")
         // Too short.
         assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, "t=$now,v1=deadbeef", secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(raw, "t=$now,v1=deadbeef", secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         // Upper-case hex is not the lowercase digest we emit.
         val upper = "t=$now,v1=${v1.uppercase()}"
         val err = assertThrows(PaylodSignatureVerificationException::class.java) {
-            Webhooks.parseAndVerify(raw, upper, secret, nowSec = now)
+            Webhooks.parseAndVerifyAt(raw, upper, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         }
         assertEquals(SignatureFailureReason.MALFORMED_SIGNATURE, err.reason)
     }
@@ -265,7 +265,7 @@ class WebhookTest {
     @Test
     fun `verifies a ByteArray payload identically to a string`() {
         val header = Webhooks.sign(raw, secret, now)
-        val event = Webhooks.parseAndVerify(raw.toByteArray(Charsets.UTF_8), header, secret, nowSec = now)
+        val event = Webhooks.parseAndVerifyAt(raw.toByteArray(Charsets.UTF_8), header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         assertEquals("pay_123", event.data.paymentId)
     }
 
@@ -274,7 +274,7 @@ class WebhookTest {
         // Signed over the compact bytes; verify a spaced variant.
         val header = Webhooks.sign(raw, secret, now)
         val spaced = raw.replace(",", ", ")
-        assertFalse(Webhooks.verify(spaced, header, secret, nowSec = now))
+        assertFalse(Webhooks.verifyAt(spaced, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now))
     }
 
     @Test
@@ -285,7 +285,7 @@ class WebhookTest {
         val body =
             """{"type":"payment.failed","created":1700000000,"data":{"paymentId":"p","decoded":{"category":"bogus","retryable":false}}}"""
         val header = Webhooks.sign(body, secret, now)
-        assertFalse(Webhooks.verify(body, header, secret, nowSec = now))
+        assertFalse(Webhooks.verifyAt(body, header, secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now))
     }
 
     @Test
@@ -294,7 +294,7 @@ class WebhookTest {
         val decoded = paylod.decodeError(1037)
         val failedBody =
             """{"type":"payment.failed","created":1700000000,"data":{"paymentId":"pay_123","status":"failed","amount":100,"resultCode":1037,"resultDesc":"DS timeout","decoded":{"code":"${decoded.code}","title":"${decoded.title}","cause":"","fix":"","category":"customer","retryable":true,"customerMessage":"${decoded.customerMessage}"}}}"""
-        val event = Webhooks.parseAndVerify(failedBody, Webhooks.sign(failedBody, secret, now), secret, nowSec = now)
+        val event = Webhooks.parseAndVerifyAt(failedBody, Webhooks.sign(failedBody, secret, now), secret, toleranceSec = Webhooks.DEFAULT_TOLERANCE_SEC, nowSec = now)
         assertEquals(WebhookEventType.PAYMENT_FAILED, event.type)
         assertEquals(
             "The M-Pesa prompt expired before it was answered. Check your phone is on, then try again " +

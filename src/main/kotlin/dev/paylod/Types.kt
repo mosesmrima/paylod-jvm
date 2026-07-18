@@ -18,12 +18,19 @@ enum class PaymentStatus {
             else -> null
         }
 
-        /**
-         * Lenient: unknown reads as PENDING. Only safe AFTER [parseWire] has already vetted the body —
-         * "keep polling" is the conservative default, but on its own it would silently mask a status
-         * the SDK does not understand.
-         */
-        fun fromWire(value: String?): PaymentStatus = parseWire(value) ?: PENDING
+        // THERE IS DELIBERATELY NO LENIENT PARSE HERE.
+        //
+        // A `fromWire(value) = parseWire(value) ?: PENDING` used to sit alongside the strict one,
+        // documented as "only safe AFTER parseWire has vetted the body". It was not used only there.
+        // The money path validated a status body with `parseWire` and then built the `Payment` the
+        // verdict was computed from with `fromWire`, so the permissive read is the one that reached
+        // the semantic model — and the guard's presence made the leniency look deliberate and safe.
+        //
+        // Deleting it, rather than leaving it unused, is the actual fix. A permissive fallback that
+        // exists is a permissive fallback some future caller reaches for, and the comment saying
+        // when it is safe is not a mechanism. Typed records now come out of the validator that
+        // vetted them ([PaymentValidators.assertPaymentBody]); an unrecognised status has exactly
+        // one outcome, which is rejection.
     }
 }
 

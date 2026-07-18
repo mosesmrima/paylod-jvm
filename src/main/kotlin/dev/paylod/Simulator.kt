@@ -142,18 +142,21 @@ class Simulator internal constructor(
         // renderer, so a body describing a DIFFERENT payment, or claiming success with no evidence,
         // was returned as this payment's outcome. Every dispatch surface runs the same validators,
         // or the guarantee is not a guarantee.
+        // The validator BUILDS the record. This used to validate the map and then construct a
+        // `Payment` from the map a second time, with the lenient `PaymentStatus.fromWire` — so the
+        // strict check and the record the outcome was actually rendered from were two different
+        // readings of the same bytes, and money used the lenient one. There is now one reading.
+        var validated: Payment? = null
         val ack = requester.request("POST", "/simulate/outcome", body, idempotencyKey) { map, status ->
-            PaymentValidators.assertPaymentBody(
+            validated = PaymentValidators.assertPaymentBody(
                 normalizeSettleAck(map), status, paymentId, "simulate.outcome()", redact,
             )
         }
 
-        val payment = Payment(
-            id = paymentId,
-            status = PaymentStatus.fromWire(ack["status"]?.toString()),
-            mpesaReceipt = ack["mpesaReceipt"]?.toString(),
-            resultCode = normalizeResultCode(ack["resultCode"]),
-            resultDesc = ack["resultDesc"]?.toString(),
+        val payment = validated ?: throw PaylodIndeterminateException(
+            "simulate.outcome() returned a response that was never validated — refusing to render " +
+                "an outcome from it.",
+            idempotencyKey,
         )
         val webhookQueued = ack["webhookQueued"] != false
         return SimulatedOutcome(Outcomes.of(payment), webhookQueued)
@@ -183,9 +186,7 @@ class Simulator internal constructor(
         return out
     }
 
-    private fun normalizeResultCode(v: Any?): String? = when (v) {
-        null -> null
-        is Double -> if (v == Math.floor(v)) v.toLong().toString() else v.toString()
-        else -> v.toString()
-    }
+    // `normalizeResultCode` used to live here too. It is gone along with the second reading of the
+    // ack that needed it — the validator normalizes the code as part of building the record it
+    // approved, so there is exactly one implementation of that rule on the money path.
 }
