@@ -318,14 +318,24 @@ class FifthRoundTest {
     @Test
     @Tag("nv-deadline-overflow")
     fun `a monotonic clock near Long MAX does not collapse the wait deadline`() {
-        // `startedAt + timeout` wraps NEGATIVE near the top of the Long range, and `monotonicMillis`
-        // is nanoTime-derived with an arbitrary origin, so it can sit anywhere. A negative deadline
-        // makes every poll "out of time": wait() returns instantly and reports a timeout on a
-        // payment it never once looked at.
+        // `monotonicMillis` is nanoTime-derived with an arbitrary origin, so it can sit anywhere in
+        // the Long range — including where `startedAt + timeout` wraps NEGATIVE.
+        //
+        // The wrap itself is harmless as long as every comparison is done by SUBTRACTION, which
+        // cancels it exactly. Comparing ABSOLUTE values is what breaks: `now + delay >= deadline`
+        // puts a huge positive against a huge negative, answers "out of time" on the first poll,
+        // and `wait()` gives up on a payment it has looked at exactly once.
+        //
+        // The clock is placed so that the wrong comparison and the right one DISAGREE. There are
+        // two steps: a pending read then a success. Correct behaviour polls both and settles;
+        // the absolute comparison breaks after the first and throws a timeout for a live charge.
         val transport = StubTransport(
-            listOf(Step(json = paymentJson(status = "success", resultCode = 0, mpesaReceipt = "SFF6XYZ123"))),
+            listOf(
+                Step(json = paymentJson(status = "pending")),
+                Step(json = paymentJson(status = "success", resultCode = 0, mpesaReceipt = "SFF6XYZ123")),
+            ),
         )
-        val clock = FakeTimeSource(now = 0, mono = Long.MAX_VALUE - 100)
+        val clock = FakeTimeSource(now = 0, mono = Long.MAX_VALUE - 3_000)
         val paylod = Paylod(
             "mp_test_abc123",
             PaylodOptions.of(transport = transport, allowCustomTransport = true),
@@ -334,7 +344,133 @@ class FifthRoundTest {
         )
         val outcome = paylod.wait("pay_123", WaitOptions.of(timeoutMs = 5_000))
         assertEquals(OutcomeStatus.SUCCEEDED, outcome.status)
-        assertEquals(1, transport.count, "the payment must actually be read")
+        assertEquals(
+            2, transport.count,
+            "the wait must poll past the first read — a wrapped deadline made it give up after one",
+        )
+    }
+
+    // ══ Result code ZERO is recognised exactly, never numerically ═════════════════════════════
+
+    /**
+     * Values that are numerically zero but are NOT the schema-approved success code. Each one is
+     * accepted by some standard JVM parse — `Integer.parseInt("+0")`, `Integer.decode("0x0")`,
+     * `Double.parseDouble("0e999")` — and the old rule was `raw.toDoubleOrNull() == 0.0`.
+     */
+    private val zeroImpostors = listOf("0e999", "+0", "00", "0.0", "-0", "0x0", " 0", "0.00", "-0.0")
+
+    @Test
+    @Tag("nv-zero-strict")
+    fun `only the integer 0 and the canonical string 0 count as success evidence`() {
+        // The canonical forms ARE success.
+        assertTrue(DarajaCatalog.isCanonicalSuccessCode(0))
+        assertTrue(DarajaCatalog.isCanonicalSuccessCode(0L))
+        assertTrue(DarajaCatalog.isCanonicalSuccessCode("0"))
+        assertEquals(StkOutcome.SUCCESS, DarajaCatalog.classifyStkResult(0))
+        assertEquals(StkOutcome.SUCCESS, DarajaCatalog.classifyStkResult("0"))
+
+        // A float zero is NOT the integer zero, however it is spelled.
+        assertFalse(DarajaCatalog.isCanonicalSuccessCode(0.0))
+        assertFalse(DarajaCatalog.isCanonicalSuccessCode(-0.0))
+
+        for (impostor in zeroImpostors) {
+            assertFalse(
+                DarajaCatalog.isCanonicalSuccessCode(impostor),
+                "\"$impostor\" must not be the canonical success code",
+            )
+            assertEquals(
+                StkOutcome.PENDING,
+                DarajaCatalog.classifyStkResult(impostor),
+                "\"$impostor\" must classify as ambiguous, never SUCCESS",
+            )
+        }
+    }
+
+    @Test
+    @Tag("nv-zero-evidence")
+    fun `a success claim backed only by a zero impostor is INDETERMINATE, never PAID`() {
+        // This is where it costs money. On a `success` claim, SUCCESS evidence is the difference
+        // between PAID (ship the goods) and INDETERMINATE (wait for the webhook). A crafted,
+        // re-encoded or mangled result code must not be able to manufacture that evidence.
+        for (impostor in zeroImpostors) {
+            val payment = Payment("pay_1", PaymentStatus.SUCCESS, null, impostor, null)
+            val judgement = PaymentSemantics.judge(payment)
+            assertEquals(
+                PaymentVerdict.INDETERMINATE, judgement.verdict,
+                "result code \"$impostor\" must not prove a payment settled",
+            )
+            val outcome = Outcomes.of(payment)
+            assertFalse(outcome.paid, "\"$impostor\" must never render as paid")
+            assertFalse(outcome.retryable, "an indeterminate payment is never retryable")
+        }
+
+        // The canonical code still proves it, so this is a tightening and not a blanket refusal.
+        val real = Payment("pay_1", PaymentStatus.SUCCESS, null, "0", null)
+        assertEquals(PaymentVerdict.PAID, PaymentSemantics.judge(real).verdict)
+        assertTrue(Outcomes.of(real).paid)
+    }
+
+    @Test
+    @Tag("nv-zero-nolaunder")
+    fun `a JSON float zero is not laundered into the canonical success code`() {
+        // The whole-Double-to-integer collapse is a catalog-lookup convenience. Applied to zero it
+        // would manufacture "0" out of a JSON `0.0`, defeating the check above one layer earlier.
+        //
+        // A RAW body is required here: the SDK's own writer emits a whole `Double` without its
+        // fraction, so `Json.write(0.0)` is the text `0` and a float zero cannot survive a
+        // round-trip through the stub. What is under test is what happens when the SERVER puts
+        // `0.0` on the wire, which only a raw body can express.
+        val (paylod, _) = testClient(
+            listOf(
+                Step(
+                    raw = """{"id":"pay_123","status":"success","mpesaReceipt":null,""" +
+                        """"resultCode":0.0,"resultDesc":null}""",
+                ),
+            ),
+        )
+        val payment = paylod.status("pay_123")
+        assertFalse(payment.resultCode == "0", "a float zero must not become the canonical \"0\"")
+        assertFalse(Outcomes.of(payment).paid, "a float zero is not proof a payment settled")
+
+        // A genuine integer zero still is.
+        val (ok, _) = testClient(
+            listOf(
+                Step(
+                    raw = """{"id":"pay_123","status":"success","mpesaReceipt":null,""" +
+                        """"resultCode":0,"resultDesc":null}""",
+                ),
+            ),
+        )
+        assertTrue(Outcomes.of(ok.status("pay_123")).paid)
+    }
+
+    @Test
+    @Tag("nv-zero-webhook")
+    fun `a signed payment success carrying a zero impostor is refused`() {
+        // The webhook path runs the same semantic model, so the same rule has to hold there — that
+        // is the point of having one model rather than two agreeing implementations.
+        for (impostor in listOf("\"0e999\"", "\"+0\"", "\"00\"", "\"-0\"", "0.0")) {
+            val body =
+                """{"type":"payment.success","created":$now,"data":{"paymentId":"pay_1",""" +
+                    """"status":"success","amount":100,"resultCode":$impostor}}"""
+            val err = assertThrows<PaylodSignatureVerificationException>(
+                "resultCode $impostor must not evidence a success",
+            ) {
+                Webhooks.parseAndVerifyAt(
+                    body, Webhooks.sign(body, secret, now), secret, Webhooks.DEFAULT_TOLERANCE_SEC, now,
+                )
+            }
+            assertEquals(SignatureFailureReason.INVALID_PAYLOAD, err.reason)
+        }
+
+        // The canonical integer zero is accepted.
+        val good =
+            """{"type":"payment.success","created":$now,"data":{"paymentId":"pay_1",""" +
+                """"status":"success","amount":100,"resultCode":0}}"""
+        val event = Webhooks.parseAndVerifyAt(
+            good, Webhooks.sign(good, secret, now), secret, Webhooks.DEFAULT_TOLERANCE_SEC, now,
+        )
+        assertEquals("pay_1", event.data.paymentId)
     }
 
     // ══ A cross-check: the money surface exposes no lenient status parse at all ════════════════

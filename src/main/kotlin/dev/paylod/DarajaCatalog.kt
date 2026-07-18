@@ -134,6 +134,47 @@ object DarajaCatalog {
         }
 
     /**
+     * Is this result code the SUCCESS code — exactly, not merely numerically?
+     *
+     * ── Why this is not `toDouble() == 0.0` ───────────────────────────────────────────────
+     * It used to be. `ResultCode = 0` is the single value that means "money moved", and it was
+     * recognised by parsing the code as a `Double` and comparing to zero. That accepts a whole
+     * family of values that are numerically zero but are NOT the schema-approved success code, and
+     * every one of them is a way to manufacture proof of payment out of a record that has none:
+     *
+     *   • `"0e999"`   — `Double.parseDouble` reads this as 0.0.
+     *   • `"+0"`      — a leading sign; `Integer.parseInt`/`parseDouble` both accept it.
+     *   • `"00"`      — leading zeros.
+     *   • `"0.0"`     — a float where an integer code is specified.
+     *   • `"-0"`      — negative zero, and `-0.0 == 0.0` is true.
+     *   • `"0x0"`     — `Integer.decode` reads this as 0.
+     *   • `" 0"`      — surrounded by whitespace.
+     *
+     * None of these is a code Daraja emits. Each is what a mangled, re-encoded, or crafted record
+     * looks like, and under the old rule each produced `SUCCESS` evidence — which, on a `success`
+     * claim, is the difference between `INDETERMINATE` and `PAID`. That is goods shipped for a
+     * payment that never settled.
+     *
+     * So success is recognised for exactly two representations: the INTEGER `0` (any integral JVM
+     * number type, which is what a JSON `0` parses to) and the canonical STRING `"0"`. A floating
+     * point value is deliberately excluded even when it equals zero — a JSON `0.0` is not the
+     * integer zero, and treating it as one is the same laundering this rule exists to stop.
+     *
+     * Everything else numerically-zero is not evidence of anything, so it classifies as PENDING
+     * (ambiguous) rather than SUCCESS or FAILED. On a `success` claim that yields `INDETERMINATE`,
+     * which is the honest answer: we cannot read the code, so we cannot confirm the payment.
+     */
+    @JvmStatic
+    fun isCanonicalSuccessCode(resultCode: Any?): Boolean = when (resultCode) {
+        // Integral JVM numbers. A JSON `0` parses to `Long` here, which is the ordinary wire case.
+        is Byte, is Short, is Int, is Long -> (resultCode as Number).toLong() == 0L
+        // The canonical string, byte for byte. Not trimmed, not parsed, not coerced.
+        is String -> resultCode == "0"
+        // Double/Float/BigDecimal and everything else: not the integer zero.
+        else -> false
+    }
+
+    /**
      * Classify a synchronous STK Query result. THE authoritative call — the decoder defers to this,
      * so a stale or wrong table entry can never resurrect the 4999 bug.
      */
@@ -148,9 +189,19 @@ object DarajaCatalog {
 
         if (pendingResultCodes.contains(raw)) return StkOutcome.PENDING
 
+        // SUCCESS is recognised from the ORIGINAL value, exactly. See [isCanonicalSuccessCode].
+        if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS
+
         val n = raw.toDoubleOrNull()
         if (raw.isNotEmpty() && n != null && n.isFinite()) {
-            if (n == 0.0) return StkOutcome.SUCCESS
+            if (n == 0.0) {
+                // Numerically zero but NOT the canonical success code — an impostor like "0e999",
+                // "+0", "00", "-0" or " 0". It is not proof of payment, and it is not a known
+                // failure code either, so it is ambiguous. Ambiguity is never force-failed and is
+                // certainly never reported as success: on a `success` claim this becomes
+                // INDETERMINATE, and the webhook or a later read settles it.
+                return StkOutcome.PENDING
+            }
             // A known-numeric, non-zero code is terminal — UNLESS the description says otherwise.
             return if (PENDING_DESC_RE.containsMatchIn(desc)) StkOutcome.PENDING else StkOutcome.FAILED
         }

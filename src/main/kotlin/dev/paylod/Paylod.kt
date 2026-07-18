@@ -466,13 +466,25 @@ class Paylod internal constructor(
         // Monotonic: the caller's timeout is a DURATION, and must not be lengthened or shortened by a
         // wall-clock adjustment landing mid-wait.
         val startedAt = time.monotonicMillis()
-        // OVERFLOW-SAFE. `monotonicMillis` has an arbitrary origin (it is `nanoTime`-derived), so it
-        // can sit anywhere in the `Long` range — including near the top, where `startedAt + timeout`
-        // wraps NEGATIVE. A negative deadline makes `remaining()` negative on the very first check,
-        // so every poll is "out of time": `wait()` returns instantly and `collectAndWait` reports a
-        // timeout on a payment it never once looked at. Saturating is the correct behaviour — a
-        // deadline that cannot be represented is, for practical purposes, infinitely far away.
-        val deadline = saturatingAdd(startedAt, timeout)
+        // `monotonicMillis` is nanoTime-derived, so its origin is arbitrary and it can sit anywhere
+        // in the `Long` range — including near the top, where this sum WRAPS NEGATIVE.
+        //
+        // That wrap is deliberately left alone, because it is harmless PROVIDED every comparison
+        // against this value is done by SUBTRACTION. Two's-complement subtraction cancels the wrap
+        // exactly: `(startedAt + timeout) - now` yields the true remaining milliseconds even when the
+        // sum itself overflowed. This is the standard `System.nanoTime()` deadline idiom, and it is
+        // why `remaining()` below has always been correct here.
+        //
+        // What is NOT safe is comparing the absolute values directly (`now + delay >= deadline`), and
+        // that is the bug this replaces — near the top of the range that comparison put a huge
+        // positive against a huge negative and answered "out of time" on the first poll, so `wait()`
+        // gave up on a payment it had looked at exactly once and `collectAndWait` reported a timeout
+        // for a live charge.
+        //
+        // Saturating the sum is NOT the fix and was tried first: it makes `deadline` Long.MAX_VALUE,
+        // but `now + delay` saturates to Long.MAX_VALUE too, so `>= deadline` becomes true and the
+        // loop breaks after one poll — the same bug, reached differently. Subtraction is the fix.
+        val deadline = startedAt + timeout
 
         var last: Payment? = null
         var attempt = 0
@@ -486,10 +498,13 @@ class Paylod internal constructor(
             options.onPoll?.onPoll(payment)
 
             val delay = pollDelay(attempt)
-            // Saturating here too: `now + delay` overflows for the same reason `startedAt + timeout`
-            // does, and a wrapped-negative sum compares as `< deadline`, so the loop would sleep and
-            // poll straight through the deadline it was given.
-            if (saturatingAdd(time.monotonicMillis(), delay) >= deadline) break
+            // BY SUBTRACTION, never by comparing absolute values. `remaining()` is the same modular
+            // arithmetic the rest of the deadline handling uses, and it is exact even when
+            // `startedAt + timeout` overflowed. Asking "is there room for another delay?" is the
+            // same question as "is the remaining budget bigger than the delay?", and only the
+            // subtraction form survives the wrap.
+            val left = remaining(deadline) ?: break
+            if (left <= delay) break
             time.sleep(delay)
             attempt++
         }
@@ -667,10 +682,6 @@ class Paylod internal constructor(
 
         /** Retries are for transient blips. Beyond ten, the answer is not going to change. */
         const val MAX_RETRIES_LIMIT = 10
-
-        /** `a + b`, saturating at [Long.MAX_VALUE] instead of wrapping negative. */
-        fun saturatingAdd(a: Long, b: Long): Long =
-            if (b > 0 && a > Long.MAX_VALUE - b) Long.MAX_VALUE else a + b
 
         /**
          * A `409` retried only when it is explicitly the "same key still running" case. Every other

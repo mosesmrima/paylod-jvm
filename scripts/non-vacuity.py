@@ -417,10 +417,39 @@ CASES = [
     ),
     dict(
         id="R5-deadline", tag="nv-deadline-overflow",
-        what="the wait deadline is computed with wrapping addition",
+        what="the poll deadline is compared by ABSOLUTE value instead of by subtraction",
         edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
-                "val deadline = saturatingAdd(startedAt, timeout)",
-                "val deadline = startedAt + timeout")],
+                "            val left = remaining(deadline) ?: break\n"
+                "            if (left <= delay) break",
+                "            if (time.monotonicMillis() + delay >= deadline) break")],
+    ),
+    dict(
+        id="R5-zero-strict", tag="nv-zero-strict",
+        what="result code zero is recognised numerically again (toDouble() == 0.0)",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS",
+                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS")],
+    ),
+    dict(
+        id="R5-zero-evidence", tag="nv-zero-evidence",
+        what="the same revert, seen as a zero impostor manufacturing PAID evidence",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS",
+                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS")],
+    ),
+    dict(
+        id="R5-zero-webhook", tag="nv-zero-webhook",
+        what="the same revert, on the webhook delivery path",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS",
+                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS")],
+    ),
+    dict(
+        id="R5-zero-launder", tag="nv-zero-nolaunder",
+        what="a JSON float zero is collapsed into the canonical success code again",
+        edits=[("src/main/kotlin/dev/paylod/Validators.kt",
+                "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()",
+                "            if (v == Math.floor(v)) v.toLong().toString() else v.toString()")],
     ),
 ]
 

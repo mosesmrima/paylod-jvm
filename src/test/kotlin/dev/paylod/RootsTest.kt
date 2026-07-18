@@ -128,18 +128,23 @@ class RootsTest {
     @Test
     @Tag("nv-r1-noretry")
     fun `ROOT 1 - a detected credential compromise is TERMINAL and is never retried`() {
-        // The end-to-end version of the above, through the real client and its real retry loop.
-        // `maxRetries = 3` means a `PaylodConnectionException` here would produce FOUR dispatches —
-        // four more chances for the attacker's host to receive the bearer token after the SDK had
-        // already concluded it was compromised. Exactly ONE call is the fix.
-        val transport = StubTransport(
-            List(4) { Step(status = 200, json = ACK) },
-        )
+        // The end-to-end version of the above, through the real client and its real retry loop, on
+        // the CHARGE path. `maxRetries = 3` means a `PaylodConnectionException` here would produce
+        // FOUR dispatches — four more chances for the attacker's host to receive the bearer token
+        // after the SDK had already concluded it was compromised. Exactly ONE is the fix.
+        //
+        // The count is taken from the transport that is actually wired in. Asserting on a stub that
+        // was built but never passed to the client would make this assertion inert, which is the
+        // failure mode the non-vacuity harness exists to catch.
+        var dispatches = 0
         val paylod = Paylod(
             "mp_test_abc123",
             PaylodOptions.of(
                 maxRetries = 3,
-                transport = { _ -> HttpResponseSpec(200, emptyMap(), Json.write(ACK), redirected = true) },
+                transport = { _ ->
+                    dispatches++
+                    HttpResponseSpec(200, emptyMap(), Json.write(ACK), redirected = true)
+                },
                 allowCustomTransport = true,
             ),
             FakeTimeSource(),
@@ -153,7 +158,10 @@ class RootsTest {
         // The key still rides along, because the request WAS dispatched and the money state is
         // unknown — the caller must read the payment, not mint a fresh key.
         assertEquals("k-compromise", err.idempotencyKey)
-        assertEquals(0, transport.count, "the stub must never be reached a second time")
+        assertEquals(
+            1, dispatches,
+            "a credential believed compromised must be sent EXACTLY once, never replayed",
+        )
     }
 
     @Test

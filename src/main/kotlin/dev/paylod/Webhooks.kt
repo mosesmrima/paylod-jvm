@@ -560,9 +560,16 @@ object Webhooks {
         else -> null
     }
 
+    /**
+     * As `PaymentValidators.normalizeResultCode`, including the zero exception: a whole `Double`
+     * collapses to its integer form for catalog lookup, but a float ZERO keeps its own
+     * representation so it cannot be laundered into the canonical success code `"0"`. See
+     * [DarajaCatalog.isCanonicalSuccessCode].
+     */
     private fun normalizeCode(v: Any?): String? = when (v) {
         null -> null
-        is Double -> if (v == Math.floor(v)) v.toLong().toString() else v.toString()
+        is Double ->
+            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()
         else -> v.toString()
     }
 

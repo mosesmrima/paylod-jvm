@@ -185,10 +185,19 @@ internal object PaymentValidators {
      * The wire `resultCode` as a string. JSON numbers arrive as `Long`/`Double`, and a whole `Double`
      * must render as `"1032"` rather than `"1032.0"` — the catalog is keyed on the former, and the
      * latter would classify as an unknown code and silently change the verdict.
+     *
+     * ZERO IS THE EXCEPTION, and deliberately so. Collapsing a whole `Double` to its integer form is
+     * a convenience for CATALOG LOOKUP, where it is harmless: it only decides which entry describes
+     * a failure. Applied to zero it stops being a lookup convenience and becomes evidence
+     * laundering — it manufactures the canonical success code `"0"` out of a JSON `0.0`, which is
+     * not the schema-approved success value (see [DarajaCatalog.isCanonicalSuccessCode]). A float
+     * zero therefore keeps its own representation, fails the canonical-zero test downstream, and is
+     * classified as ambiguous rather than as proof that money moved.
      */
     private fun normalizeResultCode(v: Any?): String? = when (v) {
         null -> null
-        is Double -> if (v == Math.floor(v)) v.toLong().toString() else v.toString()
+        is Double ->
+            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()
         else -> v.toString()
     }
 }
