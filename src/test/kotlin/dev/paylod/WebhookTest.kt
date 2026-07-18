@@ -42,18 +42,21 @@ class WebhookTest {
 
         assertEquals(goldenHeader, Webhooks.sign(goldenBody, goldenSecret, goldenT))
 
-        // The verifier accepts its own signer's golden output (freshness disabled — t is fixed).
+        // The verifier accepts its own signer's golden output. The fixed vector pins the clock via
+        // `nowSec` (freshness is deterministic), the sanctioned way to verify an ancient fixture — a
+        // non-positive `toleranceSec` on its own is now refused in production.
         val event = Webhooks.parseAndVerify(
             payload = goldenBody,
             signature = goldenHeader,
             secret = goldenSecret,
             toleranceSec = 0,
+            nowSec = goldenT,
         )
         assertEquals("pay_golden", event.data.paymentId)
 
         // And the client's boolean convenience agrees.
         val (paylod, _) = testClient(emptyList())
-        assertTrue(paylod.verifyWebhook(goldenBody, goldenHeader, goldenSecret, toleranceSec = 0))
+        assertTrue(paylod.verifyWebhook(goldenBody, goldenHeader, goldenSecret, toleranceSec = 0, nowSec = goldenT))
     }
 
     @Test
@@ -148,10 +151,59 @@ class WebhookTest {
     }
 
     @Test
-    fun `can disable the freshness check with toleranceSec 0 (historical fixtures)`() {
+    fun `verifies an ancient fixture by pinning the clock with nowSec (toleranceSec 0 + fixed clock)`() {
         val header = Webhooks.sign(raw, secret, 1) // ancient
-        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0)
+        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0, nowSec = 1)
         assertEquals("pay_123", event.data.paymentId)
+    }
+
+    @Test
+    fun `REFUSES toleranceSec 0 in production (no injected clock) — replay protection stays on`() {
+        val header = Webhooks.sign(raw, secret, now)
+        val err = assertThrows(PaylodSignatureVerificationException::class.java) {
+            Webhooks.parseAndVerify(raw, header, secret, toleranceSec = 0)
+        }
+        assertEquals(SignatureFailureReason.INSECURE_TOLERANCE, err.reason)
+    }
+
+    @Test
+    fun `REFUSES a negative tolerance too, unless a fixed nowSec is injected`() {
+        val header = Webhooks.sign(raw, secret, now)
+        assertThrows(PaylodSignatureVerificationException::class.java) {
+            Webhooks.parseAndVerify(raw, header, secret, toleranceSec = -5)
+        }
+        // …but a fixed clock makes it a legitimate deterministic fixture again.
+        val event = Webhooks.parseAndVerify(raw, header, secret, toleranceSec = -5, nowSec = now)
+        assertEquals("pay_123", event.data.paymentId)
+    }
+
+    @Test
+    fun `rejects duplicate t or v1 (comma-combined multi-value header)`() {
+        val header = Webhooks.sign(raw, secret, now)
+        val v1 = header.substringAfter("v1=")
+        // A second, forged pair appended — last-value-wins must NOT accept it.
+        val combined = "t=$now,v1=$v1,t=9999999999,v1=$v1"
+        val err = assertThrows(PaylodSignatureVerificationException::class.java) {
+            Webhooks.parseAndVerify(raw, combined, secret, nowSec = now)
+        }
+        assertEquals(SignatureFailureReason.MALFORMED_SIGNATURE, err.reason)
+        assertFalse(Webhooks.verify(raw, combined, secret, nowSec = now))
+    }
+
+    @Test
+    fun `rejects a v1 that is not exactly 64 lowercase hex chars`() {
+        val header = Webhooks.sign(raw, secret, now)
+        val v1 = header.substringAfter("v1=")
+        // Too short.
+        assertThrows(PaylodSignatureVerificationException::class.java) {
+            Webhooks.parseAndVerify(raw, "t=$now,v1=deadbeef", secret, nowSec = now)
+        }
+        // Upper-case hex is not the lowercase digest we emit.
+        val upper = "t=$now,v1=${v1.uppercase()}"
+        val err = assertThrows(PaylodSignatureVerificationException::class.java) {
+            Webhooks.parseAndVerify(raw, upper, secret, nowSec = now)
+        }
+        assertEquals(SignatureFailureReason.MALFORMED_SIGNATURE, err.reason)
     }
 
     @Test
@@ -167,6 +219,17 @@ class WebhookTest {
         val header = Webhooks.sign(raw, secret, now)
         val spaced = raw.replace(",", ", ")
         assertFalse(Webhooks.verify(spaced, header, secret, nowSec = now))
+    }
+
+    @Test
+    fun `verify returns false (not throws) for a correctly-signed body with a schema type failure`() {
+        // Correctly signed, valid JSON, type+data present — but decoded.category is not a known enum
+        // value, which would blow up parsing with an IllegalArgumentException. The boolean convenience
+        // must convert that to a plain verification failure, uniformly with a bad signature.
+        val body =
+            """{"type":"payment.failed","created":1700000000,"data":{"paymentId":"p","decoded":{"category":"bogus","retryable":false}}}"""
+        val header = Webhooks.sign(body, secret, now)
+        assertFalse(Webhooks.verify(body, header, secret, nowSec = now))
     }
 
     @Test

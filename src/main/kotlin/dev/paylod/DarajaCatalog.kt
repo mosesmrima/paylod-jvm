@@ -1,6 +1,7 @@
 package dev.paylod
 
 import dev.paylod.internal.Json
+import java.util.Collections
 
 /** WHO/what is at fault — lets a merchant tell their config apart from the customer or M-Pesa. */
 enum class DarajaCategory {
@@ -96,17 +97,21 @@ data class CatalogEntry(
  */
 object DarajaCatalog {
 
-    /** Every catalog entry, in file order. */
+    /**
+     * Every catalog entry, in file order. Exposed as an UNMODIFIABLE list — a Java caller sees the
+     * `List` interface and could otherwise cast to a mutable backing type and corrupt the table.
+     */
     @JvmStatic
-    val allEntries: List<CatalogEntry> = loadEntries()
+    val allEntries: List<CatalogEntry> = Collections.unmodifiableList(loadEntries())
 
     /**
      * Codes that mean "still processing, poll again", derived FROM the table so the classifier and
-     * the decoder can never disagree. Compared as normalized strings.
+     * the decoder can never disagree. Compared as normalized strings. UNMODIFIABLE (see [allEntries]).
      */
     @JvmStatic
-    val pendingResultCodes: Set<String> =
-        allEntries.filter { it.category == DarajaCategory.PENDING }.map { it.code }.toSet()
+    val pendingResultCodes: Set<String> = Collections.unmodifiableSet(
+        allEntries.filter { it.category == DarajaCategory.PENDING }.map { it.code }.toMutableSet(),
+    )
 
     // `ResultDesc` phrasings that mean "still processing", used as a safety net for unrecognised codes.
     private val PENDING_DESC_RE = Regex(
@@ -117,7 +122,7 @@ object DarajaCatalog {
     // `500.001.1001` is overloaded: under the SAME code Daraja also returns hard, terminal config
     // errors. A 500.* whose message matches one of these is NOT treated as pending.
     private val TERMINAL_500_MESSAGE_RE = Regex(
-        "\\b(?:wrong\\s+credentials|merchant\\s+does\\s+not\\s+exist|invalid\\s+access\\s+token|unable\\s+to\\s+lock\\s+subscriber)\\b",
+        "\\b(?:wrong\\s+credentials|merchant\\s+does\\s+not\\s+exist|invalid\\s+access\\s+token|unable\\s+to\\s+lock\\s+subscriber|insufficient\\s+funds?)\\b",
         RegexOption.IGNORE_CASE,
     )
 
@@ -210,10 +215,34 @@ object DarajaCatalog {
         )
     }
 
+    private fun decodedFrom(code: String, entry: CatalogEntry): DecodedError = DecodedError(
+        code = code,
+        title = entry.title,
+        cause = entry.cause,
+        fix = entry.fix,
+        category = entry.category,
+        retryable = entry.retryable,
+        customerMessage = entry.customerMessage,
+    )
+
     /**
-     * Decode a Daraja ResultCode into a normalized, human-readable error. Defers to
-     * [classifyStkResult] FIRST, so pending/in-flight codes (4999, 500.001.1001) can never decode as
-     * a failure and can never be advertised as retryable.
+     * Decode a Daraja ResultCode into a normalized, human-readable error.
+     *
+     * ── Family-awareness ──
+     * The STK "still processing -> pending" semantics (and the blank/unknown-numeric -> pending
+     * fallback) apply ONLY to the STK result surface. A dotted `api_error` code (e.g. 400.002.02,
+     * 500.001.1001) or an alphanumeric `b2c_c2b_result` code (e.g. C2B00011) is a TERMINAL error;
+     * routing it through [classifyStkResult] used to misclassify it as `pending` and decode it as
+     * "payment still in progress", which is wrong. So we select by family:
+     *
+     *   • STK family: defer to [classifyStkResult], so 4999 / 500.001.1001 can never decode as a
+     *     failure and can never be advertised as retryable.
+     *   • Non-STK families: decode straight from the catalog by family — no pending semantics. This
+     *     also disambiguates the OVERLOADED 500.001.1001, whose `api_error` entry is the terminal
+     *     "merchant does not exist / insufficient funds" server error.
+     *
+     * If the caller asks for the (default) STK family but the code exists ONLY in non-STK families,
+     * we decode it by its real family rather than letting the STK unknown->pending rule mislabel it.
      *
      * @param resultCode the Daraja ResultCode (number or string). `null` is treated as unknown.
      * @param rawDesc the raw ResultDesc — corroborating signal, and the `cause` when the code is unknown.
@@ -231,23 +260,27 @@ object DarajaCatalog {
         // An ABSENT code is not evidence of an in-flight payment — it is simply unknown.
         if (code.isEmpty()) return failedFallback("unknown", rawDesc)
 
-        val outcome = classifyStkResult(code, rawDesc)
-        val entry = pickEntry(code, family, outcome)
+        val matches = allEntries.filter { it.code == code }
+        val hasStk = matches.any { it.family == DarajaFamily.STK_RESULT }
 
-        if (entry != null) {
-            return DecodedError(
-                code = code,
-                title = entry.title,
-                cause = entry.cause,
-                fix = entry.fix,
-                category = entry.category,
-                retryable = entry.retryable,
-                customerMessage = entry.customerMessage,
-            )
+        // If STK was requested but the code is not an STK code, decode it by the family it DOES have.
+        val effectiveFamily: DarajaFamily =
+            if (family == DarajaFamily.STK_RESULT && !hasStk && matches.isNotEmpty()) matches.first().family
+            else family
+
+        if (effectiveFamily == DarajaFamily.STK_RESULT) {
+            val outcome = classifyStkResult(code, rawDesc)
+            val entry = pickEntry(code, effectiveFamily, outcome)
+            if (entry != null) return decodedFrom(code, entry)
+            return if (outcome == StkOutcome.PENDING) pendingFallback(code) else failedFallback(code, rawDesc)
         }
 
-        return if (outcome == StkOutcome.PENDING) pendingFallback(code)
-        else failedFallback(code.ifEmpty { "unknown" }, rawDesc)
+        // Terminal (api_error / b2c_c2b_result): no STK pending semantics. Pick the entry for this
+        // family (falling back to any non-STK match, then any match), else an indeterminate failure.
+        val entry = matches.firstOrNull { it.family == effectiveFamily }
+            ?: matches.firstOrNull { it.family != DarajaFamily.STK_RESULT }
+            ?: matches.firstOrNull()
+        return if (entry != null) decodedFrom(code, entry) else failedFallback(code, rawDesc)
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -269,7 +302,9 @@ object DarajaCatalog {
                 category = DarajaCategory.fromWire(e["category"] as String),
                 retryable = e["retryable"] as Boolean,
                 customerMessage = e["customerMessage"] as String,
-                sources = (e["sources"] as? List<Any?>)?.map { it as String } ?: emptyList(),
+                sources = Collections.unmodifiableList(
+                    (e["sources"] as? List<Any?>)?.map { it as String } ?: emptyList(),
+                ),
             )
         }
     }

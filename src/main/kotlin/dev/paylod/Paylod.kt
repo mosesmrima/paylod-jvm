@@ -3,6 +3,7 @@ package dev.paylod
 import dev.paylod.internal.Json
 import dev.paylod.internal.RealTimeSource
 import dev.paylod.internal.TimeSource
+import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -68,6 +69,9 @@ class Paylod internal constructor(
         apiKey = key.trim()
 
         baseUrl = (options.baseUrl ?: env("PAYLOD_BASE_URL") ?: DEFAULT_BASE_URL).trimEnd('/')
+        // Reject a plaintext / non-canonical origin BEFORE any key can leave the process. Loopback
+        // HTTP is allowed only behind an explicit test-only flag, and never with a live key.
+        assertSecureBaseUrl(baseUrl, apiKey, options.allowInsecureBaseUrl)
         webhookSecret = options.webhookSecret ?: env("PAYLOD_WEBHOOK_SECRET")
         timeoutMs = options.timeoutMs
         maxRetries = options.maxRetries
@@ -96,13 +100,29 @@ class Paylod internal constructor(
         path: String,
         body: Any?,
         idempotencyKey: String?,
+        deadlineMs: Long? = null,
+        validate: ((Map<String, Any?>, Int) -> Unit)? = null,
     ): Map<String, Any?> {
         val url = "$baseUrl$path"
         var lastError: PaylodException? = null
 
+        // Serialize the body ONCE, before the retry loop. Re-serialising on each attempt would let a
+        // mutable `metadata` map be mutated under a FIXED Idempotency-Key — the second attempt would
+        // send a different body than the first, defeating the double-charge guard.
+        val bodyStr = if (body == null) null else Json.write(body)
+
         var attempt = 0
         while (attempt <= maxRetries) {
-            if (attempt > 0) time.sleep(jitter(250L shl (attempt - 1)))
+            if (attempt > 0) boundedSleep(jitter(250L shl (attempt - 1)), deadlineMs)
+
+            // Cap this request to whatever time the WHOLE operation has left. A 30s per-request
+            // timeout must never let a wait({ timeoutMs = 5000 }) run for 30s.
+            var perRequestTimeout = timeoutMs
+            val remaining = remaining(deadlineMs)
+            if (remaining != null) {
+                if (remaining <= 0) break // out of time — surface the last error / a timeout below
+                perRequestTimeout = Math.min(perRequestTimeout, remaining)
+            }
 
             val headers = LinkedHashMap<String, String>()
             headers["authorization"] = "Bearer $apiKey"
@@ -110,8 +130,7 @@ class Paylod internal constructor(
             if (body != null) headers["content-type"] = "application/json"
             if (idempotencyKey != null) headers["idempotency-key"] = idempotencyKey
 
-            val bodyStr = if (body == null) null else Json.write(body)
-            val spec = HttpRequestSpec(method, url, headers, bodyStr, timeoutMs)
+            val spec = HttpRequestSpec(method, url, headers, bodyStr, perRequestTimeout)
 
             val response: HttpResponseSpec = try {
                 transport.execute(spec)
@@ -120,6 +139,8 @@ class Paylod internal constructor(
                 attempt++
                 continue // network blip -> retry
             }
+            // A PaylodInterruptedException from the transport is deliberately NOT caught here: an
+            // interrupt is a cancellation, not a transient blip, so it propagates without a retry.
 
             val text = response.body
             val parsed: Any? = try {
@@ -130,25 +151,45 @@ class Paylod internal constructor(
 
             if (response.status in 200..299) {
                 @Suppress("UNCHECKED_CAST")
-                return parsed as? Map<String, Any?> ?: emptyMap()
+                val map = parsed as? Map<String, Any?> ?: emptyMap()
+                // A malformed 2xx (e.g. no payment id) is INDETERMINATE — the validator throws rather
+                // than let an empty shape through. A 2xx is never retried, so this propagates at once.
+                validate?.invoke(map, response.status)
+                return map
             }
 
             val message = ((parsed as? Map<*, *>)?.get("error") as? String) ?: "paylod responded ${response.status}"
             val apiError = PaylodApiException(message, response.status, parsed, idempotencyKey)
 
-            // 429 / 5xx are transient; everything else is a real answer.
+            // 429 / 5xx are transient. A 409 is retried ONLY when it is explicitly "same key still in
+            // progress" — every other 409 (body conflict, indeterminate) is a real, terminal answer.
             val transient = response.status == 429 || response.status >= 500
-            if (!transient || attempt == maxRetries) throw apiError
+            val inProgress = response.status == 409 && IN_PROGRESS_409_RE.containsMatchIn(message)
+            if ((!transient && !inProgress) || attempt == maxRetries) throw apiError
 
             lastError = apiError
+            // Honour Retry-After (clamped to 10s and to the operation deadline). If absent, the
+            // top-of-loop backoff covers the wait.
             val retryAfter = response.headers["retry-after"]?.toDoubleOrNull()
             if (retryAfter != null && retryAfter > 0) {
-                time.sleep(Math.min((retryAfter * 1000).toLong(), 10_000))
+                boundedSleep(Math.min((retryAfter * 1000).toLong(), 10_000), deadlineMs)
             }
             attempt++
         }
 
         throw lastError ?: PaylodConnectionException("Request to $url failed")
+    }
+
+    /** Remaining time to the deadline, or `null` when there is no deadline. */
+    private fun remaining(deadlineMs: Long?): Long? =
+        if (deadlineMs == null) null else deadlineMs - time.nowMillis()
+
+    /** A sleep clamped to the operation deadline, so a backoff can never push past [wait]'s cap. */
+    private fun boundedSleep(ms: Long, deadlineMs: Long?) {
+        var capped = ms
+        val rem = remaining(deadlineMs)
+        if (rem != null) capped = Math.min(capped, Math.max(0L, rem))
+        if (capped > 0) time.sleep(capped)
     }
 
     private fun jitter(ms: Long): Long = Math.round(ms * (0.8 + random.nextDouble() * 0.4))
@@ -163,18 +204,34 @@ class Paylod internal constructor(
         if (amount <= 0 || amount > MAX_AMOUNT) {
             throw PaylodInvalidRequestException("amount must be between 1 and $MAX_AMOUNT KES (got $amount).")
         }
-        if (params.accountReference != null && params.accountReference.trim().length > 12) {
-            throw PaylodInvalidRequestException("accountReference must be 12 characters or fewer.")
-        }
-        if (params.description != null && params.description.trim().length > 64) {
-            throw PaylodInvalidRequestException("description must be 64 characters or fewer.")
-        }
 
         val out = LinkedHashMap<String, Any?>()
         out["amount"] = amount
         out["phone"] = Phone.normalize(params.phone)
-        if (params.accountReference != null) out["accountReference"] = params.accountReference
-        if (params.description != null) out["description"] = params.description
+
+        // Validate AND transmit the SAME trimmed representation — never validate the trimmed length
+        // while transmitting the untrimmed original (that would let " x…(12 spaces) " slip past a
+        // 12-char bound). A provided-but-blank value is rejected rather than sent as empty.
+        if (params.accountReference != null) {
+            val ref = params.accountReference.trim()
+            if (ref.isEmpty()) {
+                throw PaylodInvalidRequestException("accountReference must not be blank.")
+            }
+            if (ref.length > 12) {
+                throw PaylodInvalidRequestException("accountReference must be 12 characters or fewer.")
+            }
+            out["accountReference"] = ref
+        }
+        if (params.description != null) {
+            val desc = params.description.trim()
+            if (desc.isEmpty()) {
+                throw PaylodInvalidRequestException("description must not be blank.")
+            }
+            if (desc.length > 64) {
+                throw PaylodInvalidRequestException("description must be 64 characters or fewer.")
+            }
+            out["description"] = desc
+        }
         if (params.metadata != null) out["metadata"] = params.metadata
         return out
     }
@@ -189,35 +246,60 @@ class Paylod internal constructor(
      */
     fun collect(params: CollectParams): CollectAck {
         val body = buildCollectBody(params)
+        // A caller-supplied key is the double-charge guard — reject a blank/whitespace/control-char
+        // one loudly rather than silently drop protection. A generated key is always well-formed.
         if (params.idempotencyKey == null) warnMissingIdempotencyKey()
+        else assertValidIdempotencyKey(params.idempotencyKey)
         val idempotencyKey = params.idempotencyKey ?: UUID.randomUUID().toString()
 
-        if (simulateMode) {
-            // Same call, same ack, no handset. The key was proven a sandbox key in the constructor.
-            val simParams = SimulateCollectParams.builder()
-                .phone(params.phone)
-                .amount(params.amount)
-                .accountReference(params.accountReference)
-                .description(params.description)
-                .metadata(params.metadata)
-                .idempotencyKey(idempotencyKey)
-                .build()
-            val created = simulate.collect(simParams)
+        try {
+            if (simulateMode) {
+                // Same call, same ack, no handset. The key was proven a sandbox key in the constructor.
+                val simParams = SimulateCollectParams.builder()
+                    .phone(params.phone)
+                    .amount(params.amount)
+                    .accountReference(params.accountReference)
+                    .description(params.description)
+                    .metadata(params.metadata)
+                    .idempotencyKey(idempotencyKey)
+                    .build()
+                val created = simulate.collect(simParams)
+                return CollectAck(
+                    paymentId = created.paymentId,
+                    status = PaymentStatus.PENDING,
+                    checkoutRequestId = created.checkoutRequestId,
+                    idempotencyKey = idempotencyKey,
+                )
+            }
+
+            val ack = request("POST", "/collect", body, idempotencyKey) { map, status ->
+                // A 2xx with no payment id is INDETERMINATE: the charge may have moved. Fail with the
+                // key attached rather than hand back an empty id a caller would treat as a new payment.
+                val id = map["paymentId"]
+                if (id !is String || id.isBlank()) {
+                    throw PaylodApiException(
+                        "paylod returned a 2xx response with no paymentId — the charge state is " +
+                            "INDETERMINATE. Read the payment with this idempotencyKey before starting " +
+                            "any new attempt; do NOT mint a fresh key (that risks a second charge).",
+                        status,
+                        map,
+                        idempotencyKey,
+                        indeterminate = true,
+                    )
+                }
+            }
             return CollectAck(
-                paymentId = created.paymentId,
+                paymentId = ack["paymentId"]?.toString() ?: "",
                 status = PaymentStatus.PENDING,
-                checkoutRequestId = created.checkoutRequestId,
+                checkoutRequestId = ack["checkoutRequestId"]?.toString() ?: "",
                 idempotencyKey = idempotencyKey,
             )
+        } catch (e: PaylodException) {
+            // Whatever went wrong (network, timeout, 5xx, malformed 2xx), the caller MUST be able to
+            // recover the effective key and retry with the SAME one — a fresh key would double-charge.
+            if (e.idempotencyKey == null) e.idempotencyKey = idempotencyKey
+            throw e
         }
-
-        val ack = request("POST", "/collect", body, idempotencyKey)
-        return CollectAck(
-            paymentId = ack["paymentId"]?.toString() ?: "",
-            status = PaymentStatus.PENDING,
-            checkoutRequestId = ack["checkoutRequestId"]?.toString() ?: "",
-            idempotencyKey = idempotencyKey,
-        )
     }
 
     /** Java-friendly overload — no params object needed for the common case. */
@@ -231,10 +313,22 @@ class Paylod internal constructor(
     ): CollectAck = collect(CollectParams(phone, amount, accountReference, description, idempotencyKey))
 
     /** Read a payment. `GET /status/:id`. */
-    fun status(paymentId: String): Payment {
+    fun status(paymentId: String): Payment = readPayment(paymentId, null)
+
+    private fun readPayment(paymentId: String, deadlineMs: Long?): Payment {
         if (paymentId.isEmpty()) throw PaylodInvalidRequestException("paymentId is required.")
         val encoded = URLEncoder.encode(paymentId, StandardCharsets.UTF_8).replace("+", "%20")
-        val p = request("GET", "/status/$encoded", null, null)
+        val p = request("GET", "/status/$encoded", null, null, deadlineMs) { map, status ->
+            // A 2xx status body with no id is malformed — surface it rather than return an empty Payment.
+            val id = map["id"]
+            if (id !is String || id.isBlank()) {
+                throw PaylodApiException(
+                    "paylod returned a 2xx status body with no payment id (malformed response).",
+                    status,
+                    map,
+                )
+            }
+        }
         return Payment(
             id = p["id"]?.toString() ?: paymentId,
             status = PaymentStatus.fromWire(p["status"]?.toString()),
@@ -266,7 +360,8 @@ class Paylod internal constructor(
         var last: Payment? = null
         var attempt = 0
         while (true) {
-            val payment = status(paymentId)
+            // Propagate the wait's deadline into each poll so no single status read can hang past it.
+            val payment = readPayment(paymentId, deadline)
             last = payment
 
             val outcome = Outcomes.of(payment)
@@ -322,7 +417,8 @@ class Paylod internal constructor(
         signatureHeader: String?,
         secret: String? = null,
         toleranceSec: Long = Webhooks.DEFAULT_TOLERANCE_SEC,
-    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
+        nowSec: Long? = null,
+    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec, nowSec)
 
     /** ByteArray overload of [verifyWebhook] — pass the exact raw bytes that arrived. */
     @JvmOverloads
@@ -331,7 +427,8 @@ class Paylod internal constructor(
         signatureHeader: String?,
         secret: String? = null,
         toleranceSec: Long = Webhooks.DEFAULT_TOLERANCE_SEC,
-    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
+        nowSec: Long? = null,
+    ): Boolean = Webhooks.verify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec, nowSec)
 
     /**
      * Verify a webhook and return the typed [WebhookEvent]. Throws
@@ -343,7 +440,8 @@ class Paylod internal constructor(
         signatureHeader: String?,
         secret: String? = null,
         toleranceSec: Long = Webhooks.DEFAULT_TOLERANCE_SEC,
-    ): WebhookEvent = Webhooks.parseAndVerify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec)
+        nowSec: Long? = null,
+    ): WebhookEvent = Webhooks.parseAndVerify(rawBody, signatureHeader, secret ?: webhookSecret ?: "", toleranceSec, nowSec)
 
     private fun normalizeResultCode(v: Any?): String? = when (v) {
         null -> null
@@ -353,6 +451,40 @@ class Paylod internal constructor(
 
     private companion object {
         val warned = AtomicBoolean(false)
+
+        /**
+         * A `409` retried only when it is explicitly the "same key still running" case. Every other
+         * 409 (body conflict, indeterminate) is a real answer and must NOT be retried.
+         */
+        val IN_PROGRESS_409_RE = Regex("already in progress", RegexOption.IGNORE_CASE)
+
+        /**
+         * Enforce a secure origin for `baseUrl`. HTTPS is required so the API key is never sent in the
+         * clear and a hostile redirect target can't be substituted. Loopback HTTP is permitted ONLY
+         * behind an explicit test-only opt-in, and NEVER with a live (`mp_live_`) key.
+         */
+        fun assertSecureBaseUrl(baseUrl: String, apiKey: String, allowInsecure: Boolean) {
+            val parsed = try {
+                URI(baseUrl)
+            } catch (e: Exception) {
+                throw PaylodConfigException("baseUrl is not a valid URL: \"$baseUrl\".")
+            }
+            val scheme = parsed.scheme?.lowercase()
+            if (scheme == "https") return
+
+            val host = (parsed.host ?: "").lowercase()
+            val isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+            val isLive = apiKey.startsWith("mp_live_")
+
+            if (scheme == "http" && isLoopback && allowInsecure && !isLive) return
+
+            throw PaylodConfigException(
+                "baseUrl must use https:// (got \"$baseUrl\"). Plaintext HTTP would transmit your API " +
+                    "key in the clear and opens you to SSRF / redirection. Loopback HTTP (localhost, " +
+                    "127.0.0.1) is allowed ONLY with allowInsecureBaseUrl = true and NEVER with an " +
+                    "mp_live_ key.",
+            )
+        }
 
         fun warnMissingIdempotencyKey() {
             if (!warned.compareAndSet(false, true)) return

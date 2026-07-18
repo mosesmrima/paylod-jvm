@@ -8,16 +8,17 @@ plugins {
 }
 
 group = "dev.paylod"
-version = "0.1.0"
+version = "0.2.0"
 
 repositories {
     mavenCentral()
 }
 
-// paylod-jvm has ZERO runtime dependencies. The wire shapes are small and flat, so a tiny
-// internal JSON reader/writer (see internal/Json.kt) does the job without pulling in a
-// serialization runtime or a compiler plugin — the same "zero dependencies" posture the
-// Node SDK ships with, which matters for a library that sits in a payments path.
+// paylod-jvm pulls in NO THIRD-PARTY runtime dependencies beyond the Kotlin standard library (which
+// the published POM depends on). The wire shapes are small and flat, so a tiny internal JSON
+// reader/writer (see internal/Json.kt) does the job without a serialization runtime or a compiler
+// plugin. HTTP rides on the JDK's own java.net.http.HttpClient. That thin footprint matters for a
+// library that sits in a payments path.
 dependencies {
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
@@ -64,7 +65,8 @@ publishing {
                 description.set(
                     "Official JVM (Kotlin/Java) client for the paylod API — hosted M-Pesa " +
                         "(Safaricom Daraja) STK Push, status polling, signed webhooks and offline " +
-                        "error decoding, with zero runtime dependencies.",
+                        "error decoding, with no third-party runtime dependencies beyond the Kotlin " +
+                        "standard library.",
                 )
                 url.set("https://paylod.dev/docs/sdk")
                 licenses {

@@ -61,20 +61,38 @@ object Webhooks {
 
     private data class Header(val t: String, val v1: String)
 
+    /** A well-formed `v1` is 64 lowercase hex chars (an HMAC-SHA256 digest). */
+    private val V1_RE = Regex("^[0-9a-f]{64}$")
+
+    /**
+     * Parse the signature header STRICTLY. The header is `t=<unix>,v1=<hex>` and nothing else that
+     * matters — so we require EXACTLY ONE `t` and EXACTLY ONE `v1`, and reject anything else.
+     *
+     * This closes a last-value-wins hole: two `x-webhook-signature` headers combined into one
+     * comma-joined value (`t=1,v1=<real>,t=9999999999,v1=<forged>`) must NOT be accepted by silently
+     * taking the last pair. Duplicates of either key are fatal, as is a malformed `v1`.
+     */
     private fun parseHeader(header: String): Header? {
         var t: String? = null
         var v1: String? = null
+        var tCount = 0
+        var v1Count = 0
         for (seg in header.split(",")) {
-            val idx = seg.indexOf("=")
+            val s = seg.trim()
+            if (s.isEmpty()) continue
+            val idx = s.indexOf("=")
             if (idx <= 0) continue
-            val key = seg.substring(0, idx).trim()
-            val value = seg.substring(idx + 1).trim()
+            val key = s.substring(0, idx).trim()
+            val value = s.substring(idx + 1).trim()
             when (key) {
-                "t" -> t = value
-                "v1" -> v1 = value
+                "t" -> { t = value; tCount++ }
+                "v1" -> { v1 = value; v1Count++ }
+                // Unknown keys are ignored for forward-compatibility; a duplicate t/v1 is fatal below.
             }
         }
-        if (t.isNullOrEmpty() || v1.isNullOrEmpty()) return null
+        if (tCount != 1 || v1Count != 1 || t.isNullOrEmpty() || v1.isNullOrEmpty()) return null
+        // `v1` must be exactly one 64-char lowercase-hex digest. `t` is validated (integer) by the caller.
+        if (!V1_RE.matches(v1)) return null
         return Header(t, v1)
     }
 
@@ -98,7 +116,7 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long = System.currentTimeMillis() / 1000,
+        nowSec: Long? = null,
     ): WebhookEvent {
         if (secret.isEmpty()) {
             throw PaylodSignatureVerificationException(
@@ -119,19 +137,32 @@ object Webhooks {
                 "Malformed $SIGNATURE_HEADER header — expected \"t=<unix>,v1=<hex>\".",
             )
 
+        // `t` must always be an integer, regardless of tolerance — a non-numeric timestamp is malformed.
+        val t = parsed.t.toLongOrNull()
+            ?: throw PaylodSignatureVerificationException(
+                SignatureFailureReason.MALFORMED_SIGNATURE,
+                "Signature timestamp is not a number.",
+            )
+
         if (toleranceSec > 0) {
-            val t = parsed.t.toLongOrNull()
-                ?: throw PaylodSignatureVerificationException(
-                    SignatureFailureReason.MALFORMED_SIGNATURE,
-                    "Signature timestamp is not a number.",
-                )
-            if (Math.abs(nowSec - t) > toleranceSec) {
+            val now = nowSec ?: (System.currentTimeMillis() / 1000)
+            if (Math.abs(now - t) > toleranceSec) {
                 throw PaylodSignatureVerificationException(
                     SignatureFailureReason.STALE_TIMESTAMP,
                     "Signature timestamp is outside the ${toleranceSec}s tolerance (replay?).",
                 )
             }
+        } else if (nowSec == null) {
+            // A non-positive tolerance would DISABLE replay protection. That is only ever acceptable
+            // with a fixed, injected clock (a pinned test vector). In production — no `nowSec` — refuse
+            // it loudly rather than silently accept replays of any age.
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INSECURE_TOLERANCE,
+                "toleranceSec must be a positive number of seconds. A non-positive tolerance disables " +
+                    "webhook replay protection and is only permitted in tests that inject a fixed nowSec.",
+            )
         }
+        // else: toleranceSec <= 0 AND a fixed `nowSec` was injected — a deterministic fixed-vector test.
 
         val expected = hmacHex(secret, parsed.t, payload)
         val a = expected.toByteArray(StandardCharsets.UTF_8)
@@ -171,7 +202,7 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long = System.currentTimeMillis() / 1000,
+        nowSec: Long? = null,
     ): WebhookEvent = parseAndVerify(
         payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec,
     )
@@ -187,11 +218,17 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long = System.currentTimeMillis() / 1000,
+        nowSec: Long? = null,
     ): Boolean = try {
         parseAndVerify(payload, signature, secret, toleranceSec, nowSec)
         true
     } catch (e: PaylodSignatureVerificationException) {
+        false
+    } catch (e: ClassCastException) {
+        // A schema/type mismatch in an otherwise-correctly-signed body is a verification failure, not
+        // a crash. The boolean convenience must return false for ALL parse/schema failures, uniformly.
+        false
+    } catch (e: IllegalArgumentException) {
         false
     }
 
@@ -202,7 +239,7 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-        nowSec: Long = System.currentTimeMillis() / 1000,
+        nowSec: Long? = null,
     ): Boolean = verify(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
 
     private fun asString(v: Any?): String? = v?.toString()

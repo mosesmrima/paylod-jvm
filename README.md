@@ -1,8 +1,8 @@
 # paylod for the JVM
 
 The official **Kotlin/Java** client for the **paylod API** — M-Pesa collections without the Daraja
-boilerplate. One dependency-free JAR, usable from any JVM app: Spring Boot, Ktor, Android backends,
-plain `main()`.
+boilerplate. One small JAR with **no third-party runtime dependencies** (only the Kotlin standard
+library), usable from any JVM app: Spring Boot, Ktor, Android backends, plain `main()`.
 
 **No backend to run. No per-transaction fees. No custody of your money.** paylod hosts the Daraja
 callback, refreshes the OAuth token, decodes the result code, and POSTs you a signed webhook when the
@@ -15,13 +15,14 @@ credentials. paylod never touches the funds. You bring your own Daraja creds; pa
 
 ## Install
 
-Coordinates: **`dev.paylod:paylod`**. Requires **JVM 17+**. Zero runtime dependencies.
+Coordinates: **`dev.paylod:paylod`**. Requires **JVM 17+**. No third-party runtime dependencies —
+only the Kotlin standard library.
 
 ### Gradle (Kotlin DSL)
 
 ```kotlin
 dependencies {
-    implementation("dev.paylod:paylod:0.1.0")
+    implementation("dev.paylod:paylod:0.2.0")
 }
 ```
 
@@ -29,7 +30,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'dev.paylod:paylod:0.1.0'
+    implementation 'dev.paylod:paylod:0.2.0'
 }
 ```
 
@@ -39,7 +40,7 @@ dependencies {
 <dependency>
   <groupId>dev.paylod</groupId>
   <artifactId>paylod</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 
@@ -243,12 +244,13 @@ hatches (you probably won't need them) live on `PaylodOptions`:
 | Option | Default |
 |---|---|
 | `apiKey` | `PAYLOD_API_KEY` env var |
-| `baseUrl` | `PAYLOD_BASE_URL` env var, else `https://paylod.dev/functions/v1` |
+| `baseUrl` | `PAYLOD_BASE_URL` env var, else `https://paylod.dev/functions/v1`. **Must be `https://`** — a plaintext origin is refused so your key is never sent in the clear. |
 | `webhookSecret` | `PAYLOD_WEBHOOK_SECRET` env var |
 | `timeoutMs` | `30000` |
-| `maxRetries` | `2` (transient failures only — network, 5xx, 429) |
+| `maxRetries` | `2` (transient failures only — network, 5xx, 429, and the explicit in-progress `409`) |
 | `transport` | JDK `HttpClient` (inject an `HttpTransport` for tests/proxies) |
 | `simulate` | `false` (requires a `mp_test_` key) |
+| `allowInsecureBaseUrl` | `false` — test-only escape hatch permitting **loopback** `http://` (`localhost`/`127.0.0.1`), never with an `mp_live_` key |
 
 Kotlin uses named arguments (`PaylodOptions.of(timeoutMs = 10_000)`); Java uses the builder
 (`PaylodOptions.builder().timeoutMs(10_000).build()`).

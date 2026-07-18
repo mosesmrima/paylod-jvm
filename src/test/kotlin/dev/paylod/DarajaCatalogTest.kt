@@ -2,6 +2,7 @@ package dev.paylod
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -96,5 +97,66 @@ class DarajaCatalogTest {
     fun `the whole catalog loaded from resources`() {
         // The Node table ships 32 entries; assert we loaded a full, non-trivial table.
         assertTrue(DarajaCatalog.allEntries.size >= 30)
+    }
+
+    // ── 0.2.0: corrected retryable flags (owner-approved) ──────────────────────────────────
+    // 17 / 26 / 1025 / 9999 were retryable:true on non-authoritative community evidence. Until
+    // no-debit is proven, false is the safe money call.
+    @Test
+    fun `mpesa-system codes 17, 26, 1025, 9999 are NOT retryable`() {
+        for (code in listOf(17, 26, 1025, 9999)) {
+            val d = DarajaCatalog.decodeError(code)
+            assertEquals(DarajaCategory.MPESA_SYSTEM, d.category, "category for $code")
+            assertFalse(d.retryable, "code $code must not be retryable")
+        }
+    }
+
+    // ── 0.2.0: family-aware decoding ───────────────────────────────────────────────────────
+    @Test
+    fun `a b2c_c2b_result code decodes terminally, not as pending`() {
+        val d = DarajaCatalog.decodeError("C2B00011", family = DarajaFamily.B2C_C2B_RESULT)
+        assertEquals("C2B00011", d.code)
+        // Non-STK families carry NO pending semantics — it must not become "payment still in progress".
+        assertEquals(DarajaCategory.CUSTOMER, d.category)
+        assertFalse(d.retryable)
+    }
+
+    @Test
+    fun `overloaded 500_001_1001 decodes terminally on the api_error surface`() {
+        val d = DarajaCatalog.decodeError("500.001.1001", "merchant does not exist", DarajaFamily.API_ERROR)
+        assertEquals(DarajaCategory.MPESA_SYSTEM, d.category)
+        assertFalse(d.retryable)
+        // …while the STK surface (default) keeps its pending meaning.
+        val stk = DarajaCatalog.decodeError("500.001.1001", "The transaction is being processed")
+        assertEquals(DarajaCategory.PENDING, stk.category)
+    }
+
+    @Test
+    fun `an STK-defaulted lookup of a non-STK-only code decodes by its real family`() {
+        // C2B00011 exists only on b2c_c2b_result; asking for the default STK family must not route it
+        // through the STK unknown->pending rule.
+        val d = DarajaCatalog.decodeError("C2B00011")
+        assertEquals(DarajaCategory.CUSTOMER, d.category)
+        assertFalse(d.retryable)
+    }
+
+    @Test
+    fun `a 500 with an insufficient-funds message is terminal, not pending`() {
+        assertEquals(
+            StkOutcome.FAILED,
+            DarajaCatalog.classifyStkResult("500.001.1001", "The balance is insufficient funds"),
+        )
+    }
+
+    @Test
+    fun `exposed catalog collections are unmodifiable`() {
+        assertThrows(UnsupportedOperationException::class.java) {
+            @Suppress("UNCHECKED_CAST")
+            (DarajaCatalog.allEntries as MutableList<CatalogEntry>).clear()
+        }
+        assertThrows(UnsupportedOperationException::class.java) {
+            @Suppress("UNCHECKED_CAST")
+            (DarajaCatalog.pendingResultCodes as MutableSet<String>).clear()
+        }
     }
 }

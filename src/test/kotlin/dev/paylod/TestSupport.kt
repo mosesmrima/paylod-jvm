@@ -10,6 +10,7 @@ data class RecordedCall(
     val method: String,
     val headers: Map<String, String>,
     val body: Map<String, Any?>?,
+    val timeoutMs: Long = 0,
 )
 
 /** One canned response the [StubTransport] will replay, in order. */
@@ -33,7 +34,7 @@ class StubTransport(private val steps: List<Step>) : HttpTransport {
     @Suppress("UNCHECKED_CAST")
     override fun execute(request: HttpRequestSpec): HttpResponseSpec {
         val parsedBody = request.body?.let { Json.parse(it) as? Map<String, Any?> }
-        calls.add(RecordedCall(request.url, request.method, request.headers, parsedBody))
+        calls.add(RecordedCall(request.url, request.method, request.headers, parsedBody, request.timeoutMs))
 
         val step = steps.getOrElse(minOf(index, steps.size - 1)) {
             throw IllegalStateException("StubTransport: no step configured")
@@ -60,6 +61,7 @@ fun testClient(
     simulate: Boolean = false,
     baseUrl: String? = null,
     webhookSecret: String? = null,
+    allowInsecureBaseUrl: Boolean = false,
 ): Pair<Paylod, StubTransport> {
     val transport = StubTransport(steps)
     val options = PaylodOptions.of(
@@ -68,6 +70,7 @@ fun testClient(
         maxRetries = maxRetries,
         transport = transport,
         simulate = simulate,
+        allowInsecureBaseUrl = allowInsecureBaseUrl,
     )
     val paylod = Paylod(apiKey, options, FakeTimeSource(), Random(1))
     return paylod to transport

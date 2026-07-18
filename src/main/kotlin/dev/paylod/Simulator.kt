@@ -59,6 +59,9 @@ class Simulator internal constructor(
                 "simulate.collect(): amount must be a positive whole number of KES (got $amount).",
             )
         }
+        // Same double-charge guard as production: reject a blank/whitespace/control-char key here too,
+        // so a simulator test cannot pass with a key that would be rejected against the real API.
+        params.idempotencyKey?.let { assertValidIdempotencyKey(it) }
 
         val body = LinkedHashMap<String, Any?>()
         body["phone"] = if (params.phone != null) Phone.normalize(params.phone) else DEFAULT_SIM_PHONE

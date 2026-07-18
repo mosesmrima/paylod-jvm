@@ -302,4 +302,208 @@ class ClientTest {
         }
         assertEquals(0, t.count)
     }
+
+    // ── 0.2.0: accountReference/description trimmed on the wire ─────────────────────────────
+
+    @Test
+    fun `transmits the trimmed accountReference and description, and rejects a blank one`() {
+        val (paylod, t) = testClient(listOf(Step(status = 202, json = ACK)))
+        paylod.collect(
+            CollectParams.builder("0712345678", 100)
+                .accountReference("  INV-9  ")
+                .description("  Coffee  ")
+                .idempotencyKey("k")
+                .build(),
+        )
+        assertEquals("INV-9", t.calls[0].body!!["accountReference"])
+        assertEquals("Coffee", t.calls[0].body!!["description"])
+
+        val (paylod2, t2) = testClient(emptyList())
+        assertThrows(PaylodInvalidRequestException::class.java) {
+            paylod2.collect("0712345678", 1, accountReference = "   ")
+        }
+        assertEquals(0, t2.count)
+    }
+
+    // ── 0.2.0: secrets never printed by HttpRequestSpec.toString() ─────────────────────────
+
+    @Test
+    fun `HttpRequestSpec toString redacts the bearer token and idempotency key`() {
+        val spec = HttpRequestSpec(
+            "POST",
+            "https://paylod.dev/functions/v1/collect",
+            linkedMapOf("authorization" to "Bearer mp_live_supersecret", "idempotency-key" to "attempt-1"),
+            "{}",
+            1_000,
+        )
+        val s = spec.toString()
+        assertFalse(s.contains("mp_live_supersecret"), "bearer token leaked: $s")
+        assertFalse(s.contains("attempt-1"), "idempotency key leaked: $s")
+        assertTrue(s.contains("[redacted]"))
+    }
+
+    // ── 0.2.0: HTTPS enforcement on baseUrl ────────────────────────────────────────────────
+
+    @Test
+    fun `refuses a plaintext http baseUrl`() {
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(emptyList(), baseUrl = "http://paylod.dev/v1")
+        }
+    }
+
+    @Test
+    fun `allows loopback http only behind the explicit test flag`() {
+        // Without the flag, even loopback http is refused.
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(emptyList(), baseUrl = "http://localhost:54321/v1")
+        }
+        // With the flag and a test key, it is allowed.
+        testClient(emptyList(), baseUrl = "http://localhost:54321/v1", allowInsecureBaseUrl = true)
+    }
+
+    @Test
+    fun `never allows plaintext with a live key, even loopback with the flag`() {
+        assertThrows(PaylodConfigException::class.java) {
+            testClient(
+                emptyList(),
+                apiKey = "mp_live_abc",
+                baseUrl = "http://localhost:54321/v1",
+                allowInsecureBaseUrl = true,
+            )
+        }
+    }
+
+    // ── 0.2.0: idempotency-key validation ──────────────────────────────────────────────────
+
+    @Test
+    fun `rejects a blank, whitespace, or control-char idempotency key`() {
+        val (paylod, t) = testClient(emptyList())
+        assertThrows(PaylodInvalidRequestException::class.java) { paylod.collect("0712345678", 1, idempotencyKey = "") }
+        assertThrows(PaylodInvalidRequestException::class.java) { paylod.collect("0712345678", 1, idempotencyKey = "   ") }
+        assertThrows(PaylodInvalidRequestException::class.java) { paylod.collect("0712345678", 1, idempotencyKey = "a\tb") }
+        assertThrows(PaylodInvalidRequestException::class.java) { paylod.collect("0712345678", 1, idempotencyKey = "x".repeat(256)) }
+        assertEquals(0, t.count)
+    }
+
+    // ── 0.2.0: effective key is never lost on failure ──────────────────────────────────────
+
+    @Test
+    fun `attaches the effective idempotency key to a thrown connection error`() {
+        val (paylod, _) = testClient(
+            listOf(Step(throwable = PaylodConnectionException("socket reset"))),
+            maxRetries = 0,
+        )
+        val err = assertThrows(PaylodConnectionException::class.java) {
+            paylod.collect("0712345678", 100, idempotencyKey = "attempt-77")
+        }
+        assertEquals("attempt-77", err.idempotencyKey)
+    }
+
+    @Test
+    fun `attaches a GENERATED key to a thrown error so a retry cannot mint a fresh one`() {
+        val (paylod, _) = testClient(
+            listOf(Step(throwable = PaylodConnectionException("socket reset"))),
+            maxRetries = 0,
+        )
+        val err = assertThrows(PaylodConnectionException::class.java) {
+            paylod.collect(CollectParams("0712345678", 100)) // no key -> SDK generates one
+        }
+        assertTrue(err.idempotencyKey!!.matches(Regex("^[0-9a-f-]{36}$")))
+    }
+
+    // ── 0.2.0: malformed 2xx is indeterminate, never a silent empty success ────────────────
+
+    @Test
+    fun `a 2xx collect with no paymentId is an indeterminate error carrying the key`() {
+        val (paylod, _) = testClient(
+            listOf(Step(status = 202, json = mapOf("status" to "pending"))), // no paymentId
+        )
+        val err = assertThrows(PaylodApiException::class.java) {
+            paylod.collect("0712345678", 100, idempotencyKey = "k-indef")
+        }
+        assertTrue(err.indeterminate)
+        assertEquals("k-indef", err.idempotencyKey)
+    }
+
+    @Test
+    fun `a 2xx status body with no id is a malformed-response error`() {
+        val (paylod, _) = testClient(
+            listOf(Step(status = 200, json = mapOf("status" to "pending"))), // no id
+        )
+        assertThrows(PaylodApiException::class.java) { paylod.status("pay_123") }
+    }
+
+    // ── 0.2.0: in-progress 409 is retried; body-conflict 409 is not ────────────────────────
+
+    @Test
+    fun `retries ONLY an explicit in-progress 409, honouring the same key`() {
+        val (paylod, t) = testClient(
+            listOf(
+                Step(status = 409, json = mapOf("error" to "an idempotent request is already in progress")),
+                Step(status = 202, json = ACK),
+            ),
+            maxRetries = 2,
+        )
+        val ack = paylod.collect("0712345678", 100, idempotencyKey = "k-prog")
+        assertEquals("pay_123", ack.paymentId)
+        assertEquals(2, t.count)
+        assertEquals(t.calls[0].headers["idempotency-key"], t.calls[1].headers["idempotency-key"])
+    }
+
+    // ── 0.2.0: raw status can no longer override the classifier ─────────────────────────────
+
+    @Test
+    fun `status success carrying a pending code (4999) is NOT reported as paid`() {
+        val (paylod, _) = testClient(
+            listOf(Step(json = paymentJson(status = "success", resultCode = 4999, resultDesc = "still under processing"))),
+        )
+        val r = paylod.check("pay_123")
+        assertEquals(OutcomeStatus.PENDING, r.status)
+        assertFalse(r.paid)
+        assertFalse(r.retryable)
+    }
+
+    @Test
+    fun `status success carrying a failure code (1032) is a contradiction — indeterminate, not paid`() {
+        val (paylod, _) = testClient(
+            listOf(Step(json = paymentJson(status = "success", resultCode = 1032, resultDesc = "cancelled by user"))),
+        )
+        val r = paylod.check("pay_123")
+        assertEquals(OutcomeStatus.PENDING, r.status) // surfaced as pending so wait() lets it settle
+        assertFalse(r.paid)
+        assertFalse(r.retryable)
+        assertEquals(
+            "We couldn't confirm this payment yet. Please wait — do not retry — while it settles.",
+            r.message,
+        )
+    }
+
+    @Test
+    fun `status failed carrying a success code (0) is a contradiction — indeterminate, not failed`() {
+        val (paylod, _) = testClient(
+            listOf(Step(json = paymentJson(status = "failed", resultCode = 0, resultDesc = "ok"))),
+        )
+        val r = paylod.check("pay_123")
+        assertEquals(OutcomeStatus.PENDING, r.status)
+        assertFalse(r.paid)
+        assertFalse(r.retryable)
+    }
+
+    // ── 0.2.0: wait propagates its deadline into each poll's request timeout ────────────────
+
+    @Test
+    fun `caps a poll's per-request timeout to the wait deadline`() {
+        val (paylod, t) = testClient(
+            listOf(
+                Step(status = 202, json = ACK),
+                Step(json = paymentJson(status = "pending")),
+            ),
+        )
+        assertThrows(PaylodTimeoutException::class.java) {
+            paylod.collectAndWait(CollectParams("0712345678", 100), WaitOptions.of(timeoutMs = 8_000))
+        }
+        // The first status read (a GET) is capped to the 8s wait budget, not the 30s per-request default.
+        val firstStatus = t.calls.first { it.method == "GET" }
+        assertTrue(firstStatus.timeoutMs <= 8_000, "expected <= 8000, was ${firstStatus.timeoutMs}")
+    }
 }

@@ -25,6 +25,12 @@ class PaylodOptions private constructor(
      * [PaylodSandboxOnlyException] otherwise, so it can never point at production.
      */
     @JvmField val simulate: Boolean,
+    /**
+     * TEST-ONLY escape hatch: permit a plaintext `http://` [baseUrl] when — and only when — it is a
+     * loopback host (`localhost` / `127.0.0.1` / `::1`). HTTPS is otherwise enforced so the API key is
+     * never sent in the clear. A live (`mp_live_`) key is NEVER allowed over plaintext, even loopback.
+     */
+    @JvmField val allowInsecureBaseUrl: Boolean,
 ) {
     class Builder {
         private var apiKey: String? = null
@@ -34,6 +40,7 @@ class PaylodOptions private constructor(
         private var maxRetries: Int = 2
         private var transport: HttpTransport? = null
         private var simulate: Boolean = false
+        private var allowInsecureBaseUrl: Boolean = false
 
         fun apiKey(value: String?) = apply { this.apiKey = value }
         fun baseUrl(value: String?) = apply { this.baseUrl = value }
@@ -42,9 +49,10 @@ class PaylodOptions private constructor(
         fun maxRetries(value: Int) = apply { this.maxRetries = value }
         fun transport(value: HttpTransport?) = apply { this.transport = value }
         fun simulate(value: Boolean) = apply { this.simulate = value }
+        fun allowInsecureBaseUrl(value: Boolean) = apply { this.allowInsecureBaseUrl = value }
 
         fun build(): PaylodOptions =
-            PaylodOptions(apiKey, baseUrl, webhookSecret, timeoutMs, maxRetries, transport, simulate)
+            PaylodOptions(apiKey, baseUrl, webhookSecret, timeoutMs, maxRetries, transport, simulate, allowInsecureBaseUrl)
     }
 
     companion object {
@@ -68,7 +76,8 @@ class PaylodOptions private constructor(
             maxRetries: Int = 2,
             transport: HttpTransport? = null,
             simulate: Boolean = false,
+            allowInsecureBaseUrl: Boolean = false,
         ): PaylodOptions =
-            PaylodOptions(apiKey, baseUrl, webhookSecret, timeoutMs, maxRetries, transport, simulate)
+            PaylodOptions(apiKey, baseUrl, webhookSecret, timeoutMs, maxRetries, transport, simulate, allowInsecureBaseUrl)
     }
 }
