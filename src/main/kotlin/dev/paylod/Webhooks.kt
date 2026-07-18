@@ -568,6 +568,9 @@ object Webhooks {
      */
     private fun normalizeCode(v: Any?): String? = when (v) {
         null -> null
+        // `v == 0.0` is true for -0.0 as well, which is deliberate: a raw JSON `-0` now survives
+        // the reader as -0.0 rather than as an integral zero, and it must be kept out of the
+        // integer form on this path too — `(-0.0).toLong().toString()` is the literal "0".
         is Double ->
             if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()
         else -> v.toString()

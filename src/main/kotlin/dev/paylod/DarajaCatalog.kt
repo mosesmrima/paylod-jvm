@@ -129,7 +129,17 @@ object DarajaCatalog {
     private fun normalizeCode(resultCode: Any?): String =
         when (resultCode) {
             null -> ""
-            is Double -> if (resultCode == Math.floor(resultCode)) resultCode.toLong().toString() else resultCode.toString()
+            // A whole Double collapses to its integer form for CATALOG LOOKUP, except at zero.
+            // Zero of either sign keeps its own representation so this lookup key can never be the
+            // literal "0": `isCanonicalSuccessCode` is consulted separately and on the ORIGINAL
+            // value, and the impostor branch below relies on the key not already reading as the
+            // success code. -0.0 reaches here now that the JSON reader preserves a raw `-0`.
+            is Double ->
+                if (resultCode == Math.floor(resultCode) && resultCode != 0.0) {
+                    resultCode.toLong().toString()
+                } else {
+                    resultCode.toString()
+                }
             else -> resultCode.toString().trim()
         }
 

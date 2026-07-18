@@ -18,6 +18,19 @@ package dev.paylod.internal
  * The writer accepts the same value shapes plus `Int`/`Short`/`Byte`. It is NOT a general
  * pretty-printer: it emits compact JSON, which is all the API needs.
  */
+/**
+ * Is this the IEEE-754 NEGATIVE zero, as distinct from the ordinary zero?
+ *
+ * `v == 0.0` cannot answer this: -0.0 and 0.0 compare EQUAL under IEEE, which is precisely why a
+ * negative zero slips through arithmetic checks written the obvious way. The sign bit is the only
+ * thing that separates them, so it is read directly rather than inferred from a comparison.
+ *
+ * This matters on the money path because `-0` is one of the values that must never be mistaken for
+ * the canonical Daraja success code `"0"`. See [dev.paylod.DarajaCatalog.isCanonicalSuccessCode].
+ */
+internal fun isNegativeZero(v: Double): Boolean =
+    v == 0.0 && java.lang.Double.doubleToRawLongBits(v) != 0L
+
 internal object Json {
 
     // ── Writing ─────────────────────────────────────────────────────────────────────────────
@@ -36,8 +49,13 @@ internal object Json {
             is Int, is Long, is Short, is Byte -> sb.append(value.toString())
             is Double -> {
                 require(value.isFinite()) { "JSON cannot encode a non-finite number: $value" }
-                // Emit whole doubles without a trailing ".0" so 100.0 serialises as 100.
-                if (value == Math.floor(value) && !value.isInfinite()) {
+                // Negative zero keeps its sign. Collapsing -0.0 to the token `0` would re-create,
+                // on the way OUT, exactly the laundering the reader now refuses to do on the way
+                // in — and it is what made a round-trip through a stub unable to carry the value
+                // at all, hiding the reader's defect from any test built on one.
+                if (isNegativeZero(value)) {
+                    sb.append("-0.0")
+                } else if (value == Math.floor(value) && !value.isInfinite()) {
                     sb.append(value.toLong().toString())
                 } else {
                     sb.append(value.toString())
@@ -325,6 +343,23 @@ internal object Json {
 
             val token = src.substring(start, pos)
             if (!isDouble) {
+                // NEGATIVE ZERO IS NOT THE INTEGER ZERO, AND MUST NOT BECOME IT HERE.
+                //
+                // `"-0".toLong()` is `0L`, so a raw JSON `-0` used to arrive downstream as an
+                // integral zero — indistinguishable from a genuine `0`. That laundering happened
+                // BELOW every check that was written to stop it: `DarajaCatalog.isCanonicalSuccessCode`
+                // explicitly lists `-0` as an impostor and rejects it, but only ever saw a `Long`
+                // 0 that had already lost the sign, so a signed `{"resultCode":-0}` produced
+                // SUCCESS evidence on both the status path and the webhook path. The exact-zero
+                // check was correct; it was reading a value this parser had already normalized.
+                //
+                // The sign is therefore preserved by handing back the `Double` -0.0, which is the
+                // one JVM value that represents negative zero distinctly. It is deliberately NOT
+                // rejected here: `-0` is legal JSON and may appear in an arbitrary `metadata` map
+                // that must round-trip. Rejection belongs at classification, where the canonical
+                // success code is decided — and a `Double` is never the canonical success code,
+                // so it now fails that test exactly like the quoted `"-0"` always did.
+                if (token == "-0") return -0.0
                 token.toLongOrNull()?.let { return it }
             }
             return token.toDoubleOrNull() ?: fail("invalid number '$token'")
