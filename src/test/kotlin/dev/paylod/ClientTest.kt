@@ -641,6 +641,23 @@ class ClientTest {
     }
 
     @Test
+    fun `ceilings a huge Retry-After even when the operation has NO deadline`() {
+        // A bare collect() has no absolute deadline, so there is nothing to clamp against. Without a
+        // ceiling, `Retry-After: 86400` from a broken or hostile intermediary parks the caller's
+        // thread for a full day inside what looks like an ordinary call.
+        val (paylod, _, clock) = testClientWithClock(
+            listOf(Step(status = 429, headers = mapOf("retry-after" to "86400")), Step(status = 202, json = ACK)),
+            maxRetries = 1,
+        )
+        val start = clock.now
+        paylod.collect(CollectParams("0712345678", 100, idempotencyKey = "k1"))
+        // The 86400s ask is ceilinged to 60s. The bound allows for the ordinary jittered backoff that
+        // also runs before the second attempt; what matters is that a DAY did not elapse.
+        val elapsed = clock.now - start
+        assertTrue(elapsed <= 61_000, "slept ${elapsed}ms with no deadline to clamp to")
+    }
+
+    @Test
     fun `clamps a huge Retry-After to the wait deadline instead of overrunning it`() {
         val (paylod, _, clock) = testClientWithClock(
             listOf(
@@ -684,14 +701,40 @@ class ClientTest {
     }
 
     @Test
-    fun `bounds an idempotency key in BYTES, not characters`() {
+    fun `rejects printable NON-ASCII, which no other rule catches`() {
+        val (paylod, t) = testClient(emptyList())
+        // These pass every other check: not blank, no control chars, no invisible/zero-width
+        // characters, well under the length bound. They are still unsendable in an HTTP header.
+        val bad = mapOf(
+            "accented latin" to "ordr-caf\u00e9-1",
+            "CJK" to "order-\u4e2d\u6587-1",
+            "symbol outside latin" to "order-\u2764-1",
+            "cyrillic homoglyph" to "\u043erder-123", // Cyrillic o, indistinguishable from ASCII o
+        )
+        for ((name, k) in bad) {
+            val err = assertThrows(PaylodInvalidRequestException::class.java, {
+                paylod.collect(CollectParams("0712345678", 100, idempotencyKey = k))
+            }, "accepted a key containing $name")
+            assertTrue(err.message!!.contains("printable ASCII"), "unhelpful message: ${err.message}")
+        }
+        // Rejected LOCALLY — nothing was dispatched, so no charge could have been started under a key
+        // the server would have seen differently.
+        assertEquals(0, t.count)
+    }
+
+    @Test
+    fun `bounds an idempotency key length`() {
         val (paylod, _) = testClient(emptyList())
-        // 128 three-byte characters = 384 UTF-8 bytes, but only 128 `String` chars. A char-length
-        // bound would wave this through and let the server truncate it into a colliding key.
-        val key = "中".repeat(128)
-        assertEquals(128, key.length)
+        // Printable ASCII, so it clears every charset rule and reaches the length bound. (With ASCII
+        // enforced, one char is one byte — the byte bound and the char bound now coincide by
+        // construction rather than by accident.)
+        val key = "a".repeat(256)
         assertThrows(PaylodInvalidRequestException::class.java) {
             paylod.collect(CollectParams("0712345678", 100, idempotencyKey = key))
+        }
+        // 255 is the boundary and must still be accepted; it fails later, on the empty step list.
+        assertThrows(IllegalStateException::class.java) {
+            paylod.collect(CollectParams("0712345678", 100, idempotencyKey = "a".repeat(255)))
         }
     }
 

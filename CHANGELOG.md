@@ -54,12 +54,24 @@ golden webhook vector still passes byte-for-byte, and the Java interop suite is 
   plus a pinned clock.
 - **Strict webhook timestamp parsing.** `t` is validated lexically as decimal digits only, so `1e3`,
   `+1000`, `-1000`, `0x3e8` and `1000.0` are malformed rather than coerced by a lenient numeric parse.
+- **BREAKING: idempotency keys must be printable ASCII (0x20-0x7E).** HTTP header values are ASCII on
+  the wire (RFC 9110), but a printable NON-ASCII key (`"ordr-cafe-1"` with an accented e, a CJK or
+  Cyrillic character) passed every other rule below: not blank, no control characters, nothing
+  invisible, well inside the length bound. Such a key either fails to encode at the transport — an
+  error nowhere near its real cause — or, on a laxer stack, is silently re-encoded, so two requests the
+  caller intended to share ONE key arrive carrying different bytes. The server sees two distinct keys
+  and the duplicate-charge guard is gone with no error raised anywhere. Keys are now validated as
+  printable ASCII, with an error naming the offending character. **A caller passing a non-ASCII key
+  will now get a `PaylodInvalidRequestException` where 0.2.0 dispatched the request** — which is the
+  point: the failure moves to the line that caused it, before any charge can start. Found independently
+  by the Python SDK review after the rest of this release landed.
 - **Idempotency key charset tightened.** Rejection now covers the **full** Unicode control ranges
   (C0, C1, DEL) and Unicode-only whitespace / zero-width characters (NBSP, ZWSP, BOM, line separator,
   ideographic space) — a key like `"order-123<ZWSP>"` is visually identical to `"order-123"` in every
   log and dashboard while being a different key on the wire, which is precisely how a "protected"
   retry becomes a second charge. Length is bounded in **UTF-8 bytes** (255), not `String` chars, which
-  is what a server actually counts.
+  is what a server actually counts. (With printable ASCII now enforced, one character is one byte, so
+  the byte bound and the character bound coincide by construction rather than by accident.)
 
 ## [0.2.0] - 2026-07-18
 

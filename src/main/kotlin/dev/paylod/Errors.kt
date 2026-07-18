@@ -48,11 +48,26 @@ private val UNICODE_WHITESPACE_RE = Regex("[\\u00a0\\u1680\\u2000-\\u200f\\u2028
 private const val MAX_IDEMPOTENCY_KEY_BYTES = 255
 
 /**
+ * The only characters an HTTP header value can carry unambiguously: printable US-ASCII, 0x20..0x7E.
+ *
+ * A printable NON-ASCII key (`"ordr-café-1"`) passes every other check here and still breaks the
+ * guarantee. Either the transport refuses to encode it — an obscure failure nowhere near the real
+ * cause — or a laxer stack silently re-encodes it, and two requests the caller intended to share ONE
+ * key arrive carrying different bytes. The server sees two distinct keys, and the duplicate-charge
+ * guard is gone without a single error anywhere. Refuse it here, where the message can say why.
+ */
+private val PRINTABLE_ASCII_RE = Regex("^[\\u0020-\\u007e]+$")
+
+/**
  * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace keys,
- * keys carrying control characters or invisible Unicode (neither of which survives an HTTP header
- * round-trip intact), and over-long values. A caller-supplied key is the ONE thing standing between a
- * double-click and a double-charge, so a bad one must fail loudly rather than be quietly accepted.
- * Shared by `collect()` and `simulate.collect()`.
+ * keys carrying control characters or invisible Unicode, anything outside printable US-ASCII (none of
+ * which survives an HTTP header round-trip intact), and over-long values. A caller-supplied key is the
+ * ONE thing standing between a double-click and a double-charge, so a bad one must fail loudly rather
+ * than be quietly accepted. Shared by `collect()` and `simulate.collect()`.
+ *
+ * The checks run narrowest-first: the printable-ASCII rule below subsumes the control-character and
+ * invisible-Unicode rules, but those fire first so the caller gets a message naming the actual problem
+ * instead of a generic "not ASCII".
  */
 internal fun assertValidIdempotencyKey(key: String) {
     if (key.isBlank()) {
@@ -71,6 +86,18 @@ internal fun assertValidIdempotencyKey(key: String) {
         throw PaylodInvalidRequestException(
             "idempotencyKey must not contain non-ASCII whitespace or zero-width/invisible characters " +
                 "(NBSP, zero-width space, BOM, …) — they make two different keys look identical.",
+        )
+    }
+    if (!PRINTABLE_ASCII_RE.matches(key)) {
+        val offending = key.first { it.code < 0x20 || it.code > 0x7e }
+        throw PaylodInvalidRequestException(
+            "idempotencyKey must be printable ASCII only (0x20-0x7E) — found '%c' (U+%04X). HTTP header "
+                .format(offending, offending.code) +
+                "values are ASCII on the wire, so a key like \"ordr-café-1\" either fails to encode at " +
+                "the transport (an error nowhere near this line) or gets silently re-encoded — and two " +
+                "requests you intended to share ONE key then arrive with different bytes, dropping the " +
+                "double-charge guard with no error at all. Use A-Z a-z 0-9 and punctuation; a UUID is " +
+                "the safest choice.",
         )
     }
     val bytes = key.toByteArray(Charsets.UTF_8).size
