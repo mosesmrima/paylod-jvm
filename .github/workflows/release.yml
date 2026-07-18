@@ -1,0 +1,102 @@
+name: Release
+
+# THIS WORKFLOW DOES NOT PUBLISH. Read RELEASING.md before changing that.
+#
+# Maven Central (Sonatype) does NOT support GitHub OIDC trusted publishing the way npm and PyPI
+# do. Releasing `dev.paylod:paylod` requires two things the owner has not set up yet:
+#
+#   1. A Sonatype Central account with the `dev.paylod` namespace verified.
+#   2. A GPG signing key (Central rejects unsigned artifacts).
+#
+# Rather than ship a publish step wired to secrets that do not exist -- which would fail at the
+# worst possible moment, or worse, appear to work -- this workflow does the honest half: it
+# builds, tests, and produces the exact artifact set Central expects (jar, sources, javadoc, POM)
+# into the in-project staging repo. The publish step below is commented out and is NOT
+# credential-complete. Uncommenting it is not sufficient; see RELEASING.md.
+#
+# The trigger is still the narrowest one (published GitHub Release, gated behind a `maven-central`
+# environment) so that when publishing IS wired up, the safety posture is already correct and the
+# only change is enabling the final step.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  # id-token: write is NOT requested. Nothing here consumes an OIDC token, because Sonatype
+  # cannot accept one. Adding it would imply a trusted-publishing path that does not exist.
+
+jobs:
+  build:
+    name: Verify and stage artifacts (no publish)
+    runs-on: ubuntu-latest
+    environment: maven-central
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Guard against staging 0.5.0 under a v0.4.0 tag. gradle.properties is the single source of
+      # truth for the published coordinates (build.gradle.kts reads it rather than restating it),
+      # so that is what the tag is checked against.
+      - name: Verify release tag matches project version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          project_version=$(grep -E '^version=' gradle.properties | cut -d= -f2- | tr -d '[:space:]')
+          tag_version="${RELEASE_TAG#v}"
+          echo "release tag:      $RELEASE_TAG (normalised: $tag_version)"
+          echo "project version:  $project_version"
+          if [ -z "$project_version" ]; then
+            echo "::error::Could not read 'version' from gradle.properties." >&2
+            exit 1
+          fi
+          if [ "$tag_version" != "$project_version" ]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match gradle.properties version '$project_version'. Refusing to proceed." >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: ./gradlew test --no-daemon
+
+      - name: Build (jar, sources jar, javadoc jar)
+        run: ./gradlew build --no-daemon
+
+      - name: Stage artifacts to build/repo
+        run: ./gradlew publishMavenPublicationToLocalStagingRepository --no-daemon
+
+      - name: Upload staged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-staging-${{ github.event.release.tag_name }}
+          path: build/repo
+          if-no-files-found: error
+
+      - name: Publishing is not automated
+        run: |
+          echo "Built and staged dev.paylod:paylod locally. NOTHING was published."
+          echo "Maven Central publishing is not wired up; see RELEASING.md."
+
+      # ---------------------------------------------------------------------------------------
+      # NOT ACTIVE. Do not uncomment until every item in RELEASING.md is done. This is a sketch of
+      # the shape the step will take, not a working step -- the secrets it names do not exist, the
+      # `dev.paylod` namespace is unverified, and build.gradle.kts has no Central repository
+      # configured (it publishes to build/repo only, and signing is `isRequired = false`).
+      #
+      # - name: Publish to Maven Central
+      #   env:
+      #     ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+      #     ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+      #     ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_SIGNING_KEY }}
+      #     ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+      #   run: ./gradlew publishToMavenCentral --no-daemon
+      # ---------------------------------------------------------------------------------------
