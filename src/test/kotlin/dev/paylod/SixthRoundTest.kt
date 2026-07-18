@@ -333,6 +333,109 @@ class SixthRoundTest {
         )
     }
 
+    // ══ Sibling findings — VERIFIED here rather than assumed ═════════════════════════════════
+
+    @Test
+    @Tag("nv-wh-decoded-canonical")
+    fun `every decoded field comes from the canonical catalog, never from the payload`() {
+        // The round-5 fix recomputes `decoded` from the signed result code. This asserts the
+        // property WHOLE rather than for `retryable` alone: a payload-supplied `decoded` block is
+        // ignored in EVERY field, so nothing a hostile signer writes there is ever handed back.
+        // 1001 is chosen deliberately: the canonical table marks it NON-retryable (a transaction is
+        // already in process for this number — charging again is exactly the wrong move), while the
+        // payload below claims `retryable: true`. The two DISAGREE, so this fixture actually
+        // discriminates. A code whose catalog value happened to match the payload would prove
+        // nothing about where the value came from.
+        val lie =
+            """{"code":"9999","title":"Totally fine","cause":"none","fix":"just retry",""" +
+                """"category":"network","retryable":true,"customerMessage":"Please try again"}"""
+        val body =
+            """{"type":"payment.failed","created":$now,"data":{"paymentId":"pay_1",""" +
+                """"status":"failed","amount":100,"resultCode":1001,"resultDesc":"in process",""" +
+                """"decoded":$lie}}"""
+        val event = Webhooks.parseAndVerifyAt(
+            body, Webhooks.sign(body, secret, now), secret, Webhooks.DEFAULT_TOLERANCE_SEC, now,
+        )
+        val decoded = event.data.decoded!!
+        val canonical = DarajaCatalog.decodeError("1001", "in process")
+
+        // The payload said `retryable: true`, which a handler doing the documented
+        // `if (decoded.retryable) recharge()` would act on. The catalog says false for 1001.
+        assertFalse(decoded.retryable, "retryable must come from the catalog, not the payload")
+        assertEquals(canonical.retryable, decoded.retryable)
+        assertEquals(canonical.code, decoded.code)
+        assertEquals(canonical.title, decoded.title)
+        assertEquals(canonical.cause, decoded.cause)
+        assertEquals(canonical.fix, decoded.fix)
+        assertEquals(canonical.category, decoded.category)
+        assertEquals(canonical.customerMessage, decoded.customerMessage)
+
+        // Nothing the payload asserted survives anywhere in the block.
+        assertNotEquals("9999", decoded.code)
+        assertNotEquals("Totally fine", decoded.title)
+        assertNotEquals("Please try again", decoded.customerMessage)
+
+        // A MISSING `decoded` block is synthesized from the same catalog, not passed through as null.
+        val noBlock =
+            """{"type":"payment.failed","created":$now,"data":{"paymentId":"pay_1",""" +
+                """"status":"failed","amount":100,"resultCode":1001,"resultDesc":"in process"}}"""
+        val synthesized = Webhooks.parseAndVerifyAt(
+            noBlock, Webhooks.sign(noBlock, secret, now), secret, Webhooks.DEFAULT_TOLERANCE_SEC, now,
+        ).data.decoded
+        assertNotNull(synthesized, "a missing decoded block must be synthesized from the catalog")
+        assertEquals(canonical.code, synthesized!!.code)
+        assertFalse(synthesized.retryable)
+    }
+
+    @Test
+    @Tag("nv-wh-failed-notfailed")
+    fun `a signed payment failed whose data assesses as pending or indeterminate is refused`() {
+        // The event type is a CLAIM. A `payment.failed` must be backed by a record that actually
+        // assesses as FAILED — not one the model reads as still in flight, and not one it cannot
+        // read either way. Delivering either as a settled failure is how a paid customer is
+        // charged again.
+        //
+        // 4999 is the genuinely still-in-flight code (catalog category PENDING — "still waiting
+        // for the customer's PIN"). `failed` + IN_FLIGHT contradicts, so the model returns
+        // INDETERMINATE and the event must be refused rather than handed to a handler. 1037 and
+        // 1032 are NOT in-flight despite reading like timeouts — they classify as terminal
+        // failures — which is exactly why the code under test has to be checked against the
+        // catalog rather than against an intuition about what a code name means.
+        val inFlight =
+            """{"type":"payment.failed","created":$now,"data":{"paymentId":"pay_1",""" +
+                """"status":"failed","amount":100,"resultCode":4999}}"""
+        val err = assertThrows<PaylodSignatureVerificationException>(
+            "a failure notice carrying an in-flight code must not be delivered",
+        ) {
+            Webhooks.parseAndVerifyAt(
+                inFlight, Webhooks.sign(inFlight, secret, now), secret,
+                Webhooks.DEFAULT_TOLERANCE_SEC, now,
+            )
+        }
+        assertEquals(SignatureFailureReason.INVALID_PAYLOAD, err.reason)
+
+        // A receipt beside a failure claim is CONFLICT -> INDETERMINATE, and likewise refused.
+        val withReceipt =
+            """{"type":"payment.failed","created":$now,"data":{"paymentId":"pay_1",""" +
+                """"status":"failed","amount":100,"resultCode":1032,"mpesaReceipt":"QK12345678"}}"""
+        assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.parseAndVerifyAt(
+                withReceipt, Webhooks.sign(withReceipt, secret, now), secret,
+                Webhooks.DEFAULT_TOLERANCE_SEC, now,
+            )
+        }
+
+        // A genuine terminal failure is still delivered, so this is a tightening and not a refusal
+        // of the whole event type.
+        val genuine =
+            """{"type":"payment.failed","created":$now,"data":{"paymentId":"pay_1",""" +
+                """"status":"failed","amount":100,"resultCode":1032}}"""
+        val ok = Webhooks.parseAndVerifyAt(
+            genuine, Webhooks.sign(genuine, secret, now), secret, Webhooks.DEFAULT_TOLERANCE_SEC, now,
+        )
+        assertEquals(PaymentStatus.FAILED, ok.data.status)
+    }
+
     // ══ 5 — a rejected baseUrl is not echoed verbatim into an exception message ═══════════════
 
     @Test
