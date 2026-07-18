@@ -16,9 +16,28 @@ The sibling Node harness caught three flaws of its own, the worst being selector
 ZERO tests while the runner still exited 0 — which reads as "the mutation was not caught" when in
 truth nothing ever ran. Gradle has exactly the same failure mode, and worse: `gradlew -q` with a
 tag that matches nothing prints nothing and exits 0. So every run here goes through
-`--console=plain`, the build emits a machine-readable `NVCOUNT tests=N failed=M` line from a real
-test listener, and a case is only trusted once its tag is shown to select N > 0 tests that all
+`--console=plain`, the build emits a machine-readable `NVCOUNT tests=N failed=M skipped=S` line from
+a real test listener, and a case is only trusted once its tag is shown to select N > 0 tests that all
 PASS on clean source. Anything else is reported as a broken case rather than a verdict.
+
+── What a TRUSTED run requires (both the clean run and the mutated one) ──────────────────────
+The harness itself had this defect for a while, and it is the worst kind: it made the harness
+report CAUGHT for work it had not actually verified. It scraped the `NVCOUNT` line and stopped
+there — ignoring the gradle EXIT CODE and the SKIPPED count that the same line already carried.
+
+  • Exit code. Under `-PnvTag` the test task sets `ignoreFailures`, so a tagged run exits 0 even
+    when its tests fail; failure travels through the counters. A NON-zero exit therefore never
+    means "a test failed" — it means the build did not finish, and its counters describe a
+    partial run. `NVCOUNT` is printed from `doLast` and was happily scraped out of exactly such
+    a run, so a crashed build could be accepted as a measurement, and if it crashed after some
+    tests had failed it was accepted as CAUGHT.
+
+  • Skipped. `ran` counts a skipped test, so a case whose guarding test was disabled or filtered
+    still cleared the liveness gate and then "passed" the mutated run without executing — the
+    precise vacuity this harness exists to detect, wearing a green badge.
+
+So every measurement now requires EXIT CODE ZERO **and** ZERO SKIPPED TESTS, on both runs. Every
+number the verdict rests on is printed in the final table.
 """
 
 import os
@@ -456,17 +475,70 @@ CASES = [
 COUNT_RE = re.compile(r"NVCOUNT tests=(\d+) failed=(\d+) skipped=(\d+)")
 
 
+class Run:
+    """One gradle invocation, kept WITH its exit code so a verdict can never be read off the
+    counters alone. `trusted` is the single gate every classification below goes through."""
+
+    def __init__(self, rc, ran, failed, skipped):
+        self.rc = rc
+        self.ran = ran
+        self.failed = failed
+        self.skipped = skipped
+
+    @property
+    def reported(self):
+        return self.ran is not None
+
+    @property
+    def trusted(self):
+        # Exit code zero is the EXPECTED code even for a run whose tests failed, because the test
+        # task sets `ignoreFailures` under -PnvTag. So non-zero here is never "a test failed" —
+        # it is the build not finishing, and its counters describe a partial run.
+        return self.reported and self.rc == 0
+
+    def describe(self):
+        if not self.reported:
+            return f"exit={self.rc}, no NVCOUNT line"
+        return f"exit={self.rc}, tests={self.ran}, failed={self.failed}, skipped={self.skipped}"
+
+
 def run_tag(tag):
-    """Run only the tests carrying `tag`. Returns (ran, failed) or None if the build broke."""
+    """
+    Run only the tests carrying `tag`.
+
+    Returns (ran, failed, skipped), or None when the RUN ITSELF is untrustworthy.
+
+    ── Why the exit code is load-bearing here ────────────────────────────────────────────────
+    This used to return as soon as it found an `NVCOUNT` line, ignoring both `proc.returncode`
+    and the skipped count the line already carried. Both omissions manufacture false verdicts:
+
+      • The build task sets `ignoreFailures = (nvTag != null)`, so a tagged run exits 0 EVEN
+        WHEN TESTS FAIL — failure is reported through the NVCOUNT counters, not the exit status.
+        A non-zero exit therefore never means "a test failed"; it means the build itself broke
+        (compile error, daemon death, OOM, an exception in `doLast`). But `NVCOUNT` is emitted
+        from `doLast` and is happily scraped out of a partially-completed build, so a crashed
+        run that got far enough to print the line was accepted as a measurement. On a MUTATED
+        run that reads as `failed=0` -> VACUOUS at best, and if the crash came after some tests
+        failed, as CAUGHT — a "caught" verdict produced by a build that did not finish.
+
+      • A SKIPPED test is not a live selector. `ran` counts it, so a case whose guarding test was
+        disabled, filtered, or aborted by an assumption still reported `ran > 0` and passed the
+        liveness gate — and then "passed" the mutated run without ever executing, which is
+        precisely the vacuity this harness exists to detect, wearing a green badge.
+
+    So a trusted measurement now requires exit code ZERO **and** zero skipped tests, on the clean
+    run and the mutated run alike. Anything else is classified as broken rather than as a verdict.
+    """
     proc = subprocess.run(
         ["./gradlew", "test", "--console=plain", "--rerun-tasks", f"-PnvTag={tag}"],
         cwd=ROOT, capture_output=True, text=True, timeout=900,
     )
     out = proc.stdout + proc.stderr
     m = COUNT_RE.search(out)
+    rc = proc.returncode
     if not m:
-        return None
-    return int(m.group(1)), int(m.group(2))
+        return Run(rc, None, None, None)
+    return Run(rc, int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
 def read(rel):
@@ -486,15 +558,22 @@ for case in CASES:
 
     # 1. THE SELECTOR MUST BE LIVE. A tag matching nothing exits 0 and reads as "not caught".
     live = run_tag(tag)
-    if live is None:
-        results.append((case, "BROKEN-BUILD", "clean source did not build/report"))
+    if not live.trusted:
+        results.append((case, "BROKEN-BUILD", "clean run not trustworthy", live, None))
         continue
-    ran, failed = live
-    if ran == 0:
-        results.append((case, "BROKEN-SELECTOR", "tag matches 0 tests"))
+    if live.ran == 0:
+        results.append((case, "BROKEN-SELECTOR", "tag matches 0 tests", live, None))
         continue
-    if failed:
-        results.append((case, "BROKEN-SELECTOR", f"{failed} test(s) already fail on clean source"))
+    if live.skipped:
+        # A skipped test cannot catch anything. Counting it as live is how a disabled guard keeps
+        # reporting CAUGHT.
+        results.append((case, "BROKEN-SELECTOR",
+                        f"{live.skipped} of {live.ran} selected test(s) were SKIPPED on clean source",
+                        live, None))
+        continue
+    if live.failed:
+        results.append((case, "BROKEN-SELECTOR",
+                        f"{live.failed} test(s) already fail on clean source", live, None))
         continue
 
     # 2. THE ANCHORS MUST BE UNIQUE. Otherwise a no-op edit looks like a caught mutation.
@@ -505,13 +584,14 @@ for case in CASES:
             originals[rel] = read(rel)
         if originals[rel].count(find) != 1:
             results.append((case, "BROKEN-ANCHOR",
-                            f"{rel} matched {originals[rel].count(find)}x"))
+                            f"{rel} matched {originals[rel].count(find)}x", live, None))
             anchors_ok = False
             break
     if not anchors_ok:
         continue
 
     # 3. REVERT, RUN, RESTORE.
+    after = None
     try:
         mutated = dict(originals)
         for rel, find, repl in case["edits"]:
@@ -520,33 +600,41 @@ for case in CASES:
             write(rel, text)
 
         after = run_tag(tag)
-        if after is None:
-            status, detail = "BROKEN-MUTATION", "mutated source did not compile"
+        if not after.trusted:
+            status, detail = "BROKEN-MUTATION", "mutated run not trustworthy"
+        elif after.skipped > 0:
+            # Tests that did not run cannot have caught the mutation, whatever the failure count
+            # says about the ones that did.
+            status = "BROKEN-MUTATION"
+            detail = f"{after.skipped} of {after.ran} test(s) SKIPPED after mutation"
+        elif after.ran == 0:
+            status, detail = "BROKEN-SELECTOR", "0 tests ran after mutation"
+        elif after.failed > 0:
+            status = "CAUGHT"
+            detail = f"{after.failed} of {after.ran} test(s) failed"
         else:
-            m_ran, m_failed = after
-            if m_failed > 0:
-                status = "CAUGHT"
-                detail = f"{m_failed} of {m_ran} test(s) failed"
-            elif m_ran == 0:
-                status, detail = "BROKEN-SELECTOR", "0 tests ran after mutation"
-            else:
-                status, detail = "VACUOUS", f"all {m_ran} test(s) still PASSED"
+            status, detail = "VACUOUS", f"all {after.ran} test(s) still PASSED"
     finally:
         for rel, text in originals.items():
             write(rel, text)
 
-    results.append((case, status, f"{detail}; selector covers {ran} test(s)"))
+    results.append((case, status, f"{detail}; selector covers {live.ran} test(s)", live, after))
     # Report AS WE GO, flushed. The table used to be printed only at the very end, so a run that
     # was interrupted — and a full pass takes a while — produced nothing at all, discarding every
     # case it had already settled. Progress that only exists at the end is progress you can lose.
     print(f"[{len(results)}/{len(CASES)}] {case['id']:<24} {status:<16} {detail}", flush=True)
 
-print("\n| id | reverted protection | guarding tag | result |")
-print("| --- | --- | --- | --- |")
-for case, status, detail in results:
-    print(f"| {case['id']} | {case['what']} | {case['tag']} | {status} ({detail}) |")
+# The table shows BOTH runs in full — exit code, tests, failed, skipped — because those are the
+# numbers the verdict is derived from, and a verdict whose inputs are not shown is a verdict you
+# have to take on trust.
+print("\n| id | reverted protection | guarding tag | clean run | mutated run | result |")
+print("| --- | --- | --- | --- | --- | --- |")
+for case, status, detail, live, after in results:
+    clean = live.describe() if live else "not run"
+    mutated = after.describe() if after else "not run"
+    print(f"| {case['id']} | {case['what']} | {case['tag']} | {clean} | {mutated} | {status} ({detail}) |")
 
-bad = [(c, s) for c, s, _ in results if s != "CAUGHT"]
+bad = [(c, s) for c, s, _, _, _ in results if s != "CAUGHT"]
 print(f"\n{len(results) - len(bad)}/{len(results)} mutations caught.")
 if bad:
     print("NOT ALL MUTATIONS CAUGHT: " + ", ".join(f"{c['id']}={s}" for c, s in bad),
