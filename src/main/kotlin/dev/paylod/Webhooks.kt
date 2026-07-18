@@ -124,6 +124,31 @@ object Webhooks {
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
         nowSec: Long? = null,
     ): WebhookEvent {
+        val root = verifySignature(payload, signature, secret, toleranceSec, nowSec)
+        assertEventSchema(root)
+        return toEvent(root)
+    }
+
+    /**
+     * Verify ONLY the signature and return the parsed JSON body, without the event-schema checks.
+     *
+     * This is the signature layer on its own. It exists because the two questions are genuinely
+     * separate — "did paylod send these bytes?" and "do these bytes mean what my handler assumes?" —
+     * and because the cross-repo golden vector pins the SIGNING SCHEME with a minimal fixture that
+     * is deliberately not a representative event.
+     *
+     * Production handlers should call [parseAndVerify]: a verified signature alone is not a licence
+     * to act on a body.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun verifySignature(
+        payload: ByteArray,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
+        nowSec: Long? = null,
+    ): Map<String, Any?> {
         if (secret.isEmpty()) {
             throw PaylodSignatureVerificationException(
                 SignatureFailureReason.MISSING_SIGNATURE,
@@ -208,16 +233,22 @@ object Webhooks {
                 "Webhook body is signed correctly but is not valid JSON.",
             )
         }
-        if (parsedBody !is Map<*, *> || parsedBody["type"] !is String || parsedBody["data"] !is Map<*, *>) {
-            throw PaylodSignatureVerificationException(
-                SignatureFailureReason.INVALID_PAYLOAD,
-                "Webhook body is not a paylod event (missing `type`/`data`).",
-            )
-        }
-
         @Suppress("UNCHECKED_CAST")
-        return toEvent(parsedBody as Map<String, Any?>)
+        return parsedBody as? Map<String, Any?> ?: invalid("the body is not a JSON object")
     }
+
+    /** String overload of [verifySignature]. */
+    @JvmStatic
+    @JvmOverloads
+    fun verifySignature(
+        payload: String,
+        signature: String?,
+        secret: String,
+        toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
+        nowSec: Long? = null,
+    ): Map<String, Any?> = verifySignature(
+        payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec,
+    )
 
     @JvmStatic
     @JvmOverloads
@@ -265,6 +296,122 @@ object Webhooks {
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
         nowSec: Long? = null,
     ): Boolean = verify(payload.toByteArray(StandardCharsets.UTF_8), signature, secret, toleranceSec, nowSec)
+
+    /** Reject with a consistent, non-leaking message. */
+    private fun invalid(detail: String): Nothing = throw PaylodSignatureVerificationException(
+        SignatureFailureReason.INVALID_PAYLOAD,
+        "Webhook body is signed correctly but is not a valid paylod event: $detail. A signature " +
+            "proves WHO sent the body, not that the body MEANS what your handler assumes — so the " +
+            "event is rejected rather than passed on half-understood.",
+    )
+
+    private fun optionalString(v: Any?, field: String) {
+        if (v != null && v !is String) invalid("$field is not a string")
+    }
+
+    /**
+     * Validate the FULL event schema, then its internal consistency, then its evidence.
+     *
+     * ── Why this exists ───────────────────────────────────────────────────────────────────
+     * The previous version checked that `type` was a String and `data` was a Map, then built a
+     * [WebhookEvent] out of whatever else had arrived — coercing every remaining field with
+     * `toString()` / `as?` / `?: ""`. So `event.data.status`, `event.data.amount` and
+     * `event.data.mpesaReceipt` were typed as `PaymentStatus?`, `Int?` and `String?` while actually
+     * being whatever the sender felt like. A handler written against those types — which is every
+     * handler, because that is what the types are FOR — would branch on
+     * `data.status == PaymentStatus.SUCCESS` and fulfil an order on a field nothing had checked.
+     *
+     * A valid signature does NOT make that safe. It proves the body came from paylod; it says
+     * nothing about whether the body is COHERENT. A bug upstream, a partially-written row, a schema
+     * change, or a compromised signing key all produce correctly-signed nonsense, and the handler is
+     * the last place that can refuse it.
+     *
+     * Three layers:
+     *   1. SHAPE       — every field present is the type the data class promises.
+     *   2. CONSISTENCY — `type` and `data.status` must agree. A `payment.success` carrying
+     *                    `status: "failed"` is not an event we can act on in either direction.
+     *   3. EVIDENCE    — a `payment.success` must satisfy the SAME semantic model a status read
+     *                    does. The event type is a CLAIM, and a claim is not evidence for itself:
+     *                    this is law L2 from `Semantics.kt`, applied to the delivery channel that
+     *                    most often triggers order fulfilment. Reusing [PaymentSemantics.judge]
+     *                    rather than re-deriving the rule is the whole point of having a model —
+     *                    the webhook path and the status-read path cannot drift into disagreeing
+     *                    about what proves a payment.
+     */
+    private fun assertEventSchema(root: Map<String, Any?>) {
+        val type = root["type"]
+        if (type != "payment.success" && type != "payment.failed") {
+            invalid("type was \"$type\", expected payment.success or payment.failed")
+        }
+        val created = root["created"]
+        if (created !is Number || created.toLong() < 0 || created.toDouble() != Math.floor(created.toDouble())) {
+            invalid("created is not a non-negative whole number of unix seconds")
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        val data = root["data"] as? Map<String, Any?> ?: invalid("data is not an object")
+
+        val paymentId = data["paymentId"]
+        if (paymentId !is String || paymentId.isBlank()) invalid("data.paymentId is missing or empty")
+
+        val status = data["status"]
+        if (status !is String) invalid("data.status is missing or is not a string")
+        val parsedStatus = PaymentStatus.parseWire(status)
+            ?: invalid("data.status was \"$status\", not one of pending/success/failed")
+
+        val amount = data["amount"]
+        if (amount !is Number) invalid("data.amount is not a number")
+
+        val envValue = data["env"]
+        if (envValue != null && envValue != "sandbox" && envValue != "production") {
+            invalid("data.env was \"$envValue\", expected sandbox or production")
+        }
+        optionalString(data["applicationId"], "data.applicationId")
+        optionalString(data["phone"], "data.phone")
+        optionalString(data["accountRef"], "data.accountRef")
+        optionalString(data["mpesaReceipt"], "data.mpesaReceipt")
+        optionalString(data["checkoutRequestId"], "data.checkoutRequestId")
+        optionalString(data["resultDesc"], "data.resultDesc")
+        val resultCode = data["resultCode"]
+        if (resultCode != null && resultCode !is String && resultCode !is Number) {
+            invalid("data.resultCode is neither a string/number nor null")
+        }
+
+        // 2. CONSISTENCY.
+        val expectedStatus = if (type == "payment.success") PaymentStatus.SUCCESS else PaymentStatus.FAILED
+        if (parsedStatus != expectedStatus) {
+            invalid(
+                "type is \"$type\" but data.status is \"$status\" — the event contradicts itself, " +
+                    "so neither field can be trusted",
+            )
+        }
+
+        // 3. EVIDENCE, via the one semantic model.
+        val judgement = PaymentSemantics.judge(
+            Payment(
+                id = paymentId,
+                status = parsedStatus,
+                mpesaReceipt = data["mpesaReceipt"] as? String,
+                resultCode = normalizeCode(resultCode),
+                resultDesc = data["resultDesc"] as? String,
+            ),
+        )
+        if (type == "payment.success" && judgement.verdict != PaymentVerdict.PAID) {
+            invalid(
+                "it announces a successful payment but the record does not prove one " +
+                    "(${judgement.reason}). Refusing to hand your handler an unevidenced success — " +
+                    "that is how an order gets fulfilled for a payment that never settled",
+            )
+        }
+        if (type == "payment.failed" && judgement.verdict != PaymentVerdict.FAILED) {
+            invalid(
+                "it announces a failed payment but the record does not support that " +
+                    "(${judgement.reason}). In particular a failure notice carrying a RECEIPT, or " +
+                    "one carrying a still-in-flight result code, must not be delivered as a settled " +
+                    "failure — acting on it is how a paid customer gets charged again",
+            )
+        }
+    }
 
     private fun asString(v: Any?): String? = v?.toString()
 

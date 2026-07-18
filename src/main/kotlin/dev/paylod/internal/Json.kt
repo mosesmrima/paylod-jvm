@@ -149,6 +149,20 @@ internal object Json {
                 val key = parseString()
                 skipWhitespace()
                 expect(':')
+                // A REPEATED OBJECT NAME IS FATAL.
+                //
+                // RFC 8259 calls duplicate names merely "unpredictable", and last-value-wins — what
+                // `out[key] = …` did silently — is the most common choice. On a payments path that
+                // is a parser-differential attack surface: `{"id":"pay_A","id":"pay_B"}` binds
+                // against whichever name the SDK kept, while an upstream proxy, a WAF, a logger, or
+                // the server's own parser may have kept the OTHER one. The same body then means two
+                // different payments to two different readers, and the fields at stake are exactly
+                // the ones money depends on — the id the response is bound to, the status claim, the
+                // receipt and the result code that constitute the evidence. A document whose meaning
+                // depends on which parser reads it is not a document we can act on.
+                if (out.containsKey(key)) {
+                    fail("duplicate object name \"$key\" — a repeated key makes the body's meaning depend on which parser reads it")
+                }
                 out[key] = parseValue()
                 skipWhitespace()
                 when (val c = next()) {

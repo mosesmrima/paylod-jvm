@@ -2,6 +2,7 @@ package dev.paylod
 
 import dev.paylod.internal.Json
 import dev.paylod.internal.RealTimeSource
+import dev.paylod.internal.Redactor
 import dev.paylod.internal.TimeSource
 import java.net.URI
 import java.net.URLEncoder
@@ -49,8 +50,14 @@ class Paylod internal constructor(
     private val webhookSecret: String?
     private val timeoutMs: Long
     private val maxRetries: Int
-    private val transport: HttpTransport
+    private val transport: Transport
     private val simulateMode: Boolean
+
+    /**
+     * Scrubs this client's own secrets out of anything derived from a response before it can reach
+     * an exception message, a public `body` field, or a log sink.
+     */
+    private val redact: Redactor
 
     /**
      * The sandbox simulator: drive a payment to any of the five outcomes from a test file, with no
@@ -61,7 +68,7 @@ class Paylod internal constructor(
 
     init {
         val env: (String) -> String? = { System.getenv(it) }
-        val key = apiKeyArg ?: options.apiKey ?: env("PAYLOD_API_KEY")
+        val key = apiKeyArg ?: options.apiKeyOrNull() ?: env("PAYLOD_API_KEY")
         if (key == null || key.trim().isEmpty()) {
             throw PaylodConfigException(
                 "No paylod API key. Pass one — Paylod(System.getenv(\"PAYLOD_API_KEY\")) — or set " +
@@ -79,16 +86,46 @@ class Paylod internal constructor(
         // Reject a plaintext / non-canonical origin BEFORE any key can leave the process. Loopback
         // HTTP is allowed only behind an explicit test-only flag, and never with a live key.
         assertSecureBaseUrl(baseUrl, apiKey, options.allowInsecureBaseUrl)
-        webhookSecret = options.webhookSecret ?: env("PAYLOD_WEBHOOK_SECRET")
+        webhookSecret = options.webhookSecretOrNull() ?: env("PAYLOD_WEBHOOK_SECRET")
         timeoutMs = options.timeoutMs
         maxRetries = options.maxRetries
-        transport = options.transport ?: JdkHttpTransport()
+        redact = Redactor(listOf(apiKey, webhookSecret))
+
+        // ── ROOT 1: the custom-transport gate ────────────────────────────────────────────────
+        // A custom HttpTransport is a TEST SEAM. It is refused unless it was asked for explicitly,
+        // and refused outright for a production key. This is the same posture `allowInsecureBaseUrl`
+        // already had, and it is enforced HERE and AGAIN inside `Transport` — reverting either one
+        // alone must not open the hole, because a guarantee with a single implementation is a
+        // guarantee with a single point of failure.
+        val custom = options.transportOrNull()
+        if (custom != null && !options.allowCustomTransport) {
+            throw PaylodConfigException(
+                "A custom HttpTransport was supplied without allowCustomTransport = true. It is a " +
+                    "TEST-ONLY seam, not a production extension point: the SDK pins its own origin " +
+                    "and never follows a redirect, and it will not delegate a charge path to code it " +
+                    "cannot make those promises about. Set allowCustomTransport = true in a test, or " +
+                    "drop the transport.",
+            )
+        }
+        if (custom != null && apiKey.startsWith("mp_live_")) {
+            throw PaylodConfigException(
+                "A custom HttpTransport may never be used with an mp_live_ key. The API key is a " +
+                    "bearer credential; a live charge path must run through the SDK's own dispatch.",
+            )
+        }
+        transport = Transport(apiKey, baseUrl, custom, redact)
 
         // Simulator mode is a TEST posture, fenced off from production at CONSTRUCTION time.
         simulateMode = options.simulate
         if (simulateMode) assertSandboxKey(apiKey, "Paylod(options.simulate = true)")
 
-        simulate = Simulator(apiKey) { method, path, body, idem -> request(method, path, body, idem) }
+        simulate = Simulator(
+            apiKey = apiKey,
+            redact = redact,
+            requester = { method, path, body, idem, validate ->
+                request(method, path, body, idem, null, validate)
+            },
+        )
     }
 
     /** Construct with an explicit API key (or `null` to read `PAYLOD_API_KEY`) and options. */
@@ -98,7 +135,7 @@ class Paylod internal constructor(
 
     /** Everything-in-one-object form. */
     constructor(options: PaylodOptions) :
-        this(options.apiKey, options, RealTimeSource, java.util.Random())
+        this(options.apiKeyOrNull(), options, RealTimeSource, java.util.Random())
 
     // ── HTTP ────────────────────────────────────────────────────────────────────────────────
 
@@ -110,7 +147,6 @@ class Paylod internal constructor(
         deadlineMs: Long? = null,
         validate: ((Map<String, Any?>, Int) -> Unit)? = null,
     ): Map<String, Any?> {
-        val url = "$baseUrl$path"
         var lastError: PaylodException? = null
 
         // Serialize the body ONCE, before the retry loop. Re-serialising on each attempt would let a
@@ -131,18 +167,20 @@ class Paylod internal constructor(
                 perRequestTimeout = Math.min(perRequestTimeout, remaining)
             }
 
-            val headers = LinkedHashMap<String, String>()
-            headers["authorization"] = "Bearer $apiKey"
-            headers["accept"] = "application/json"
-            if (body != null) headers["content-type"] = "application/json"
-            if (idempotencyKey != null) headers["idempotency-key"] = idempotencyKey
-
-            // Wrapped so that PRINTING the header map — `spec.headers.toString()`, a string template,
-            // a structured-log field dump — can never render the bearer token. Lookups are unaffected.
-            val spec = HttpRequestSpec(method, url, RedactingHeaders(headers), bodyStr, perRequestTimeout)
-
-            val response: HttpResponseSpec = try {
-                transport.execute(spec)
+            // The caller supplies a METHOD, a PATH and a BODY. Not a URL, not headers, and above all
+            // not the credential — the transport owns all three, so no code path here (and no custom
+            // transport) can address the key anywhere. Origin pinning and the layered redirect
+            // refusal happen inside `send`, on every dispatch, with no way to opt out.
+            val response: TransportResponse = try {
+                transport.send(
+                    TransportRequest(
+                        method = method,
+                        path = path,
+                        body = bodyStr,
+                        idempotencyKey = idempotencyKey,
+                        timeoutMs = perRequestTimeout,
+                    ),
+                )
             } catch (e: PaylodConnectionException) {
                 lastError = e
                 attempt++
@@ -150,25 +188,7 @@ class Paylod internal constructor(
             }
             // A PaylodInterruptedException from the transport is deliberately NOT caught here: an
             // interrupt is a cancellation, not a transient blip, so it propagates without a retry.
-
-            // A 3xx is REFUSED here, not followed and not retried — and this is the check that actually
-            // enforces the no-redirect guarantee, because the SDK does not control an injected
-            // `HttpTransport`. A custom transport built on a redirect-following client would replay
-            // `Authorization: Bearer` to the 3xx target's host. We cannot stop third-party code from
-            // doing that, but the SDK itself never treats a redirect as something to chase: the API
-            // never legitimately redirects, so a 3xx is a misconfiguration or an attack, and it is
-            // terminal.
-            if (response.status in 300..399) {
-                throw PaylodApiException(
-                    "paylod responded ${response.status} (a redirect). The paylod API never redirects, " +
-                        "and a redirect is never followed: doing so would replay your API key to the " +
-                        "redirect target. Check baseUrl and any proxy in front of it.",
-                    response.status,
-                    null,
-                    idempotencyKey,
-                    indeterminate = true,
-                )
-            }
+            // A 3xx (or a followed redirect) throws from inside `send` and is likewise terminal.
 
             val text = response.body
             val parsed: Any? = try {
@@ -186,8 +206,16 @@ class Paylod internal constructor(
                 return map
             }
 
-            val message = ((parsed as? Map<*, *>)?.get("error") as? String) ?: "paylod responded ${response.status}"
-            val apiError = PaylodApiException(message, response.status, parsed, idempotencyKey)
+            // BOTH the message and the stored body are built from a REDACTED view of the response.
+            // `error` is a server-controlled string and `body` is a public field that integrators log
+            // wholesale, so an API that echoes the request back — a validation error quoting the
+            // offending headers, a debug envelope, a gateway rendering the whole request on a 502 —
+            // would otherwise carry the live bearer token into the exception and from there into
+            // every log sink downstream. A server cannot be trusted not to echo.
+            val rawMessage = ((parsed as? Map<*, *>)?.get("error") as? String)
+                ?: "paylod responded ${response.status}"
+            val message = redact.text(rawMessage)
+            val apiError = PaylodApiException(message, response.status, redact.body(parsed), idempotencyKey)
 
             // 429 / 5xx are transient. A 409 is retried ONLY when it is explicitly "same key still in
             // progress" — every other 409 (body conflict, indeterminate) is a real, terminal answer.
@@ -206,7 +234,7 @@ class Paylod internal constructor(
             attempt++
         }
 
-        throw lastError ?: PaylodConnectionException("Request to $url failed")
+        throw lastError ?: PaylodConnectionException("Request to $path failed")
     }
 
     /**
@@ -312,35 +340,9 @@ class Paylod internal constructor(
                 )
             }
 
+            // THE shared validator — the same one `simulate.collect()` runs, HTTP status included.
             val ack = request("POST", "/collect", body, idempotencyKey) { map, status ->
-                // Validate the WHOLE acknowledgement, not just the payment id. A 2xx that is missing
-                // any part of the ack shape is a response we do not understand, and the charge behind
-                // it may well have moved — so it is INDETERMINATE, never a silently-degraded ack with
-                // empty-string fields a caller would go on to use as a real checkout reference.
-                fun bad(why: String): Nothing = throw PaylodApiException(
-                    "paylod returned a 2xx collect response that is not a valid acknowledgement " +
-                        "($why) — the charge state is INDETERMINATE. Read the payment with this " +
-                        "idempotencyKey before starting any new attempt; do NOT mint a fresh key " +
-                        "(that risks a second charge).",
-                    status,
-                    map,
-                    idempotencyKey,
-                    indeterminate = true,
-                )
-
-                val id = map["paymentId"]
-                if (id !is String || id.isBlank()) bad("no usable paymentId")
-                val checkout = map["checkoutRequestId"]
-                if (checkout !is String || checkout.isBlank()) bad("no usable checkoutRequestId")
-                // `POST /collect` ALWAYS answers 202 with a hardcoded `status: "pending"` — including
-                // for an idempotent REPLAY, which returns the STORED original ack rather than the
-                // current settled state. So there is no legitimate settled ack, and accepting one
-                // would mean trusting a shape the API never emits. Require the literal.
-                val wireStatus = map["status"]
-                if (wireStatus !is String) bad("status is missing or is not a string")
-                if (wireStatus != "pending") {
-                    bad("status is \"$wireStatus\", but a collect acknowledgement is always \"pending\"")
-                }
+                PaymentValidators.assertCollectAck(map, status, idempotencyKey, "paylod", redact)
             }
             return CollectAck(
                 paymentId = ack["paymentId"] as String,
@@ -372,62 +374,11 @@ class Paylod internal constructor(
     private fun readPayment(paymentId: String, deadlineMs: Long?): Payment {
         if (paymentId.isEmpty()) throw PaylodInvalidRequestException("paymentId is required.")
         val encoded = URLEncoder.encode(paymentId, StandardCharsets.UTF_8).replace("+", "%20")
+        // THE shared validator, with law L1 (ID BINDING) at the front: the body must describe the
+        // payment that was ASKED about. Whether it proves settlement is a separate question, decided
+        // afterwards by the one semantic model in `Semantics.kt` — shape here, meaning there.
         val p = request("GET", "/status/$encoded", null, null, deadlineMs) { map, status ->
-            // Validate the COMPLETE, state-dependent status schema before a Payment is built from it.
-            //
-            // Checking only `id` was a false-PAID bug: `{"id":"pay_1","status":"success"}` sailed
-            // through, `PaymentStatus.fromWire` turned the string into SUCCESS, no result code meant
-            // the classifier never ran, and `Outcomes.of` returned `paid = true` with a null receipt.
-            // A caller doing the documented `if (outcome.paid) fulfil(...)` shipped the goods on a
-            // response carrying no evidence whatsoever that money had moved.
-            //
-            // So: the status STRING is never sufficient on its own. A terminal success must arrive
-            // with something M-Pesa actually said — a receipt, or a result code to classify — and any
-            // field of the wrong shape makes the whole body untrustworthy rather than partly usable.
-            // Every rejection is INDETERMINATE: not paid, and not proof of failure either.
-            fun bad(why: String): Nothing = throw PaylodApiException(
-                "paylod returned a malformed 2xx status body ($why). The payment state is " +
-                    "INDETERMINATE — this is NOT a confirmed payment and must NOT be fulfilled. Read " +
-                    "the payment again, or let the webhook settle it.",
-                status,
-                map,
-                null,
-                indeterminate = true,
-            )
-
-            val id = map["id"]
-            if (id !is String || id.isBlank()) bad("no payment id")
-
-            val wireStatus = map["status"]
-            if (wireStatus !is String) bad("status is missing or is not a string")
-            val parsedStatus = PaymentStatus.parseWire(wireStatus)
-                ?: bad("status \"$wireStatus\" is not one of pending/success/failed")
-
-            // `mpesaReceipt` is THE proof of settlement. A non-string, or a blank string pretending to
-            // be one, is not a receipt.
-            val receipt = map["mpesaReceipt"]
-            if (receipt != null && (receipt !is String || receipt.isBlank())) {
-                bad("mpesaReceipt is present but is not a non-empty string")
-            }
-
-            // `resultCode` drives the classifier, which outranks the raw status field. A shape it
-            // cannot read (a boolean, an object, an empty string) would be normalized into a junk
-            // string and decoded as an unknown code — silently changing the outcome.
-            val resultCode = map["resultCode"]
-            if (resultCode != null && resultCode !is String && resultCode !is Number) {
-                bad("resultCode is neither a string nor a number")
-            }
-            if (resultCode is String && resultCode.isBlank()) bad("resultCode is a blank string")
-
-            val resultDesc = map["resultDesc"]
-            if (resultDesc != null && resultDesc !is String) bad("resultDesc is present but is not a string")
-
-            if (parsedStatus == PaymentStatus.SUCCESS && receipt == null && resultCode == null) {
-                bad(
-                    "status is \"success\" but the body carries NEITHER an mpesaReceipt NOR a " +
-                        "resultCode, so nothing in it evidences that money actually moved",
-                )
-            }
+            PaymentValidators.assertPaymentBody(map, status, paymentId, "paylod", redact)
         }
         return Payment(
             id = p["id"] as String,
@@ -501,6 +452,36 @@ class Paylod internal constructor(
             if (e.idempotencyKey == null) e.idempotencyKey = ack.idempotencyKey
             if (e.paymentId == null) e.paymentId = ack.paymentId
             throw e
+        } catch (e: Throwable) {
+            // ── The rest of the failures, which used to escape with no handles at all ──────────
+            //
+            // Catching only `PaylodException` covered the SDK's own errors and nothing else. A custom
+            // transport throwing an `IOException`, an `onPoll` listener throwing anything at all, an
+            // `IllegalStateException` from a stub, an OOM in a logging call — every one of those
+            // unwound straight past this block, and the caller was handed an exception with NO
+            // idempotency key and NO payment id for a charge that is live on a handset right now.
+            // The narrow catch made the guarantee conditional on which layer failed, which is exactly
+            // the kind of "safe most of the time" that charges people twice.
+            //
+            // An `Error` (OOM, StackOverflow) is deliberately NOT re-wrapped — the JVM is not in a
+            // state where wrapping helps — but it is still not allowed to escape unlabelled: nothing
+            // else in this method can attach the handles, so a normalising wrapper is the only place
+            // they can come from. Everything else becomes a `PaylodConnectionException` carrying both
+            // handles, with a REDACTED message and NO cause attached (an arbitrary third-party
+            // exception can embed a request line, headers, or a URL with credentials in it).
+            if (e is Error) throw e
+            val wrapped = PaylodConnectionException(
+                redact.text(
+                    "The collect was ACKNOWLEDGED and an STK prompt is live, but waiting for it to " +
+                        "settle failed with an unexpected ${e.javaClass.simpleName}: ${e.message}. " +
+                        "The charge state is INDETERMINATE. Read payment ${ack.paymentId} (or retry " +
+                        "with THIS idempotencyKey) before starting any new attempt — minting a fresh " +
+                        "key would risk a second charge.",
+                ),
+            )
+            wrapped.idempotencyKey = ack.idempotencyKey
+            wrapped.paymentId = ack.paymentId
+            throw wrapped
         }
     }
 

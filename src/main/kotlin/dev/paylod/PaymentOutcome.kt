@@ -99,23 +99,32 @@ object Outcomes {
         val detail = if (hasCode) DarajaCatalog.decodeError(payment.resultCode, payment.resultDesc) else null
         val code = detail?.code
 
-        // When M-Pesa has given us a code, the CLASSIFIER is authoritative and the raw `status` field
-        // must NOT override it. A row marked status:"success" carrying a pending code (4999) or a
-        // failure code (1032) must never be reported as paid; a row marked status:"failed" carrying a
-        // pending code stays pending. Before there is a code, the API's own status is all we have.
-        val classified: StkOutcome? =
-            if (hasCode) DarajaCatalog.classifyStkResult(payment.resultCode, payment.resultDesc) else null
+        // ── The whole decision, in one call ────────────────────────────────────────────────────
+        //
+        // Everything about "is this paid?" now lives in `Semantics.kt` and is expressed as one TOTAL
+        // table over (claim, evidence), with no default branch. This function no longer DECIDES
+        // anything; it RENDERS. That separation is the point: the rules used to be spread across a
+        // `contradictory` boolean, a `classified ?: status` fallback chain and an evidence check
+        // nested inside the status validator, and the gaps BETWEEN those three were where
+        // `{status: pending, resultCode: 0}` came back paid and a receipt on a failed row came back
+        // `retryable = true`.
+        return when (PaymentSemantics.judge(payment).verdict) {
+            PaymentVerdict.PAID -> PaymentOutcome(
+                status = OutcomeStatus.SUCCEEDED,
+                message = detail?.customerMessage ?: "Payment received — thank you!",
+                retryable = false, // it worked — charging again would be a second charge
+                paid = true,
+                paymentId = payment.id,
+                receipt = payment.mpesaReceipt,
+                code = code,
+                detail = detail,
+                payment = payment,
+            )
 
-        // A genuine contradiction between two TERMINAL signals — the raw status says success while
-        // the code classifies as a failure, or vice versa. Neither can be trusted, so the payment is
-        // INDETERMINATE: not paid, not safe to charge again. (A `pending` classification is NOT a
-        // contradiction — it just means "still in flight, keep polling".)
-        val contradictory = classified != null &&
-            ((classified == StkOutcome.SUCCESS && payment.status == PaymentStatus.FAILED) ||
-                (classified == StkOutcome.FAILED && payment.status == PaymentStatus.SUCCESS))
-
-        if (contradictory) {
-            return PaymentOutcome(
+            // Rendered as PENDING so `wait()` keeps polling and lets the webhook settle it, rather
+            // than reporting a false success (goods shipped for nothing) or a false retryable failure
+            // (the customer charged twice). Never paid, never retryable — both unconditional.
+            PaymentVerdict.INDETERMINATE -> PaymentOutcome(
                 status = OutcomeStatus.PENDING,
                 message = INDETERMINATE,
                 retryable = false,
@@ -126,31 +135,11 @@ object Outcomes {
                 detail = detail,
                 payment = payment,
             )
-        }
 
-        val outcome = classified ?: when (payment.status) {
-            PaymentStatus.SUCCESS -> StkOutcome.SUCCESS
-            PaymentStatus.FAILED -> StkOutcome.FAILED
-            PaymentStatus.PENDING -> StkOutcome.PENDING
-        }
-
-        if (outcome == StkOutcome.SUCCESS) {
-            return PaymentOutcome(
-                status = OutcomeStatus.SUCCEEDED,
-                message = detail?.customerMessage ?: "Payment received — thank you!",
-                retryable = false,
-                paid = true,
-                paymentId = payment.id,
-                receipt = payment.mpesaReceipt,
-                code = code,
-                detail = detail,
-                payment = payment,
-            )
-        }
-
-        if (outcome == StkOutcome.PENDING) {
-            return PaymentOutcome(
+            PaymentVerdict.IN_FLIGHT -> PaymentOutcome(
                 status = OutcomeStatus.PENDING,
+                // `detail` is only useful here if it is genuinely a pending code (4999 /
+                // 500.001.1001); anything else that classified as pending has no useful message.
                 message = if (detail != null && detail.category == DarajaCategory.PENDING) detail.customerMessage else WAITING,
                 retryable = false, // THE double-charge guard. A live prompt is never safe to re-charge.
                 paid = false,
@@ -160,19 +149,23 @@ object Outcomes {
                 detail = detail,
                 payment = payment,
             )
-        }
 
-        // Terminal failure. Cancellation gets its own word.
-        return PaymentOutcome(
-            status = if (code == CANCELLED_CODE) OutcomeStatus.CANCELLED else OutcomeStatus.FAILED,
-            message = detail?.customerMessage ?: "The payment didn't go through. Please try again.",
-            retryable = detail?.retryable ?: false,
-            paid = false,
-            paymentId = payment.id,
-            receipt = null,
-            code = code,
-            detail = detail,
-            payment = payment,
-        )
+            // Terminal failure. Cancellation gets its own word: the customer chose this, it is not an
+            // error, and a UI usually wants to say so more gently.
+            PaymentVerdict.FAILED -> PaymentOutcome(
+                status = if (code == CANCELLED_CODE) OutcomeStatus.CANCELLED else OutcomeStatus.FAILED,
+                message = detail?.customerMessage ?: "The payment didn't go through. Please try again.",
+                // Straight from the canonical table, which defines `retryable` as "safe to charge
+                // again". Reachable ONLY on a FAILED verdict, so a record carrying a receipt can
+                // never arrive here — that is law L4, enforced upstream in the judge.
+                retryable = detail?.retryable ?: false,
+                paid = false,
+                paymentId = payment.id,
+                receipt = null,
+                code = code,
+                detail = detail,
+                payment = payment,
+            )
+        }
     }
 }
