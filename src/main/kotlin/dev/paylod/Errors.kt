@@ -110,6 +110,20 @@ internal fun assertValidIdempotencyKey(key: String) {
                 "the safest choice.",
         )
     }
+    // A SANITIZER PLACEHOLDER IS NOT A KEY. `[redacted]` is printable ASCII, non-blank, short and
+    // control-character free, so every check above passes it — and it is the value a logging or
+    // masking layer substitutes when it decides an id looks sensitive. Two DIFFERENT payment
+    // attempts sanitized the same way arrive carrying the SAME key, so the server collapses two
+    // genuinely distinct charges into one (a payment silently lost), or one attempt reuses another's
+    // key. A correlation value that a sanitizer can manufacture is not a correlation value.
+    // See conformance requirement 3.4.
+    if (dev.paylod.internal.CredentialShapes.looksSanitized(key)) {
+        throw PaylodInvalidRequestException(
+            "idempotencyKey looks like a redaction/sanitizer placeholder rather than a real key. A " +
+                "placeholder is the SAME value for every attempt that gets masked, so it collapses " +
+                "charges that must stay distinct. Mint one real key per payment attempt.",
+        )
+    }
     val bytes = key.toByteArray(Charsets.UTF_8).size
     if (bytes > MAX_IDEMPOTENCY_KEY_BYTES) {
         throw PaylodInvalidRequestException(

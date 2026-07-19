@@ -73,12 +73,22 @@ class DarajaCatalogTest {
     }
 
     @Test
-    fun `an unknown code is indeterminate — failed and NOT retryable`() {
+    fun `an unknown code is INDETERMINATE — not a failure, and it never invites a retry`() {
         val d = DarajaCatalog.decodeError(4242, "Something odd happened")
         assertEquals("4242", d.code)
-        assertEquals("Payment failed", d.title)
-        assertEquals("Something odd happened", d.cause)
+        // Conformance 1.5: a canonically shaped code that is not in the catalog is NOT evidence, so
+        // it must not become a confident terminal failure. This used to read "Payment failed".
+        assertEquals("Payment state unknown", d.title)
+        // The operator's own words survive, which is why they were worth keeping.
+        assertTrue(d.cause.contains("Something odd happened"))
         assertFalse(d.retryable)
+        // Conformance 3.7: the sentence a CUSTOMER reads must agree with `retryable = false`. The
+        // old message was "The payment didn't go through. Please try again." beside this same
+        // `false` — a merchant renders the message, not the boolean.
+        assertFalse(
+            Regex("try again|pay again|retry", RegexOption.IGNORE_CASE).containsMatchIn(d.customerMessage),
+            "a non-retryable decode invited another attempt: ${d.customerMessage}",
+        )
     }
 
     @Test
@@ -159,7 +169,10 @@ class DarajaCatalogTest {
         // decoder must not hand back "payment still in progress" — that would tell a caller to keep
         // polling a code that arrived on a surface with no in-flight semantics at all.
         assertNotEquals(DarajaCategory.PENDING, d.category)
-        assertEquals("Payment failed", d.title)
+        // No STK pending semantics — and no confident failure claim either, because 4999 is not a
+        // code this catalog defines on THIS surface. "Not in flight" and "failed" are different
+        // answers; only the first is established here. (Conformance 1.5.)
+        assertEquals("Payment state unknown", d.title)
         // And it must never be advertised as safe to charge again.
         assertFalse(d.retryable)
     }

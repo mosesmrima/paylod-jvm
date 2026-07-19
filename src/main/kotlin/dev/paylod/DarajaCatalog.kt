@@ -113,6 +113,19 @@ object DarajaCatalog {
         allEntries.filter { it.category == DarajaCategory.PENDING }.map { it.code }.toMutableSet(),
     )
 
+    /**
+     * Every code the catalog defines on the STK result surface.
+     *
+     * Derived FROM the table, like [pendingResultCodes], so membership and decoding can never
+     * disagree — a code that classifies as a terminal failure is by construction a code
+     * [decodeError] can produce a real entry for. See the membership check in [classifyStkResult]
+     * (conformance requirement 1.5).
+     */
+    @JvmStatic
+    val knownStkResultCodes: Set<String> = Collections.unmodifiableSet(
+        allEntries.filter { it.family == DarajaFamily.STK_RESULT }.map { it.code }.toMutableSet(),
+    )
+
     // `ResultDesc` phrasings that mean "still processing", used as a safety net for unrecognised codes.
     private val PENDING_DESC_RE = Regex(
         "\\b(?:still\\s+under\\s+processing|is\\s+being\\s+processed|still\\s+processing|being\\s+processed)\\b",
@@ -323,6 +336,24 @@ object DarajaCatalog {
             // number. Two independent readings of "is this a number" is how the float spelling got
             // in the first time.
             if (!CANONICAL_CODE_RE.matches(raw)) return StkOutcome.PENDING
+            // ── AN UNKNOWN CODE IS NOT EVIDENCE (conformance requirement 1.5) ─────────────────
+            //
+            // This branch used to return FAILED for ANY canonically-shaped non-zero number,
+            // catalog member or not. So `999999`, `31337`, `12345` — codes Daraja does not define
+            // and this SDK has never seen — became TERMINAL FAILURE evidence, and on a `failed`
+            // claim `PaymentSemantics` turned that into a `FAILED` verdict: a confident, customer-
+            // facing "the payment didn't go through" for a payment whose real state nobody knew.
+            //
+            // Form is not meaning. Passing the lexeme check only establishes that the value is
+            // SPELLED the way Daraja spells codes; it says nothing about whether the payment
+            // failed. A code we cannot place is the definition of ambiguity, and ambiguity resolves
+            // to PENDING here so the webhook or a later read settles it — never to a terminal
+            // verdict, and so never to a retry invitation that could raise a second charge against
+            // a payment that may well have succeeded.
+            //
+            // The catalog is consulted for MEMBERSHIP only, which is why this cannot weaken the
+            // converse: every code the catalog defines still classifies exactly as it did.
+            if (!knownStkResultCodes.contains(raw)) return StkOutcome.PENDING
             return if (PENDING_DESC_RE.containsMatchIn(desc)) StkOutcome.PENDING else StkOutcome.FAILED
         }
 
@@ -371,18 +402,50 @@ object DarajaCatalog {
         customerMessage = "Check your phone and enter your M-Pesa PIN to complete this payment.",
     )
 
-    private fun failedFallback(code: String, rawDesc: String?): DecodedError {
+    /**
+     * The decode of a code this catalog CANNOT PLACE — absent, malformed, non-canonical, or
+     * canonically shaped but not a catalog member.
+     *
+     * ── Why this is no longer called `failedFallback` ─────────────────────────────────────
+     * It used to return `title = "Payment failed"` with the customer message *"The payment didn't
+     * go through. Please try again."* — for an input the SDK had just finished establishing it
+     * could not read. Three separate things were wrong with that, and each costs money on its own:
+     *
+     *   • IT ASSERTED A FAILURE IT HAD NOT ESTABLISHED (requirement 1.5). An unknown code is not
+     *     evidence. `resultCode` absent entirely — the single most common shape of a partially
+     *     written row — produced a confident terminal failure.
+     *   • IT INVITED A RETRY (requirement 3.7). "Please try again" beside `retryable = false` is
+     *     the contradiction that requirement forbids: the structured field said do not charge
+     *     again and the sentence a customer actually READS said do. A merchant renders
+     *     `outcome.message`, the customer taps Pay a second time, and nothing in this SDK ever
+     *     proved the first attempt did not debit them.
+     *   • ITS OWN `fix` TEXT CONTRADICTED ITS OWN TITLE — "this code is not in the catalog, so we
+     *     cannot prove no money moved" sat directly beneath the word "failed".
+     *
+     * So the honest decode is INDETERMINATE: no failure claim, no retry invitation, and a customer
+     * message that tells the truth — we are still finding out. `retryable` stays `false`, and now
+     * every other field agrees with it.
+     */
+    private fun indeterminateFallback(code: String, rawDesc: String?): DecodedError {
         val desc = (rawDesc ?: "").trim()
         return DecodedError(
             code = code,
-            title = "Payment failed",
-            cause = if (desc.isNotEmpty()) desc else "M-Pesa returned a non-zero ResultCode with no further detail.",
-            fix = "Check the raw ResultDesc, verify your credentials + shortcode/till pairing, and confirm " +
-                "the payment's final state with GET /status/:id before charging again — this code is not " +
-                "in the catalog, so we cannot prove no money moved.",
+            title = "Payment state unknown",
+            cause = (if (desc.isNotEmpty()) "$desc " else "") +
+                "This result code is not one this SDK can place, so it is neither proof the payment " +
+                "succeeded nor proof it failed.",
+            fix = "Do NOT charge again — nothing here proves no money moved. Confirm the payment's " +
+                "final state with GET /status/:id or let the webhook settle it, and check the raw " +
+                "ResultDesc plus your credentials and shortcode/till pairing.",
             category = DarajaCategory.MPESA_SYSTEM,
             retryable = false,
-            customerMessage = "The payment didn't go through. Please try again.",
+            // Phrased WITHOUT the words "try"/"retry"/"pay again" in any form, including the
+            // negated form. The catalog-wide invariant that enforces requirement 3.7 is a substring
+            // rule, and a rule that has to distinguish "please try again" from "do not try again"
+            // is a rule one careless edit away from letting the first one through. Saying the safe
+            // thing in words the check cannot misread costs nothing.
+            customerMessage = "We couldn't confirm this payment yet. Please wait while it settles — " +
+                "do not start a new payment.",
         )
     }
 
@@ -429,7 +492,7 @@ object DarajaCatalog {
         val code = normalizeCode(resultCode)
 
         // An ABSENT code is not evidence of an in-flight payment — it is simply unknown.
-        if (code.isEmpty()) return failedFallback("unknown", rawDesc)
+        if (code.isEmpty()) return indeterminateFallback("unknown", rawDesc)
 
         // FORM BEFORE LOOKUP. A code that is not written the way Daraja writes them never reaches
         // the catalog — it is neither evidence of success nor evidence of failure, so it decodes as
@@ -438,7 +501,7 @@ object DarajaCatalog {
         // received. See [isCanonicalCodeLexeme] for what this closed.
         val lexeme = codeLexeme(resultCode)
         if (lexeme == null || !isCanonicalCodeLexeme(lexeme)) {
-            return failedFallback(lexeme ?: code, rawDesc)
+            return indeterminateFallback(lexeme ?: code, rawDesc)
         }
 
         val matches = allEntries.filter { it.code == code }
@@ -453,7 +516,25 @@ object DarajaCatalog {
             val outcome = classifyStkResult(code, rawDesc)
             val entry = pickEntry(code, effectiveFamily, outcome)
             if (entry != null) return decodedFrom(code, entry)
-            return if (outcome == StkOutcome.PENDING) pendingFallback(code) else failedFallback(code, rawDesc)
+            // No entry. `outcome == PENDING` is now reached by TWO very different routes and they
+            // must not share a decode:
+            //
+            //   • The code, or the description, positively SAYS the payment is still processing —
+            //     a genuine in-flight signal. "Check your phone and enter your PIN" is correct.
+            //   • The code is simply one we cannot place (conformance 1.5). Nothing here says the
+            //     prompt is live. Telling a customer to check their phone for a prompt that may
+            //     never have been sent is a false statement, and it is the same class of error as
+            //     the old "Payment failed" — asserting a state the SDK never established.
+            //
+            // Only the first route may claim in-flight, so it is required to be POSITIVE evidence:
+            // a catalog-defined pending code, or an explicit still-processing description.
+            val positivelyPending = pendingResultCodes.contains(code) ||
+                PENDING_DESC_RE.containsMatchIn((rawDesc ?: "").trim())
+            return if (outcome == StkOutcome.PENDING && positivelyPending) {
+                pendingFallback(code)
+            } else {
+                indeterminateFallback(code, rawDesc)
+            }
         }
 
         // Terminal (api_error / b2c_c2b_result): no STK pending semantics, EVER.
@@ -467,7 +548,7 @@ object DarajaCatalog {
         // answer is the terminal, NON-RETRYABLE fallback.
         val entry = matches.firstOrNull { it.family == effectiveFamily }
             ?: matches.firstOrNull { it.family != DarajaFamily.STK_RESULT }
-        return if (entry != null) decodedFrom(code, entry) else failedFallback(code, rawDesc)
+        return if (entry != null) decodedFrom(code, entry) else indeterminateFallback(code, rawDesc)
     }
 
     @Suppress("UNCHECKED_CAST")

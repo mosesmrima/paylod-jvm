@@ -1,5 +1,6 @@
 package dev.paylod
 
+import dev.paylod.internal.CredentialShapes
 import dev.paylod.internal.Redactor
 
 /**
@@ -77,6 +78,19 @@ internal object PaymentValidators {
             )
         }
 
+        // SANITIZER OUTPUT IS NOT AN IDENTIFIER. A `paymentId` of `[redacted]` is not a payment we
+        // can poll, bind a status read to, or reconcile against — it is a statement that the real id
+        // was removed. Accepting it would produce a well-formed `CollectAck` naming a payment that
+        // does not exist, and every subsequent `wait()` and `getPayment()` would bind against the
+        // placeholder. Refused for the same reason a credential-bearing id is refused: it is not an
+        // identifier at all. See conformance requirement 3.4.
+        if (CredentialShapes.looksSanitized(ack["paymentId"] as? String)) {
+            bad("paymentId is a redaction/sanitizer placeholder, so it does not name a payment")
+        }
+        if (CredentialShapes.looksSanitized(ack["checkoutRequestId"] as? String)) {
+            bad("checkoutRequestId is a redaction/sanitizer placeholder, so it does not name a checkout request")
+        }
+
         // `status` is a HARDCODED LITERAL "pending" on the backend, present on every 202 — including
         // an idempotent REPLAY, which returns the STORED original ack rather than the current settled
         // state. So there is no legitimate ack carrying a settled status, and no legitimate ack
@@ -151,6 +165,11 @@ internal object PaymentValidators {
         if (!isNonBlankString(id)) bad("no payment id")
         if (redact.containsCredential(id as? String)) {
             bad("the payment id contains something shaped like an API credential, so it is not an id")
+        }
+        // See the identical check in [assertCollectAck]: a placeholder is not an identifier, and the
+        // binding check below would otherwise compare one placeholder against another.
+        if (CredentialShapes.looksSanitized(id as? String)) {
+            bad("the payment id is a redaction/sanitizer placeholder, so it does not name a payment")
         }
 
         // ID BINDING, checked before anything else about the record's CONTENTS: if this fails then

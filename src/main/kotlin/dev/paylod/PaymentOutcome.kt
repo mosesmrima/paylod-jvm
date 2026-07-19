@@ -140,7 +140,12 @@ object Outcomes {
                 retryable = false, // it worked — charging again would be a second charge
                 paid = true,
                 paymentId = payment.id,
-                receipt = payment.mpesaReceipt,
+                // Only a receipt that satisfies the grammar is surfaced. A PAID verdict can be
+                // reached on result code 0 ALONE, so `payment.mpesaReceipt` here may be an
+                // unreadable or sanitized string that was never evidence for anything — publishing
+                // it on a field documented as "the M-Pesa confirmation code" would hand a caller a
+                // reconciliation key that reconciles against nothing.
+                receipt = payment.mpesaReceipt?.takeIf { PaymentSemantics.isValidReceipt(it) },
                 code = code,
                 detail = safeDetail(),
                 payment = payment,

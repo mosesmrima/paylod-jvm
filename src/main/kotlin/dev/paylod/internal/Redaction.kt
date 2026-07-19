@@ -48,6 +48,35 @@ internal object CredentialShapes {
     fun looksLikeCredential(value: String?): Boolean =
         value != null && KEY_SHAPED_RE.containsMatchIn(value)
 
+    /**
+     * Every marker that means "a sanitizer has already been here".
+     *
+     * ── Why a sanitizer's OUTPUT must never satisfy an evidence check ─────────────────────
+     * This requirement exists because of a defect that shipped: redacting a credential echoed into
+     * `mpesaReceipt` rewrote the field to `[redacted]`, and the evidence test at the time was
+     * "is the receipt non-blank?". `[redacted]` is non-blank. So the act of HIDING a credential
+     * MANUFACTURED proof of payment — the safety machinery became the attack. A `success` claim
+     * beside that receipt resolved to PAID.
+     *
+     * The lesson generalises past our own mask: any placeholder an intermediary substitutes
+     * (`[redacted]`, `***`, `<hidden>`, `REDACTED`, `[FILTERED]`) is a statement that the real
+     * value was REMOVED, which is the opposite of evidence. So no sanitizer output may satisfy any
+     * evidence, identifier or correlation check anywhere in this SDK — receipt, paymentId,
+     * checkoutRequestId, payment id, idempotency key.
+     *
+     * Matched case-insensitively and as a SUBSTRING: a partially-masked value is just as much a
+     * value we do not have.
+     */
+    private val SANITIZED_RE = Regex(
+        "\\[redacted\\b|\\bredacted\\b|\\[filtered\\b|\\bfiltered\\b|\\[masked\\b|\\bmasked\\b" +
+            "|\\[hidden\\b|<hidden>|\\[removed\\b|\\*{3,}|•{3,}|x{6,}",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /** Has a sanitizer already replaced (any part of) this value? See [SANITIZED_RE]. */
+    fun looksSanitized(value: String?): Boolean =
+        value != null && SANITIZED_RE.containsMatchIn(value)
+
     /** Scrub credential-shaped runs out of a string, preserving `null`. */
     fun scrub(value: String?): String? =
         if (value == null) null else KEY_SHAPED_RE.replace(value, MASK)

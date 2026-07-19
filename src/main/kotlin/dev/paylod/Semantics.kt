@@ -1,5 +1,7 @@
 package dev.paylod
 
+import dev.paylod.internal.CredentialShapes
+
 /**
  * THE semantic model for a payment record.
  *
@@ -110,9 +112,64 @@ data class PaymentJudgement(
 /** The judge. One evidence function, one total table, no defaults. */
 object PaymentSemantics {
 
-    /** A receipt counts only if it is a non-blank string. `""` and `"   "` prove nothing. */
+    /**
+     * THE receipt grammar: exactly ten uppercase alphanumerics.
+     *
+     * ── Why a POSITIVE grammar replaced the non-emptiness test ────────────────────────────
+     * This used to be `!mpesaReceipt.isNullOrBlank()`. Non-emptiness is not a property of a
+     * receipt; it is a property of a string. Every one of these passed it and none of them is an
+     * M-Pesa confirmation code:
+     *
+     *   • `"[redacted]"` — the SDK'S OWN redaction placeholder. When a server echoed a credential
+     *     into `mpesaReceipt`, scrubbing it wrote this value, and the scrubbed result then SATISFIED
+     *     the evidence test. Hiding a secret manufactured proof of payment. This is the single
+     *     defect this grammar exists for.
+     *   • `"null"`, `"undefined"`, `"N/A"`, `"-"`, `"pending"` — what a serialiser writes for an
+     *     absent value, and what a half-populated row carries.
+     *   • `"0"` — a truncated field.
+     *
+     * The shape is derived from every real receipt in the paylod fixtures (`SFF6XYZ123`,
+     * `RGH4TYU789`, …): ten characters, uppercase letters and digits only. Sibling SDKs (PHP first,
+     * then Node, Python and this one) enforce the IDENTICAL grammar, so a body that is evidence in
+     * one is evidence in all of them.
+     *
+     * ── The anchor ────────────────────────────────────────────────────────────────────────
+     * Written WITHOUT `^`/`$` and matched with [Regex.matches], which is a FULL-REGION match — the
+     * Kotlin/Java equivalent of `\z`-anchoring. An `$`-anchored pattern would be a live defect here:
+     * in Java (as in PCRE and Python `re`) `$` also matches immediately BEFORE a trailing newline,
+     * so `"SFF6XYZ123\n"` would validate — a receipt with a smuggled newline is exactly the kind of
+     * re-encoded value this check exists to reject. See conformance requirement 7.1.
+     */
+    @JvmField
+    val RECEIPT_RE = Regex("[A-Z0-9]{10}")
+
+    /**
+     * Is this string an M-Pesa receipt — by SHAPE, not merely by presence?
+     *
+     * Exposed publicly because callers reconciling their own records need the same answer the SDK
+     * uses, and because a second, subtly different copy in application code is how the two drift.
+     */
     @JvmStatic
-    fun hasReceipt(payment: Payment): Boolean = !payment.mpesaReceipt.isNullOrBlank()
+    fun isValidReceipt(receipt: String?): Boolean {
+        if (receipt == null) return false
+        // Sanitizer output is checked FIRST and independently of the grammar. The grammar happens to
+        // exclude `[redacted]` on its own, but that is a coincidence of which characters the current
+        // mask uses — a future mask spelled `XXXXXXXXXX` would satisfy `[A-Z0-9]{10}` exactly. A
+        // safety property must not rest on the spelling of an unrelated constant.
+        if (CredentialShapes.looksSanitized(receipt)) return false
+        return RECEIPT_RE.matches(receipt)
+    }
+
+    /**
+     * A receipt counts as evidence only if it satisfies [isValidReceipt].
+     *
+     * Note what this does NOT do: it does not make a malformed receipt into a failure. A record
+     * whose receipt is unreadable simply carries no receipt evidence, and the rest of the table
+     * decides from the result code. Turning "I cannot read this receipt" into "this payment failed"
+     * would be the same claim-without-evidence move the whole file exists to forbid.
+     */
+    @JvmStatic
+    fun hasReceipt(payment: Payment): Boolean = isValidReceipt(payment.mpesaReceipt)
 
     /** A result code is "present" if it is neither null nor blank. `"0"` is present and meaningful. */
     @JvmStatic
