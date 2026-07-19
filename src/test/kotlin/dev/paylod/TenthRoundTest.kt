@@ -153,6 +153,84 @@ class TenthRoundTest {
         assertTrue(bad.message!!.contains("placeholder"), bad.message)
     }
 
+    // ── §3.7 — a non-retryable outcome never invites another attempt ────────────────────────
+
+    /**
+     * §3.7, enforced as a CATALOG-WIDE INVARIANT rather than as a list of codes.
+     *
+     * The spec names 17, 26, 1025 and 9999. Seventeen entries actually violated it, which is the
+     * argument for the invariant form: a test that checks the four named codes passes while the
+     * other thirteen keep telling customers to pay again, and the next entry someone adds is
+     * unguarded by construction.
+     *
+     * Why it matters concretely: `retryable` is a boolean a MERCHANT branches on, but `message` is
+     * the sentence a CUSTOMER reads. When they disagree, the customer wins — they tap Pay a second
+     * time. None of these codes proves no debit occurred, so the second tap can be a second charge
+     * for a payment the first tap may already have completed.
+     */
+    @Test
+    @Tag("nv-no-retry-language")
+    fun `no non-retryable catalog entry invites another payment attempt`() {
+        val invitation = Regex("try again|retry|pay again|again", RegexOption.IGNORE_CASE)
+        val offenders = DarajaCatalog.allEntries
+            .filter { !it.retryable && invitation.containsMatchIn(it.customerMessage) }
+            .map { "${it.code} (${it.family}): ${it.customerMessage}" }
+        assertTrue(
+            offenders.isEmpty(),
+            "non-retryable entries whose customer message invites another attempt:\n" +
+                offenders.joinToString("\n"),
+        )
+        // The fixture must be able to discriminate (§8.5): assert the catalog is actually populated
+        // and actually contains non-retryable entries, so "no offenders" cannot mean "nothing was
+        // examined".
+        assertTrue(DarajaCatalog.allEntries.size >= 30, "catalog did not load")
+        assertTrue(DarajaCatalog.allEntries.count { !it.retryable } >= 15, "nothing to check")
+    }
+
+    /** §3.7 — the same invariant on the two synthesised decodes, which are not catalog rows. */
+    @Test
+    @Tag("nv-no-retry-language")
+    fun `the fallback decodes never invite another payment attempt either`() {
+        val invitation = Regex("try again|retry|pay again|again", RegexOption.IGNORE_CASE)
+        // Unknown, absent, non-canonical and malformed — every route to a synthesised decode.
+        for (code in listOf<Any?>(null, "", 4242, "999999", " 0", "0.0", "500.0", "1032\n", true, 1032.0)) {
+            val d = DarajaCatalog.decodeError(code, null)
+            assertFalse(d.retryable, "synthesised decode for $code was retryable")
+            assertFalse(
+                invitation.containsMatchIn(d.customerMessage),
+                "decode for $code invited another attempt: ${d.customerMessage}",
+            )
+        }
+    }
+
+    /** §3.6 — `retryable` agrees with the verdict at EVERY nesting level, over the cross-product. */
+    @Test
+    @Tag("nv-retryable-agrees")
+    fun `no outcome exposes a nested retryable that contradicts the top-level one`() {
+        val codes = listOf(null, "0", "1032", "2001", "4999", "999999", " 0", "0.0", "17", "9999")
+        val receipts = listOf(null, "SFF6XYZ123", "[redacted]", "not-a-receipt")
+        var checked = 0
+        for (claim in PaymentStatus.entries) {
+            for (code in codes) {
+                for (receipt in receipts) {
+                    val out = Outcomes.of(Payment("pay_1", claim, receipt, code, null))
+                    if (!out.retryable) {
+                        assertFalse(
+                            out.detail?.retryable ?: false,
+                            "claim=$claim code=$code receipt=$receipt: top-level retryable=false " +
+                                "but detail.retryable=true",
+                        )
+                    }
+                    if (out.paid) assertFalse(out.retryable, "a PAID outcome was retryable")
+                    checked++
+                }
+            }
+        }
+        // §8.5 — the sweep must actually have swept something.
+        assertEquals(PaymentStatus.entries.size * codes.size * receipts.size, checked)
+        assertTrue(checked >= 100, "cross-product too small to discriminate")
+    }
+
     // ── §3.5 — all seven rows of the required resolution table ──────────────────────────────
 
     /**
