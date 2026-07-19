@@ -1,22 +1,24 @@
 # paylod for the JVM
 
-The official **Kotlin/Java** client for the **paylod API** — M-Pesa collections without the Daraja
-boilerplate. One small JAR with **no third-party runtime dependencies** (only the Kotlin standard
-library), usable from any JVM app: Spring Boot, Ktor, Android backends, plain `main()`.
+The official **Kotlin/Java** client for the **paylod API**. The client does M-Pesa collections without
+the Daraja boilerplate. The JAR has **no third-party runtime dependencies**. The JAR needs only the
+Kotlin standard library. You can use the JAR from any JVM application: Spring Boot, Ktor, an Android
+backend, or a plain `main()`.
 
-**No backend to run. No per-transaction fees. No custody of your money.** paylod hosts the Daraja
-callback, refreshes the OAuth token, decodes the result code, and POSTs you a signed webhook when the
-money lands — but the money moves through **your** Safaricom shortcode, on **your** Daraja
-credentials. paylod never touches the funds. You bring your own Daraja creds; paylod does the plumbing.
+**You run no backend. You pay no per-transaction fee. paylod holds none of your money.** paylod hosts
+the Daraja callback. paylod refreshes the access token. paylod decodes the result code. paylod POSTs a
+signed webhook to your server when a payment settles. The money moves through **your** Safaricom
+shortcode, on **your** Daraja credentials. paylod never touches the funds. You supply your own Daraja
+credentials.
 
-> **Free early access.** paylod is free while in early access — mint a key and build.
+> **Free early access.** paylod is free during early access. Mint a key and start.
 
 ---
 
 ## Install
 
-Coordinates: **`dev.paylod:paylod`**. Requires **JVM 17+**. No third-party runtime dependencies —
-only the Kotlin standard library.
+The coordinates are **`dev.paylod:paylod`**. The SDK requires **JVM 17+**. The SDK has no third-party
+runtime dependencies. The SDK needs only the Kotlin standard library.
 
 ### Gradle (Kotlin DSL)
 
@@ -44,15 +46,25 @@ dependencies {
 </dependency>
 ```
 
-> **Server-side only — this is not client-safe.** Your `PAYLOD_API_KEY` can move money. Never ship it
-> in an Android/iOS app or any client bundle. Call this SDK from a server or a backend service.
+> **Call this SDK from a server only.** Your `PAYLOD_API_KEY` can move money. Never ship the key in a
+> browser bundle, a mobile application, or any other client.
 
 ---
 
 ## Quickstart
 
-One call rings the phone, waits for the PIN, and hands you something you can **render**. There is no
-result-code table in your app.
+One call sends the STK push, waits for the PIN, and returns a value that your application can
+**render**. Your application needs no result code table.
+
+> **Pass an idempotency key on every collect call.** Mint one key for each payment attempt. Duplicates
+> of that attempt collapse into one STK push and one charge. A double-clicked Pay button, a refreshed
+> tab, and a redelivered job are duplicates of one attempt. Do not use the order id or the product id
+> as the key. A retry after a wrong PIN is a new attempt, and it needs a new key.
+>
+> The idempotency key is required. The SDK refuses a collect call without one, before the call leaves
+> your process. The opt-out is `unsafeGeneratedIdempotencyKey = true`. Do not use this option in
+> production. The SDK then mints a throwaway key, and it warns on every call. A throwaway key protects
+> nothing, and the call can charge a customer twice.
 
 ### Kotlin
 
@@ -91,14 +103,9 @@ if (outcome.getPaid()) {
 }
 ```
 
-That's the whole integration. `collectAndWait` sends the STK prompt, polls with a sane jittered
-backoff (1s -> 5s), and returns a `PaymentOutcome`.
-
-> **Pass an `idempotencyKey`, and mint one per payment attempt.** Duplicates of that attempt — a
-> double-clicked button, a refreshed tab, a redelivered job — collapse into **one** prompt and **one**
-> charge. Do **not** key on the order or the product: that replays an old payment. A retry after a
-> wrong PIN is a new charge and needs a **new** key. Omit the key and every call is a new charge (and
-> the SDK warns once).
+That code is the complete integration. `collectAndWait` sends the STK push. `collectAndWait` then
+polls the payment status. The poll interval increases from 1s to 5s, with jitter. `collectAndWait`
+returns a `PaymentOutcome`.
 
 ---
 
@@ -117,32 +124,33 @@ data class PaymentOutcome(
 )
 ```
 
-Two invariants worth internalising:
+Read these two invariants:
 
-1. **`retryable` means SAFE TO CHARGE AGAIN** — not "the user may press a button". A `PENDING`
-   payment is never retryable: codes `4999` / `500.001.1001` mean the prompt is live and the customer
-   hasn't typed their PIN yet. Retrying pushes a second prompt and can double-charge them.
-2. **A wrong PIN is an answer, not an exception.** Cancellations, wrong PINs and low balances come
-   back as data (`status = FAILED`, with a `message`), not as thrown errors. Only genuinely
-   exceptional things throw — see below.
+1. `retryable` means SAFE TO CHARGE AGAIN. It does not mean that the customer may press a button.
+   `retryable = false` means that paylod cannot prove that no debit occurred. Result code `4999` and
+   result code `500.001.1001` mean that the STK push is live on the handset. The customer did not enter the PIN yet. The payment is IN FLIGHT, not failed. A pending payment is never retryable.
+   A second collect call sends a second STK push, and it can charge the customer twice.
+2. A wrong PIN is an answer, not an exception. A cancellation, a wrong PIN, and a low balance come
+   back as data, with `status` and a `message`. They do not raise an error. Only exceptional
+   conditions raise an exception. The next table lists them.
 
 ### What throws
 
 | Throws | When |
 |---|---|
-| `PaylodInvalidRequestException` | Bad amount/phone. A bug in your code. |
-| `PaylodConfigException` | No API key. A bug in your deploy. |
-| `PaylodApiException` | Non-2xx from paylod (`status`, `isAuthError`, `isRateLimited`, `isIdempotencyConflict`, and the three 409 discriminators). |
-| `PaylodConnectionException` | The network failed after retries. |
-| `PaylodTimeoutException` | Still `PENDING` at the deadline — deliberately **not** a failed payment. Leave the order pending; the webhook settles it. |
+| `PaylodInvalidRequestException` | The amount or the phone number is not valid. Your code has a defect. |
+| `PaylodConfigException` | The API key is absent. Your deployment has a defect. |
+| `PaylodApiException` | paylod returned a non-2xx status. The exception carries `status`, `isAuthError`, `isRateLimited`, `isIdempotencyConflict`, and the three 409 discriminators. |
+| `PaylodConnectionException` | The network failed after all retries. |
+| `PaylodTimeoutException` | The payment is still `PENDING` at the deadline. A timeout is not a failed payment. The outcome is INDETERMINATE. The customer can still enter the PIN, and the payment can still succeed. Leave the order pending. The webhook settles the order. |
 
 ---
 
 ## Test your checkout without a phone
 
-Your failure paths are where payment bugs live. `paylod.simulate` removes the handset — and nothing
-else: a real sandbox payment row, real Daraja result codes, a real signed webhook. Sandbox
-(`mp_test_`) keys only, enforced locally.
+Most payment defects occur on the failure paths. The simulator removes the handset, and it changes
+nothing else. You get a real sandbox payment record, real Daraja result codes, and a real signed
+webhook. Every simulator call refuses an `mp_live_` key locally, before the call leaves your process.
 
 ```kotlin
 val paylod = Paylod(System.getenv("PAYLOD_TEST_KEY"))   // mp_test_...
@@ -161,7 +169,7 @@ outcome.retryable  // true — no money moved, so a fresh charge is safe
 | `USER_CANCELLED` | `CANCELLED` | `1032` |
 | `TIMEOUT` | `FAILED` | `1037` |
 
-To test *your* `collect()` path unchanged, build the client with `simulate = true`:
+To test your own `collect()` path without a change, build the client with `simulate = true`:
 
 ```kotlin
 val paylod = Paylod("mp_test_...", PaylodOptions.of(simulate = true))
@@ -173,15 +181,21 @@ paylod.simulate.outcome(ack.paymentId, SimOutcomeId.USER_CANCELLED)
 
 ## Webhooks
 
-paylod POSTs a signed JSON body to your endpoint when a payment settles:
+paylod POSTs a signed JSON body to your endpoint when a payment settles.
 
 ```
 POST /your/webhook
 x-webhook-signature: t=1700000000,v1=<hex hmac-sha256>
 ```
 
-The signature is `HMAC-SHA256(secret, "${t}.${rawBody}")`. Verify it against the **raw** bytes — a
-re-serialised body will not match.
+The signature is `HMAC-SHA256(secret, "${t}.${rawBody}")`.
+
+> **Verify the signature against the raw bytes.** A re-serialised body does not reproduce the same
+> bytes, and the signature check then fails.
+>
+> paylod can deliver the same webhook more than once. Key your fulfilment on the signed
+> `data.paymentId`, and make the fulfilment idempotent. Do not use the `x-webhook-id` header for this
+> check. The header is unsigned, so an attacker can replay a body under a new header value.
 
 ### Kotlin
 
@@ -217,8 +231,6 @@ if (event.getType() == WebhookEventType.PAYMENT_SUCCESS) {
 }
 ```
 
-**Deliveries can repeat.** Key your fulfilment on `data.paymentId` and make it idempotent.
-
 ---
 
 ## Offline error decoding
@@ -230,39 +242,41 @@ paylod.decodeError(1032)
 //   customerMessage="Payment cancelled — you can try again whenever you're ready.")
 ```
 
-No network, no API key needed at call time. The strings are byte-identical to what paylod puts in
-`event.data.decoded`, so your UI reads the same whether it came from a poll or a webhook. You rarely
-need this — `check()`, `wait()` and `collectAndWait()` already hand back a decoded `PaymentOutcome`.
+`decodeError` needs no network and no API key. The strings are byte-identical to the strings in
+`event.data.decoded`. Your interface therefore shows the same text for a poll and for a webhook. You
+rarely need `decodeError`. `check()`, `wait()` and `collectAndWait()` already return a decoded
+`PaymentOutcome`.
 
 ---
 
 ## Configuration
 
-The base URL is baked in — identical for every customer, so there is nothing to configure. Escape
-hatches (you probably won't need them) live on `PaylodOptions`:
+The SDK contains the base URL. The base URL is the same for every customer, so you configure nothing.
+`PaylodOptions` holds the optional settings. Most applications need none of them.
 
 | Option | Default |
 |---|---|
-| `apiKey` | `PAYLOD_API_KEY` env var. **Write-only** — there is no getter, so the credential cannot be read back off the options object. |
-| `baseUrl` | `PAYLOD_BASE_URL` env var, else `https://paylod.dev/functions/v1`. **Must be `https://`** — a plaintext origin is refused so your key is never sent in the clear. |
-| `webhookSecret` | `PAYLOD_WEBHOOK_SECRET` env var. Write-only, same as `apiKey`. |
+| `apiKey` | The `PAYLOD_API_KEY` environment variable. The option is write-only. The options object has no getter, so no code can read the credential back. |
+| `baseUrl` | The `PAYLOD_BASE_URL` environment variable, or else `https://paylod.dev/functions/v1`. The value must start with `https://`. The SDK refuses a plaintext origin, so the SDK never sends your key in the clear. |
+| `webhookSecret` | The `PAYLOD_WEBHOOK_SECRET` environment variable. The option is write-only, the same as `apiKey`. |
 | `timeoutMs` | `30000` |
-| `maxRetries` | `2` (transient failures only — network, 5xx, 429, and the explicit in-progress `409`) |
-| `transport` | The SDK's own JDK `HttpClient` dispatch. Injecting an `HttpTransport` is a **test-only seam**: it requires `allowCustomTransport = true`, is refused for `mp_live_` keys, and receives **no credential** — the SDK adds the `Authorization` header after that boundary, from a private field. |
-| `allowCustomTransport` | `false` — the explicit opt-in a custom `HttpTransport` requires |
-| `simulate` | `false` (requires a `mp_test_` key) |
-| `allowInsecureBaseUrl` | `false` — test-only escape hatch permitting **loopback** `http://` (`localhost`/`127.0.0.1`), never with an `mp_live_` key |
+| `maxRetries` | `2`. The SDK retries only transient failures: a network failure, a 5xx status, a 429 status, and the explicit in-progress `409`. |
+| `transport` | The default is the SDK's own JDK `HttpClient` dispatch. A custom `HttpTransport` is a test-only seam. It requires `allowCustomTransport = true`. The SDK refuses it for an `mp_live_` key. It receives no credential. The SDK adds the `Authorization` header after that boundary, from a private field. |
+| `allowCustomTransport` | `false`. A custom `HttpTransport` requires this explicit opt-in. |
+| `simulate` | `false`. This option requires an `mp_test_` key. |
+| `allowInsecureBaseUrl` | `false`. This option is a test-only escape hatch. It permits a loopback `http://` origin (`localhost` or `127.0.0.1`). The SDK refuses it with an `mp_live_` key. |
 
-Kotlin uses named arguments (`PaylodOptions.of(timeoutMs = 10_000)`); Java uses the builder
-(`PaylodOptions.builder().timeoutMs(10_000).build()`).
+Kotlin uses named arguments, as in `PaylodOptions.of(timeoutMs = 10_000)`. Java uses the builder, as
+in `PaylodOptions.builder().timeoutMs(10_000).build()`.
 
 ---
 
 ## Threading
 
-The v1 API is synchronous — every call blocks the calling thread. Run collections off your request
-thread (a worker pool, or a coroutine's `Dispatchers.IO`) if latency matters. Coroutine /
-`CompletableFuture` variants can be layered on later without changing this surface.
+The v1 API is synchronous. Every call blocks the calling thread. If latency is important, run each
+collect call off your request thread. Use a worker pool or the `Dispatchers.IO` coroutine dispatcher.
+paylod can add coroutine variants and `CompletableFuture` variants later. Those variants need no
+change to this API surface.
 
 ---
 
