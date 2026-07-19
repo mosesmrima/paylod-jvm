@@ -48,6 +48,15 @@ class NinthRoundTest {
         val CLASSES_DIR = File("build/classes/kotlin/main/dev/paylod")
 
         val REDACTOR = Redactor(listOf(API_KEY, WEBHOOK_SECRET))
+
+        /**
+         * Emitted by the inspection walk when it runs out of depth.
+         *
+         * A traversal that gives up must not be indistinguishable from a traversal that found
+         * nothing. The sweep treats this marker as a failure, so an object too deep to inspect is
+         * REFUSED rather than reported clean (requirement 4.5).
+         */
+        const val UNSCANNED = "[sweep: subtree too deep to inspect]"
     }
 
     // ══ 1. THE TRAVERSAL BOUND ══════════════════════════════════════════════════════════════
@@ -123,6 +132,13 @@ class NinthRoundTest {
             for ((route, text) in reachableStrings(obj, covered)) {
                 if (text.contains(API_KEY)) failures += "[$label] leaked the API KEY via $route"
                 if (text.contains(WEBHOOK_SECRET)) failures += "[$label] leaked the WEBHOOK SECRET via $route"
+                // FAIL CLOSED. A subtree the walk could not reach is not a subtree it cleared —
+                // and an object shaped so the sweep cannot finish inspecting it is exactly where
+                // someone would hide the thing the sweep looks for. Requirement 4.5.
+                if (text == UNSCANNED) {
+                    failures += "[$label] could not be fully inspected at $route — the sweep " +
+                        "refuses to report a type clean that it did not finish walking"
+                }
             }
         }
 
@@ -249,6 +265,43 @@ class NinthRoundTest {
             )
             paylod.status("pay_123")
         }
+        // `resultCode` POISONED. This field was absent from the sweep entirely, and it was the
+        // one server-controlled field on a status body with no credential check — copied into
+        // `Payment.resultCode`, `PaymentOutcome.code` and `DecodedError.code`, and therefore into
+        // the generated `toString()` of all three. It is refused now; the scenario is here so that
+        // remains true rather than being true today.
+        attempt("status/poisoned-resultcode") {
+            val (paylod, _) = testClient(
+                listOf(
+                    Step(
+                        status = 200,
+                        json = paymentJson(
+                            status = "failed", resultCode = "Bearer $API_KEY",
+                            resultDesc = "see the code",
+                        ),
+                        headers = poisonHeaders,
+                    ),
+                ),
+                apiKey = API_KEY,
+            )
+            paylod.status("pay_123")
+        }
+        attempt("status/poisoned-receipt-and-code") {
+            val (paylod, _) = testClient(
+                listOf(
+                    Step(
+                        status = 200,
+                        json = paymentJson(
+                            status = "success", mpesaReceipt = "$WEBHOOK_SECRET",
+                            resultCode = "$API_KEY", resultDesc = "both poisoned",
+                        ),
+                        headers = poisonHeaders,
+                    ),
+                ),
+                apiKey = API_KEY,
+            )
+            paylod.check("pay_123")
+        }
         attempt("check/poisoned-desc") {
             val (paylod, _) = testClient(
                 listOf(
@@ -352,6 +405,17 @@ class NinthRoundTest {
         }
 
         // ── the offline catalog: DecodedError and CatalogEntry, given hostile server prose ─────
+        // THE FIXTURE MUST BE ABLE TO DISCRIMINATE (requirement 8.5). This used to pass code
+        // "1032", which the catalog DEFINES — so `decodeError` returns catalog-owned prose and the
+        // poisoned `rawDesc` never reaches the object at all. The scenario therefore proved that a
+        // string it had discarded was absent, which is no test of redaction whatsoever.
+        //
+        // An UNKNOWN code takes the `indeterminateFallback` path, which is the one that actually
+        // copies the caller's description into `DecodedError.cause` — the credential-bearing route.
+        keep("catalog/decode-unknown", DarajaCatalog.decodeError("987654", "failed for $API_KEY / $WEBHOOK_SECRET"))
+        // A credential echoed into the CODE ITSELF, not just the prose beside it.
+        keep("catalog/decode-poisoned-code", DarajaCatalog.decodeError("Bearer $API_KEY", "see code"))
+        // And the known-code path too, so the control is still exercised.
         keep("catalog/decode", DarajaCatalog.decodeError("1032", "cancelled by $API_KEY / $WEBHOOK_SECRET"))
         keep("catalog/entry", DarajaCatalog.allEntries.first())
 
@@ -521,7 +585,22 @@ class NinthRoundTest {
         val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
 
         fun walk(label: String, v: Any?, depth: Int) {
-            if (v == null || depth > 8) return
+            if (v == null) return
+            // ── THE INSPECTION WALK IS PINNED TO THE PARSE DEPTH, AND FAILS CLOSED ────────────
+            //
+            // This was `depth > 8`, silently. The SDK parses to [Json.MAX_DEPTH] (64) and redacts
+            // to the same bound, so a credential sitting between depth 9 and 64 of a public object
+            // was reachable by an integrator and INVISIBLE to the sweep — which then reported the
+            // type clean. That is the same 8-vs-64 drift requirement 4.4 exists to stop, in the
+            // one place whose entire job is to notice it.
+            //
+            // And it returned QUIETLY at the bound, so "I did not look" and "I looked and it is
+            // fine" produced the identical answer (requirement 4.5). Beyond the bound the walk now
+            // records a marker that the assertion below treats as a failure.
+            if (depth > Json.MAX_DEPTH) {
+                out += label to UNSCANNED
+                return
+            }
             if (v is String) { out += label to v; return }
             if (v is Number || v is Boolean || v is Char) return
             if (!seen.add(v)) return
