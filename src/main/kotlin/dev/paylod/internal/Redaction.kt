@@ -28,8 +28,21 @@ internal object CredentialShapes {
 
     const val MASK = "[redacted]"
 
-    /** `mp_live_…` / `mp_test_…` and long bearer tokens, whoever they belong to. */
-    val KEY_SHAPED_RE = Regex("mp_(?:live|test)_[A-Za-z0-9_\\-]{4,}|(?i:bearer)\\s+[A-Za-z0-9._\\-]{12,}")
+    /**
+     * Every credential SHAPE this SDK can recognise without holding the secret.
+     *
+     * `whsec_` and `sk_` were absent, and their absence was not theoretical: the webhook SIGNING
+     * SECRET is spelled `whsec_…`, so the one credential most likely to be echoed back by a
+     * misconfigured webhook emitter was the one shape this scrubber could not see. `sk_` is the
+     * conventional spelling for a secret key across the payment ecosystem, and a body that quotes
+     * one is a body we must not print either.
+     */
+    val KEY_SHAPED_RE = Regex(
+        "mp_(?:live|test)_[A-Za-z0-9_\\-]{4,}" +
+            "|whsec_[A-Za-z0-9_\\-]{4,}" +
+            "|sk_[A-Za-z0-9_\\-]{4,}" +
+            "|(?i:bearer)\\s+[A-Za-z0-9._\\-]{12,}",
+    )
 
     /** Does this server-supplied string carry something shaped like a credential? */
     fun looksLikeCredential(value: String?): Boolean =
@@ -43,14 +56,26 @@ internal object CredentialShapes {
 internal class Redactor(secrets: List<String?>) {
 
     /**
-     * Only substantial secrets are matched. A 3-character "secret" would turn every response into
-     * asterisks and destroy the diagnostic value of the message for no security gain.
+     * EVERY nonempty configured secret is a needle.
+     *
+     * This used to drop anything shorter than eight characters, justified as protecting the
+     * diagnostic value of a message from a "secret" so short it appeared everywhere. The
+     * justification assumed a minimum length that is enforced NOWHERE: neither the API-key
+     * configuration nor the webhook-secret parameter has a length floor, so a caller who configures
+     * a seven-character signing secret — a test fixture, a truncated environment variable, a
+     * placeholder that reached production — got a redactor that silently declined to redact the one
+     * value it was constructed to hide. A filter whose precondition is unenforced is not a filter,
+     * it is a hole with a comment over it.
+     *
+     * The diagnostic concern was real but is the wrong trade: a noisy message is an inconvenience,
+     * a printed signing secret is a forgeable webhook. Short secrets are now redacted like any
+     * other, and the length question is left to whoever chooses the secret.
      */
     private val needles: List<String> = secrets
         .asSequence()
         .filterNotNull()
         .map { it.trim() }
-        .filter { it.length >= MIN_SECRET_LENGTH }
+        .filter { it.isNotEmpty() }
         .distinct()
         // Longest first, so a key is not partially masked by a shorter secret that is a substring
         // of it, leaving the remaining characters exposed.
@@ -131,12 +156,122 @@ internal class Redactor(secrets: List<String?>) {
         }
     }
 
-    private companion object {
+    internal companion object {
         const val MASK = CredentialShapes.MASK
-        const val MIN_SECRET_LENGTH = 8
-        const val MAX_DEPTH = 8
+
+        /**
+         * The redaction traversal bound is PINNED TO THE PARSER'S bound, not chosen independently.
+         *
+         * It was 8 while [Json.MAX_DEPTH] — the depth to which a hostile response is actually
+         * parsed — was 64. Every structure between depth 9 and 64 therefore parsed successfully and
+         * then hit a scanner that gave up on it. This one failed CLOSED (the subtree is replaced by
+         * a placeholder rather than returned), so it was a diagnostic loss rather than a leak — but
+         * it was a loss on exactly the bodies most worth reading, and the next person to make the
+         * recursion return the value instead of the placeholder would have turned it into a leak
+         * with no test objecting.
+         *
+         * Deriving it from the parser bound means the two CANNOT drift: there is no second number
+         * to forget to update. [NinthRoundTest] additionally asserts the invariant directly, so the
+         * relationship survives someone replacing this expression with a literal.
+         */
+        const val MAX_DEPTH = Json.MAX_DEPTH
+
+        /**
+         * The longest server-controlled run any single diagnostic will interpolate.
+         *
+         * A message is a string that gets logged, and a field the server controls is a field the
+         * server can make a megabyte long. Redaction alone does not bound it — a hostile value that
+         * contains no credential is passed through verbatim — so the length is bounded too, and the
+         * truncation is marked rather than silent.
+         */
+        const val MAX_FIELD_CHARS = 120
 
         /** ONE definition, shared with the webhook path. See [CredentialShapes]. */
         val KEY_SHAPED_RE = CredentialShapes.KEY_SHAPED_RE
+
+        /**
+         * A redactor holding no secret of its own — shape scrubbing only.
+         *
+         * For diagnostic sites that are genuinely outside any client or webhook secret's scope. It
+         * is a [Redactor] rather than a bare call to [CredentialShapes.scrub] so that every
+         * diagnostic in the SDK goes through the SAME choke point and gets the SAME length bound.
+         */
+        val SHAPES_ONLY = Redactor(emptyList())
+    }
+
+    /**
+     * THE ONE WAY server-controlled data is allowed to enter a diagnostic string.
+     *
+     * ── Why a choke point rather than care at each site ───────────────────────────────────
+     * Every leak this SDK has had on an error path had the same shape: someone wrote
+     * `"field was \"$value\""` with a value that came off the wire. Reviewing each such site is a
+     * process that works until the next site is written. Routing them all through one function
+     * makes the safe spelling the SHORT one, and makes the unsafe spelling — a bare `$value` — a
+     * thing a reviewer and a test can both grep for.
+     *
+     * Three things happen here, in this order, and all three are load-bearing:
+     *   1. REDACT the configured secrets this redactor holds.
+     *   2. SCRUB anything merely SHAPED like a credential, including secrets we do not hold.
+     *   3. BOUND the length, so a hostile field cannot make a log entry arbitrarily large.
+     *
+     * The result is quoted, so an empty or whitespace value is visible in the message rather than
+     * vanishing into the surrounding prose.
+     */
+    fun field(value: Any?): String {
+        if (value == null) return "absent"
+        val redacted = text(value.toString())
+        val bounded = if (redacted.length <= MAX_FIELD_CHARS) {
+            redacted
+        } else {
+            redacted.take(MAX_FIELD_CHARS) + "… [${redacted.length} chars, truncated]"
+        }
+        return "\"$bounded\""
+    }
+
+    /**
+     * Does this parsed structure carry one of OUR OWN CONFIGURED secrets anywhere inside it?
+     *
+     * Used to REFUSE rather than to scrub. A correctly-signed body that quotes our own signing
+     * secret back at us is not a formatting problem to be masked: it means the sender holds the
+     * secret and is echoing it, i.e. the emitter is misconfigured or the server is compromised. In
+     * either case the right answer is to stop, not to print a tidier version of the same body.
+     *
+     * ── Exact needles ONLY, deliberately not credential SHAPES ────────────────────────────
+     * A shape match means "this looks like somebody's credential" — possibly another environment's
+     * key, possibly a string that merely resembles one. That is a reason to SCRUB the value, and
+     * the existing per-field rules already do so (free-form prose is masked, identifier fields are
+     * refused individually). Escalating every shape match to a whole-event refusal would reject
+     * legitimate events over a substring resemblance.
+     *
+     * An exact match on a secret THIS CLIENT HOLDS admits no such benign reading. Nobody can echo
+     * it back without having it.
+     *
+     * The traversal FAILS CLOSED. A structure too deep to finish scanning is reported as carrying a
+     * credential, because "we could not look" and "there is nothing there" are different answers
+     * and only one of them is safe to act on. With [MAX_DEPTH] pinned to the parser's bound this is
+     * unreachable through the parser — which is the point: it is the assertion that keeps it
+     * unreachable, not an assumption that it already is.
+     */
+    fun containsCredentialDeep(value: Any?): Boolean = scan(value, 0)
+
+    /** An exact match on a secret this client holds — no shape matching. See [containsCredentialDeep]. */
+    private fun holdsConfiguredSecret(value: String?): Boolean =
+        value != null && needles.any { value.contains(it) }
+
+    private fun scan(value: Any?, depth: Int): Boolean {
+        if (depth > MAX_DEPTH) return true
+        return when (value) {
+            null -> false
+            is String -> holdsConfiguredSecret(value)
+            is Boolean, is Number -> false
+            is Map<*, *> -> value.any { (k, v) ->
+                // KEYS as well as values: an echoed request renders headers as keys at least as
+                // often as it renders them as values.
+                holdsConfiguredSecret(k?.toString()) || scan(v, depth + 1)
+            }
+            is Iterable<*> -> value.any { scan(it, depth + 1) }
+            is Array<*> -> value.any { scan(it, depth + 1) }
+            else -> holdsConfiguredSecret(value.toString())
+        }
     }
 }

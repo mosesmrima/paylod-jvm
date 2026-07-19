@@ -66,6 +66,15 @@ object Webhooks {
      */
     const val MAX_PAYLOAD_BYTES = 1024 * 1024
 
+    /**
+     * The longest `x-webhook-signature` header this SDK will even look at.
+     *
+     * A well-formed header is `t=<unix>,v1=<64 hex>` — under 90 characters. This ceiling is the
+     * bound applied BEFORE the header is split, so an unauthenticated sender cannot make the parse
+     * itself expensive. See [parseHeader].
+     */
+    const val MAX_SIGNATURE_HEADER_CHARS = 512
+
     private fun hmacHex(secret: String, timestamp: String, body: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(secret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
@@ -117,6 +126,18 @@ object Webhooks {
      * taking the last pair. Duplicates of either key are fatal, as is a malformed `v1`.
      */
     private fun parseHeader(header: String): Header? {
+        // BOUNDED BEFORE IT IS SPLIT. `header` arrives from an UNAUTHENTICATED sender — this runs
+        // before the HMAC, which is the whole point of parsing it — and `split(",")` on an N-byte
+        // header allocates a list of substrings totalling N bytes, plus a trimmed copy of each.
+        // A sender who has proved nothing could therefore command memory and CPU proportional to
+        // whatever header size the surrounding server accepts, on every request, for free.
+        //
+        // The refusal is on the LENGTH alone, which costs nothing, and the ceiling is small because
+        // the grammar is small: a well-formed header is `t=<=19 digits>,v1=<64 hex>`, about 90
+        // characters. [MAX_SIGNATURE_HEADER_CHARS] leaves generous room for unknown
+        // forward-compatible keys while still being orders of magnitude below anything that costs
+        // us something to shred.
+        if (header.length > MAX_SIGNATURE_HEADER_CHARS) return null
         var t: String? = null
         var v1: String? = null
         var tCount = 0
@@ -184,8 +205,47 @@ object Webhooks {
         nowSec: Long?,
     ): WebhookEvent {
         val root = verifySignatureAt(payload, signature, secret, toleranceSec, nowSec)
-        assertEventSchema(root)
-        return toEvent(root)
+        // ── THE CONFIGURED SECRET TRAVELS WITH THE BODY FROM HERE ON ──────────────────────────
+        //
+        // It used to stop at the signature check. `assertEventSchema` and `toEvent` ran with no
+        // knowledge of the secret at all, so both fell back to SHAPE-ONLY scrubbing — and the shape
+        // list did not include `whsec_`. The consequence was direct: a correctly-signed body that
+        // echoed the caller's own signing secret into, say, `data.resultDesc` had that secret
+        // copied onto a public field of `WebhookEventData` (a data class, so its GENERATED
+        // `toString()` prints it), or interpolated raw into an invalid-schema exception message.
+        // Either one reaches the log on the handler's first line, and a leaked signing secret is a
+        // forgeable webhook — the attacker can then sign anything this very function will accept.
+        //
+        // `verifySignature` had been given a secret-seeded redactor for exactly this reason. The
+        // TYPED path — the one production handlers are told to use — had not.
+        val redact = Redactor(listOf(secret))
+
+        // ── REFUSED, NOT STRIPPED ─────────────────────────────────────────────────────────────
+        //
+        // Masking would produce a well-formed event that we hand to the handler as though nothing
+        // had happened. But a correctly-signed body containing OUR OWN signing secret is not a
+        // formatting defect: the signature proves the sender holds the secret, so the sender is
+        // either a misconfigured emitter echoing its own configuration or an attacker who has
+        // already obtained it. Both mean the secret must be rotated, and neither is a situation in
+        // which the right move is to quietly process the payment event inside it.
+        //
+        // The message deliberately names no field and quotes no value — pointing at the leak would
+        // reproduce it in the very diagnostic that reports it.
+        if (redact.containsCredentialDeep(root)) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INVALID_PAYLOAD,
+                "Webhook body is signed correctly but contains this integration's own credential. " +
+                    "That is not a malformed field, it is evidence the signing secret is known to " +
+                    "whatever produced this body — a misconfigured emitter echoing its own " +
+                    "configuration, or a sender who already holds the secret. The event is refused " +
+                    "rather than scrubbed, because a scrubbed copy would be handed to your handler " +
+                    "as though nothing were wrong. Rotate the webhook signing secret. The offending " +
+                    "value is deliberately not quoted here, so that this message is safe to log.",
+            )
+        }
+
+        assertEventSchema(root, redact)
+        return toEvent(root, redact)
     }
 
     /** The internal fixed-clock seam, `String` overload. */
@@ -542,14 +602,35 @@ object Webhooks {
      *                    the webhook path and the status-read path cannot drift into disagreeing
      *                    about what proves a payment.
      */
-    private fun assertEventSchema(root: Map<String, Any?>) {
+    private fun assertEventSchema(root: Map<String, Any?>, redact: Redactor) {
         val type = root["type"]
         if (type != "payment.success" && type != "payment.failed") {
-            invalid("type was \"$type\", expected payment.success or payment.failed")
+            invalid("type was ${redact.field(type)}, expected payment.success or payment.failed")
         }
+        // ── `created` MUST BE AN INTEGRAL JSON NUMBER ─────────────────────────────────────────
+        //
+        // The old test was `toDouble() != floor(toDouble())`, which INFINITY satisfies: `floor(inf)
+        // == inf`, so the equality holds, and `Double.toLong()` then saturates to `Long.MAX_VALUE`.
+        // A signed event carrying `"created": 1e400` — a literal the JSON reader turns into
+        // `Double.POSITIVE_INFINITY` — therefore passed the "whole number of unix seconds" check
+        // and was published on `WebhookEvent.created` as 9223372036854775807, a timestamp roughly
+        // 292 billion years in the future. Anything downstream doing arithmetic on it (an age, an
+        // ordering, a retention window) inherits that.
+        //
+        // The fix refuses the floating-point representation outright rather than range-checking it.
+        // Unix seconds are an integer; `1e400`, `1.5` and `1.0` are none of them things a
+        // conforming emitter sends, and accepting a float here only re-opens the question of which
+        // floats are safe.
         val created = root["created"]
-        if (created !is Number || created.toLong() < 0 || created.toDouble() != Math.floor(created.toDouble())) {
-            invalid("created is not a non-negative whole number of unix seconds")
+        if (created !is Long && created !is Int && created !is Short && created !is Byte) {
+            invalid(
+                "created is ${redact.field(created)}, not an integral JSON number of unix seconds " +
+                    "— a floating-point spelling (including 1e400, which decodes to infinity and " +
+                    "saturates to Long.MAX_VALUE) is refused rather than coerced",
+            )
+        }
+        if ((created as Number).toLong() < 0) {
+            invalid("created is ${redact.field(created)}, not a non-negative number of unix seconds")
         }
 
         @Suppress("UNCHECKED_CAST")
@@ -601,7 +682,7 @@ object Webhooks {
         val status = data["status"]
         if (status !is String) invalid("data.status is missing or is not a string")
         val parsedStatus = PaymentStatus.parseWire(status)
-            ?: invalid("data.status was \"$status\", not one of pending/success/failed")
+            ?: invalid("data.status was ${redact.field(status)}, not one of pending/success/failed")
 
         // Not merely "is a Number": an exact, positive, whole, in-range KES amount. See [wholeAmount].
         val amount = data["amount"]
@@ -615,7 +696,7 @@ object Webhooks {
 
         val envValue = data["env"]
         if (envValue != null && envValue != "sandbox" && envValue != "production") {
-            invalid("data.env was \"$envValue\", expected sandbox or production")
+            invalid("data.env was ${redact.field(envValue)}, expected sandbox or production")
         }
         optionalString(data["applicationId"], "data.applicationId")
         optionalString(data["phone"], "data.phone")
@@ -632,7 +713,8 @@ object Webhooks {
         val expectedStatus = if (type == "payment.success") PaymentStatus.SUCCESS else PaymentStatus.FAILED
         if (parsedStatus != expectedStatus) {
             invalid(
-                "type is \"$type\" but data.status is \"$status\" — the event contradicts itself, " +
+                "type is ${redact.field(type)} but data.status is ${redact.field(status)} — the " +
+                    "event contradicts itself, " +
                     "so neither field can be trusted",
             )
         }
@@ -672,7 +754,7 @@ object Webhooks {
             if (lexeme == null || lexeme.isBlank() || !DarajaCatalog.isCanonicalCodeLexeme(lexeme)) {
                 invalid(
                     "it announces a failed payment but carries no canonical Daraja result code " +
-                        "(data.resultCode was ${if (resultCode == null) "absent" else "\"$resultCode\""}). " +
+                        "(data.resultCode was ${redact.field(resultCode)}). " +
                         "A failure notice with nothing behind it is a CLAIM, not evidence, and " +
                         "accepting it as terminal is one catalog lookup away from telling you to " +
                         "charge the customer again",
@@ -680,7 +762,7 @@ object Webhooks {
             }
             if (DarajaCatalog.classifyStkResult(lexeme, data["resultDesc"] as? String) != StkOutcome.FAILED) {
                 invalid(
-                    "it announces a failed payment but data.resultCode \"$lexeme\" does not " +
+                    "it announces a failed payment but data.resultCode ${redact.field(lexeme)} does not " +
                         "classify as a terminal failure",
                 )
             }
@@ -767,7 +849,7 @@ object Webhooks {
     }
 
     @Suppress("UNCHECKED_CAST")
-    internal fun toEvent(root: Map<String, Any?>): WebhookEvent {
+    internal fun toEvent(root: Map<String, Any?>, redact: Redactor): WebhookEvent {
         val rawType = root["type"] as String
         val data = root["data"] as Map<String, Any?>
 
@@ -799,7 +881,9 @@ object Webhooks {
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    // The SECRET-SEEDED redactor, not the shape-only scrubber. `DecodedError` is a
+                    // public data class too, and its `description` is server prose.
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }
         } else {
@@ -829,7 +913,7 @@ object Webhooks {
                 // whose generated `toString()` a handler logs. Masked rather than refused so a
                 // decodable failure stays readable. Identifiers take the other route — they are
                 // rejected outright in `assertEventSchema`.
-                resultDesc = CredentialShapes.scrub(asString(data["resultDesc"])),
+                resultDesc = redact.optionalText(asString(data["resultDesc"])),
                 decoded = decoded,
             ),
         )
