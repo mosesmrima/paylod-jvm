@@ -1038,9 +1038,12 @@ CASES = [
         id="R9-baseurl-redaction", tag="nv-adversarial-sweep",
         what="the baseUrl refusal prints the rejected URL verbatim again, so a credential in the "
              "PATH lands in the message a misconfigured integration logs at startup",
+        # No quote characters in the replacement: the point of the revert is that the URL is
+        # interpolated WITHOUT passing through the redactor, and a quoted spelling only made the
+        # mutation a Kotlin syntax error inside the surrounding string literal.
         edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
                 "(got ${redact.field(sanitizeUrl(parsed))})",
-                "(got \"${sanitizeUrl(parsed)}\")")],
+                "(got ${sanitizeUrl(parsed)})")],
     ),
     dict(
         id="R9-json-escape-decoding", tag="nv-json-escaped-key",
@@ -1130,6 +1133,12 @@ def run_tag(tag):
     m = COUNT_RE.search(out)
     rc = proc.returncode
     if not m:
+        # A run with no NVCOUNT is a run that told us nothing, and the reason is in the output we
+        # were about to throw away. Diagnosing this used to mean reproducing the mutation by hand.
+        sys.stderr.write(
+            "\n--- UNTRUSTED RUN (tag=%s, rc=%s): no NVCOUNT line. Last 40 lines ---\n%s\n"
+            % (tag, rc, "\n".join(out.splitlines()[-40:]))
+        )
         return Run(rc, None, None, None)
     return Run(rc, int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
@@ -1198,6 +1207,16 @@ print(f"{len(declared)} nv tags declared, {len(present)} present in the test tre
       flush=True)
 
 results = []
+
+# `--only <id>[,<id>...]` runs a subset. A full sweep is ~15 minutes, and diagnosing ONE broken
+# case by re-running all 92 is how a broken case gets waved through instead of understood.
+ONLY = None
+for _a in sys.argv[1:]:
+    if _a.startswith("--only="):
+        ONLY = set(_a.split("=", 1)[1].split(","))
+if ONLY:
+    CASES = [c for c in CASES if c["id"] in ONLY]
+    print(f"--only: running {len(CASES)} case(s): {', '.join(c['id'] for c in CASES)}\n", flush=True)
 
 for case in CASES:
     tag = case["tag"]
