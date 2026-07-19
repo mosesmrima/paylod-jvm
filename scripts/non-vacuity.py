@@ -520,9 +520,9 @@ CASES = [
         id="R5-zero-launder", tag="nv-zero-nolaunder",
         what="a JSON float zero is collapsed into the canonical success code again",
         edits=[("src/main/kotlin/dev/paylod/Validators.kt",
-                "        is Double -> v.toString()",
-                "        is Double ->\n"
-                "            if (v == Math.floor(v)) v.toLong().toString() else v.toString()")],
+                "        is dev.paylod.internal.JsonNumber -> v.lexeme",
+                "        is dev.paylod.internal.JsonNumber ->\n"
+                "            if (v.toDouble() == Math.floor(v.toDouble())) v.toLong().toString() else v.lexeme")],
     ),
 
     # ── ROUND 6 ───────────────────────────────────────────────────────────────────────────────
@@ -530,7 +530,8 @@ CASES = [
         id="R6-rawzero-parse", tag="nv-rawzero-parse",
         what="the JSON reader collapses a raw -0 back into an integral zero",
         edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
-                'if (token == "-0") return -0.0', 'if (false) return -0.0')],
+                'if (token == "-0") return JsonNumber(token, -0.0)',
+                'if (token == "-0") return JsonNumber("0", 0L)')],
     ),
     dict(
         id="R6-rawzero-write", tag="nv-rawzero-parse",
@@ -543,13 +544,15 @@ CASES = [
         id="R6-rawzero-status", tag="nv-rawzero-status",
         what="a raw -0 on the STATUS path is read as the canonical success code",
         edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
-                'if (token == "-0") return -0.0', 'if (false) return -0.0')],
+                'if (token == "-0") return JsonNumber(token, -0.0)',
+                'if (token == "-0") return JsonNumber("0", 0L)')],
     ),
     dict(
         id="R6-rawzero-webhook", tag="nv-rawzero-webhook",
         what="a raw -0 on the WEBHOOK path is read as the canonical success code",
         edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
-                'if (token == "-0") return -0.0', 'if (false) return -0.0')],
+                'if (token == "-0") return JsonNumber(token, -0.0)',
+                'if (token == "-0") return JsonNumber("0", 0L)')],
     ),
     dict(
         id="R6-body-deadline", tag="nv-body-deadline",
@@ -567,7 +570,11 @@ CASES = [
         id="R6-wh-maxbytes", tag="nv-wh-maxbytes",
         what="a webhook body is HMAC'd and parsed with no size bound (BOTH entry paths reverted)",
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
-                "assertWithinLimit(payload.size)", "Unit"),
+                # Disambiguated by context: `assertWithinLimit(payload.size)` now also appears in
+                # the public `sign` helper, which gained the same bound this round (6.4). This
+                # edit must revert the VERIFICATION path's bound specifically.
+                "        assertWithinLimit(payload.size)\n        if (secret.isEmpty()) {",
+                "        if (secret.isEmpty()) {"),
                ("src/main/kotlin/dev/paylod/Webhooks.kt",
                 "if (payload.length > MAX_PAYLOAD_BYTES) assertWithinLimit(payload.length)\n"
                 "        val bytes = payload.toByteArray(StandardCharsets.UTF_8)\n"
@@ -620,16 +627,32 @@ CASES = [
         what="the decoder trims before the catalog lookup again, so \" 0\" selects the SUCCESS entry",
         edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt", """        val lexeme = codeLexeme(resultCode)
         if (lexeme == null || !isCanonicalCodeLexeme(lexeme)) {
-            return failedFallback(lexeme ?: code, rawDesc)
-        }""", "")],
+            return indeterminateFallback(lexeme ?: code, rawDesc)
+        }""", ""),
+               # A SECOND edit, added this round. `normalizeCode` no longer trims (requirement
+               # 1.1), so a padded code fails the catalog lookup on its own and reverting the
+               # lexeme check alone left the guarantee standing — the case came back VACUOUS.
+               # The two layers are deliberately independent, so removing the GUARANTEE means
+               # removing both: the form check ABOVE the lookup, and the losslessness BELOW it.
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "            else -> resultCode.toString()\n        }",
+                "            else -> resultCode.toString().trim()\n        }")],
     ),
     dict(
         id="R6-decode-terminal", tag="nv-s6-decode-terminal",
         what="the decoder trims before the catalog lookup again, so \" 1032\" decodes as the retryable cancellation",
         edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt", """        val lexeme = codeLexeme(resultCode)
         if (lexeme == null || !isCanonicalCodeLexeme(lexeme)) {
-            return failedFallback(lexeme ?: code, rawDesc)
-        }""", "")],
+            return indeterminateFallback(lexeme ?: code, rawDesc)
+        }""", ""),
+               # A SECOND edit, added this round. `normalizeCode` no longer trims (requirement
+               # 1.1), so a padded code fails the catalog lookup on its own and reverting the
+               # lexeme check alone left the guarantee standing — the case came back VACUOUS.
+               # The two layers are deliberately independent, so removing the GUARANTEE means
+               # removing both: the form check ABOVE the lookup, and the losslessness BELOW it.
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "            else -> resultCode.toString()\n        }",
+                "            else -> resultCode.toString().trim()\n        }")],
     ),
     dict(
         id="R6-decode-anchor", tag="nv-s6-decode-anchor",
@@ -672,31 +695,36 @@ CASES = [
         what="a whole FLOAT result code is collapsed to its integer form again, on the status path "
              "and in the catalog alike",
         edits=[("src/main/kotlin/dev/paylod/Validators.kt",
-                "        is Double -> v.toString()\n        else -> v.toString()",
-                "        is Double ->\n"
-                "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()\n"
-                "        else -> v.toString()"),
+                # A wire float is now a JsonNumber, so the laundering has to be reintroduced on the
+                # lexeme branch — the `is Double` branch it used to live on is unreachable from a
+                # parsed body.
+                "        is dev.paylod.internal.JsonNumber -> v.lexeme",
+                "        is dev.paylod.internal.JsonNumber ->\n"
+                "            if (v.toDouble() == Math.floor(v.toDouble()) && v.toDouble() != 0.0)\n"
+                "                v.toLong().toString() else v.lexeme"),
                ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
-                "        if (resultCode != null && codeLexeme(resultCode) == null) return StkOutcome.PENDING",
-                "        if (false) return StkOutcome.PENDING")],
+                "[dev.paylod.internal.JsonNumber].\n"
+                "        is JsonNumber -> resultCode.lexeme",
+                "[dev.paylod.internal.JsonNumber].\n"
+                "        is JsonNumber ->\n"
+                "            if (resultCode.toDouble() == Math.floor(resultCode.toDouble()))\n"
+                "                resultCode.toLong().toString() else resultCode.lexeme")],
     ),
     dict(
         id="R7-float-webhook", tag="nv-float-webhook",
-        what="the webhook reader collapses a whole FLOAT result code to its integer form again",
+        what="the webhook reader collapses a whole FLOAT result code to its integer form again "
+             "(BOTH the shared lexeme extractor and the webhook's own normalizer reverted)",
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
-                "        is Double -> v.toString()\n        else -> v.toString()",
-                "        is Double ->\n"
-                "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()\n"
-                "        else -> v.toString()"),
-               ("src/main/kotlin/dev/paylod/Webhooks.kt",
-                "                is Byte, is Short, is Int, is Long -> resultCode.toString()\n"
-                "                // A float has no lexeme — `1032.0` and `1.032e3` are not tokens Daraja sends.\n"
-                "                else -> null",
-                "                is Byte, is Short, is Int, is Long -> resultCode.toString()\n"
-                "                is Double ->\n"
-                "                    if (resultCode == Math.floor(resultCode)) resultCode.toLong().toString()\n"
-                "                    else resultCode.toString()\n"
-                "                else -> null")],
+                "        is JsonNumber -> v.lexeme",
+                "        is JsonNumber ->\n"
+                "            if (v.toDouble() == Math.floor(v.toDouble())) v.toLong().toString() else v.lexeme"),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "[dev.paylod.internal.JsonNumber].\n"
+                "        is JsonNumber -> resultCode.lexeme",
+                "[dev.paylod.internal.JsonNumber].\n"
+                "        is JsonNumber ->\n"
+                "            if (resultCode.toDouble() == Math.floor(resultCode.toDouble()))\n"
+                "                resultCode.toLong().toString() else resultCode.lexeme")],
     ),
     dict(
         id="R7-detail-retryable", tag="nv-detail-retryable",
@@ -835,7 +863,15 @@ CASES = [
                 ""),
                ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
                 'Regex("(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){2,6}")',
-                'Regex("(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){1,6}")')],
+                'Regex("(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){1,6}")'),
+               # A FOURTH edit, added this round. The catalog-membership check (requirement 1.5)
+               # now also stops a non-canonical code reaching the terminal branch, so reverting the
+               # three lexeme guards alone left the guarantee standing and the case came back
+               # VACUOUS. That is the harness working: a protection with four independent layers
+               # needs all four reverted before the GUARANTEE is actually gone.
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "            if (!knownStkResultCodes.contains(raw)) return StkOutcome.PENDING\n",
+                "")],
     ),
     dict(
         id="R8-exotic-message", tag="nv-exotic-message",
@@ -857,12 +893,12 @@ CASES = [
         what="verifySignature hands back the raw parsed body again, unknown fields and all "
              "(BOTH public overloads reverted)",
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
-                "    ): Map<String, Any?> = scrubTree(\n"
+                "    ): Map<String, Any?> = refuseOrScrub(\n"
                 "        verifySignatureAt(payload, signature, secret, toleranceSec, null), Redactor(listOf(secret)),\n"
                 "    )",
                 "    ): Map<String, Any?> = verifySignatureAt(payload, signature, secret, toleranceSec, null)"),
                ("src/main/kotlin/dev/paylod/Webhooks.kt",
-                "    ): Map<String, Any?> = scrubTree(\n"
+                "    ): Map<String, Any?> = refuseOrScrub(\n"
                 "        verifySignatureAt(boundedBytes(payload), signature, secret, toleranceSec, null),\n"
                 "        Redactor(listOf(secret)),\n"
                 "    )",
@@ -1031,7 +1067,7 @@ CASES = [
         what="signed event `created` accepts a floating-point spelling again, so 1e400 decodes to "
              "infinity and is published as Long.MAX_VALUE",
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
-                "        if (created !is Long && created !is Int && created !is Short && created !is Byte) {",
+                "        if (!createdIsIntegral) {",
                 "        if (created !is Number || created.toDouble() != Math.floor(created.toDouble())) {")],
     ),
     dict(

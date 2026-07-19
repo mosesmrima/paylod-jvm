@@ -4,6 +4,156 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-07-20
+
+**Conformance release.** This one is not organised around a review's findings. It is organised
+around [`SDK-CONFORMANCE.md`](https://github.com/paylod/paylod/blob/main/docs/SDK-CONFORMANCE.md),
+a specification every paylod SDK — Node, PHP, Python, Kotlin/JVM — must satisfy in full.
+
+That document exists because of a pattern, not a bug. Ten review rounds produced 95 distinct
+findings across four SDKs, and the dominant failure was never that a defect was hard to fix: it was
+that a fix landing in one SDK never reached the other three. PHP closed the
+redaction-placeholder-as-receipt defect in round 9; round 10 found the identical defect still open
+in Node, Python and here. So the unit of work is no longer "this SDK's findings list". It is the
+specification, and an SDK is conformant when it satisfies every requirement with a test proving
+each one.
+
+**289 tests, 0 failed, 0 skipped. 104/104 mutations caught** by `scripts/non-vacuity.py`, which
+reverts each protection in the source and requires its guarding test to FAIL. Signing is unchanged
+(the shared golden webhook vector still matches byte-for-byte) and the Java interop suite passes.
+
+### A redaction placeholder was accepted as proof of payment
+
+The defect the specification's receipt requirement exists for, and the one this release most needs
+you to know about.
+
+`PaymentSemantics.hasReceipt` was `!mpesaReceipt.isNullOrBlank()`. Non-emptiness is a property of a
+string, not of a receipt — and the value it most dangerously admitted was this SDK's own redaction
+mask. When a server echoed a credential into `mpesaReceipt`, the scrubber rewrote the field to
+`[redacted]`, and that non-blank string then SATISFIED the evidence test. **The act of hiding a
+secret manufactured proof of payment**, and a `success` claim beside it resolved to `PAID`.
+
+A receipt is now validated against a positive grammar — exactly ten uppercase alphanumerics,
+derived from every real receipt in the paylod fixtures, and identical across all four SDKs. It is
+matched with `Regex.matches` (a full-region match, the Kotlin equivalent of `\z`) rather than an
+`$` anchor, because in Java — as in PCRE and Python `re` — `$` also matches immediately before a
+trailing newline, so `"SFF6XYZ123\n"` would have validated.
+
+Sanitizer output is refused INDEPENDENTLY of that grammar, and on every identity and correlation
+surface: receipt, `paymentId`, `checkoutRequestId`, payment id, idempotency key. `XXXXXXXXXX`
+satisfies `[A-Z0-9]{10}` exactly, so resting the property on which characters today's mask happens
+to use would be resting it on a coincidence.
+
+A masked idempotency key is the quieter half of this: two different payment attempts sanitized the
+same way arrive carrying the SAME key, so the server collapses two genuinely distinct charges into
+one and a payment is silently lost.
+
+### An unknown result code was a confident failure that told customers to try again
+
+Two separate defects that compounded.
+
+`classifyStkResult` returned `FAILED` for any canonically-shaped non-zero number, catalog member or
+not — so `999999`, a code Daraja does not define, became terminal failure EVIDENCE, and a `failed`
+claim beside it produced a `FAILED` verdict. Catalog membership is now required before that branch.
+Form is not meaning: passing the lexeme check establishes only that a value is spelled the way
+Daraja spells codes.
+
+And the decoder's fallback — reached for absent, malformed, non-canonical and unplaceable codes —
+announced `"Payment failed"` with the customer message *"The payment didn't go through. Please try
+again."*, beside `retryable = false`, while its own `fix` text admitted "this code is not in the
+catalog, so we cannot prove no money moved". It is now an explicitly indeterminate decode.
+
+Seventeen catalog entries had the same contradiction: `retryable = false` next to a customer message
+inviting another attempt. `retryable` is a boolean a merchant branches on; `message` is the sentence
+a customer READS, and when they disagree the customer wins — they tap Pay again. Codes 17, 26, 1025
+and 9999 are M-Pesa system errors that occur AFTER the push was dispatched, so none of them proves
+no debit occurred. All seventeen messages were rewritten. No `retryable` value was changed: flipping
+one to `true` is the double-charge direction and is a product decision, not a conformance one.
+
+**Behaviour change.** `DecodedError.title` for an unplaceable code is now `"Payment state unknown"`
+rather than `"Payment failed"`, and several `customerMessage` strings changed. If you assert on
+these strings, update those assertions. Nothing that was `paid` or `retryable` becomes less so.
+
+### Malformed bytes became an ordinary string
+
+Three sites decoded network bytes with REPLACE semantics — `String(payload, UTF_8)` on the webhook
+path, `ByteArrayOutputStream.toString(charset)` on the response path, and the bundled catalog
+resource. All three silently rewrite malformed input to `U+FFFD` instead of rejecting it, which
+launders in two directions: ten raw `FF FE` pairs inside a receipt field are not text, but they
+decoded to a ten-character NONBLANK string; and every invalid sequence maps to the same `U+FFFD`,
+so genuinely different bytes compare EQUAL on the id-binding and correlation checks. Now a strict
+`CharsetDecoder` with `REPORT` on both malformed and unmappable input.
+
+### The parser now keeps the sender's numeric token
+
+The parser returned plain `Long`/`Double`, and safety was recovered downstream by discriminating on
+TYPE. That was sound — none of `-0`, `0.0`, `0e999`, `1032.0`, `1.032e3` ever reached a catalog
+entry — but it was sound by a proxy, and the guarantee rested on the token-to-JVM-type mapping.
+Numbers now carry the token exactly as written, so `codeLexeme` returns the real spelling and
+`isCanonicalSuccessCode` compares it to the literal `"0"`. `Json.write` emits it verbatim, making a
+parse/write round-trip byte-exact — which matters, because a stub that could not carry a spelling is
+how one of these defects stayed invisible to every test built on one.
+
+This also consolidated a THIRD private lexeme implementation in `Webhooks`, which predated token
+retention and would have rejected every legitimate failure webhook.
+
+### Credentials: the last two paths into a public object
+
+`resultCode` was the one server-controlled field on a status body with no credential check, copied
+verbatim into `Payment.resultCode`, `PaymentOutcome.code` and `DecodedError.code` — and therefore
+into the generated `toString()` of all three. It is now refused, like the other identity-bearing
+fields.
+
+`decodeError` never touches the network and so has no client to redact for it, yet builds
+`DecodedError.code` and `.cause` from values that came from a webhook body or a log line. The static
+surface now masks credential shapes and bounds both fields; `Paylod.decodeError` additionally runs
+the CLIENT's redactor, which knows the configured secrets BY VALUE — the case shape matching
+structurally cannot catch.
+
+### `verifySignature` sanitized a body it should have refused
+
+`parseAndVerify` has refused a signed body containing this integration's own webhook secret since
+0.9.0. `verifySignature` — the same trust decision through a different public function — sanitized
+and DELIVERED it. Nobody can echo that secret without holding it, so the emitter is misconfigured or
+the sender is compromised.
+
+Its scrubbing was also done by a private walker with NO depth cap at all, sitting beside the
+depth-pinned `Redactor`: an adversarially nested body was a `StackOverflowError` thrown from inside
+a verification path. Deleted; that path now uses `Redactor.body`.
+
+**Behaviour change.** `Webhooks.verifySignature` now throws `PaylodSignatureVerificationException`
+for a body echoing your configured signing secret. A credential merely SHAPED like one, which the
+client does not hold, is still scrubbed and delivered.
+
+### Two lower layers normalized before validating
+
+`DarajaCatalog.normalizeCode` trimmed, turning `" 0"` and `"1032\n"` into canonical codes one layer
+BELOW every check written to reject them. Its callers guarded it — but "currently unreachable"
+describes today's call graph, not the function, and the specification is explicit that a guard at
+one layer is not a guard at the layer below. Likewise `parseHeader` trimmed the signature header's
+VALUES, so a whitespace-padded anti-replay timestamp passed a check written to require a strict
+decimal token.
+
+### Verification
+
+- **104 mutation cases** (was 92). Every protection landed this round is registered, and the
+  harness's tag-registration guard refused to run at all until they were — the "missing test
+  wearing the badge of a verified one" check doing its job unprompted.
+- **Two harness holes closed**, both the same shape as the vacuity it exists to detect.
+  `--only=<typo>` ran zero cases and exited 0 with "0/0 mutations caught"; `-PnvTag=<no-such-tag>`
+  exited 0 and printed `NVRESULT PASSED`. Both are now hard failures.
+- **One new case came back VACUOUS on its first run**, and the test was at fault, not the case:
+  restoring the `.trim()` failed nothing because every caller checked the lexeme first.
+  `normalizeCode` is now asserted directly to be lossless.
+- **The adversarial sweep's own inspection walk stopped at depth 8** while the SDK parses and
+  redacts to 64 — the same drift it exists to detect, in the one place whose job is to notice it.
+  Pinned, and it now fails closed rather than returning quietly at the bound. Its catalog fixture
+  used a code the catalog DEFINES, so the poisoned description never reached the object and the
+  scenario proved that a discarded string was absent. `resultCode` poisoning was added.
+- **The greppability guard now covers every C0 control and DEL**, not just NUL. This turned out not
+  to be a JVM quirk: the Node SDK carried a raw NUL and a raw DEL inside test fixture strings,
+  hiding 823 lines from `grep`.
+
 ## [0.9.0] - 2026-07-19
 
 An eighth independent review against the threat model in `SECURITY.md`: one High, four Medium,
