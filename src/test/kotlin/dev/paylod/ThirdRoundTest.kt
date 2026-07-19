@@ -363,11 +363,15 @@ class ThirdRoundTest {
 
     @Test
     fun `the parser rejects unescaped control characters inside a string`() {
+        // The control characters are spelled as ESCAPES, not embedded as raw bytes. They are
+        // the same characters at runtime, but a raw NUL in the source makes the whole file
+        // `data` to `file(1)`, and grep then skips it silently -- a fixture is not worth making
+        // a file invisible to review tooling.
         val bad = listOf(
-            "{\"a\":\"x y\"}",
+            "{\"a\":\"x\u0000y\"}",
             "{\"a\":\"x\ny\"}",
             "{\"a\":\"x\ty\"}",
-            "{\"a\":\"xy\"}",
+            "{\"a\":\"x\u001fy\"}",
         )
         for (text in bad) {
             assertThrows<Json.JsonParseException>("accepted ${text.replace("\n", "\\n")}") {

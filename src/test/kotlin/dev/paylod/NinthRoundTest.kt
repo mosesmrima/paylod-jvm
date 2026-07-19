@@ -712,6 +712,23 @@ class NinthRoundTest {
     }
 
     @Test
+    fun `no source file contains a raw NUL byte, so the whole tree stays greppable`() {
+        // `Json.kt` carried one, as the end-of-input sentinel in `peek()`. A single NUL makes a file
+        // `data` rather than text: `grep` skips it SILENTLY, printing no match and no warning. A
+        // reviewer grepping for the parser's depth bound therefore got nothing back and could
+        // reasonably conclude the parser had none — which is exactly the drift this round found.
+        //
+        // A parser on a payments path is the last file that should be invisible to review tooling,
+        // so the property is asserted rather than left to whoever next types a control character.
+        val offenders = File("src").walkTopDown()
+            .filter { it.isFile && (it.extension == "kt" || it.extension == "java") }
+            .filter { it.readBytes().contains(0) }
+            .map { it.path }
+            .toList()
+        assertTrue(offenders.isEmpty(), "source files contain raw NUL bytes: $offenders")
+    }
+
+    @Test
     @Tag("nv-sim-outcome-handles")
     fun `simulate outcome attaches its deterministic key and payment id to every failure`() {
         // Each of these fails AFTER the settle may have taken effect, so each is a state the caller

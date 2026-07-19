@@ -4,6 +4,124 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-07-19
+
+An eighth independent review against the threat model in `SECURITY.md`: one High, four Medium,
+three Low — the cleanest result any paylod SDK has returned. This release closes all eight and
+adds a permanent adversarial sweep that immediately found a ninth nobody had reported.
+
+Every fix carries a test verified non-vacuously by `scripts/non-vacuity.py`, which reverts the fix
+in the source and requires the guarding test to FAIL: **92/92 mutations caught**. Signing is
+unchanged (the shared golden webhook vector still matches byte-for-byte) and the Java interop suite
+still passes. 266 tests, 0 skipped.
+
+### HIGH — the typed webhook path discarded the signing secret
+
+`Webhooks.parseAndVerify` dropped the configured secret at the signature check. `assertEventSchema`
+and `toEvent` then ran with SHAPE-ONLY scrubbing — and the shape list did not include `whsec_`, so
+the one credential this path definitely holds was the one it could not recognise. A correctly signed
+body that echoed the caller's own signing secret put it onto a public `WebhookEventData` field (a
+data class, so its generated `toString()` prints it) or interpolated it raw into an invalid-schema
+exception message. Both reach the log on a handler's first line, and a leaked signing secret is a
+forgeable webhook: the attacker can then sign anything this function accepts.
+
+`verifySignature` had been given a secret-seeded redactor for exactly this reason. The typed path —
+the one production handlers are told to use — had not.
+
+The fix is structural rather than per-site, because per-site is what produced the last three rounds
+of this same finding:
+
+- **One diagnostics choke point.** `Redactor.field()` redacts the configured secrets, scrubs
+  credential shapes, and BOUNDS the interpolated length. Every server-controlled value in a webhook
+  diagnostic now goes through it. The safe spelling is the short one; a bare `$value` is now
+  something a reviewer and a test can grep for.
+- **One recursive redactor**, walking nested maps, lists and arrays to their string leaves — keys
+  included — not scalars only.
+- **The traversal bound is pinned to the parser's.** `Redactor.MAX_DEPTH` was 8 while `Json.MAX_DEPTH`
+  was 64, so everything between depth 9 and 64 parsed successfully and then met a scanner that gave
+  up on it. It now derives from the parser bound, and a test asserts `REDACT_DEPTH >= PARSE_DEPTH`
+  so the two cannot drift.
+- **Refuse, do not strip.** A signed body containing one of our own configured secrets means the
+  sender holds it — a misconfigured emitter echoing its configuration, or an attacker who already
+  has it. The event is refused and the message tells the caller to rotate, without quoting the value
+  it is reporting. Exact secrets only: credential SHAPES stay on the existing scrub-or-refuse rules,
+  so a mere resemblance cannot reject a legitimate event.
+
+### NEW — the adversarial sweep, and what it found
+
+A permanent sweep enumerates every public exception and data class, discovered from the compiled
+class files rather than a hand-maintained list, drives the SDK's real entry points with hostile
+responses echoing both credentials at several nesting depths, and asserts neither is reachable via
+`toString()`, the message, the cause chain, or any nested field. Objects are produced BY the SDK,
+never constructed directly — a data class handed a credential trivially contains one. A self-check
+fails if any discovered public type was never actually produced.
+
+It immediately found an unreported leak: **`PaylodConfigException` printed the rejected `baseUrl`**,
+and `sanitizeUrl` stripped userinfo, query and fragment but kept the PATH verbatim. A credential in
+the path — a copied signed URL, a callback endpoint carrying a key, a misassembled environment
+variable — went straight into the message a misconfigured integration logs at startup. Now routed
+through the same choke point.
+
+### MEDIUM — the outbound writer allocated before it checked its budget
+
+The write bound was checked before `writeValue` was entered and after it returned: the wrong side of
+the work for a scalar. An oversized `metadata` string, or a map KEY, was copied into the
+`StringBuilder` in full and only then measured, so a large enough value was still an
+`OutOfMemoryError` instead of the typed refusal the bound exists to produce. String emission is now
+budget-aware on entry — overflow-safe `Long` arithmetic on the raw length, since escaping only ever
+grows a string — and re-checked as escaping expands it.
+
+### MEDIUM — `simulate.outcome()` lost the charge handles
+
+Validator refusals, malformed 2xx bodies and a missing or non-Boolean `webhookQueued` all happen
+AFTER the settle may have taken effect, and all escaped with neither the deterministic settle key
+nor the payment id. "Retry with the same key" is not something a caller can do when the key was
+never handed to them. `pay()` additionally stranded the payment its own `collect` had just created;
+it now propagates that context.
+
+### MEDIUM — short secrets were silently excluded from redaction
+
+`Redactor` dropped any configured secret shorter than eight characters, justified by a minimum
+length enforced NOWHERE: neither the API key nor the webhook secret has a floor. A caller with a
+seven-character signing secret got a redactor that declined to redact the value it was built to
+hide. Every nonempty secret is now a needle. `whsec_` and `sk_` were also added to the recognised
+credential shapes.
+
+### MEDIUM — the signature header was split without a length bound
+
+The header arrives from an UNAUTHENTICATED sender — that is the whole point of parsing it — and
+`split(",")` allocated substrings totalling its full length. Bounded at 512 characters before the
+split, on the length alone. A well-formed header is under 90.
+
+### LOW — signed `created` accepted floating-point infinity
+
+`floor(inf) == inf`, so the wholeness test accepted infinity and `Double.toLong()` saturated,
+publishing a `created` of `Long.MAX_VALUE` — roughly 292 billion years in the future — that anything
+downstream inherited. `created` must now be an integral JSON number; float spellings are refused
+rather than range-checked.
+
+### LOW — two tests that could not fail
+
+- The escaped-member-name test spelled every fixture as the literal `resultCode`, so it passed
+  whether or not escaped-key decoding existed. It was guarding PHP's Critical. It now uses real
+  `\uXXXX` escapes, including both orderings of a mixed literal/escaped duplicate pair, and a new
+  mutation reverts escape decoding independently.
+- The mutation described as reattaching a credential-bearing cause only removed message redaction
+  and never supplied the throwable as a cause, so a CAUGHT verdict established nothing about the
+  cause chain. Split into two cases: one for the message, one that keeps the message redacted and
+  genuinely reattaches the cause.
+
+### Housekeeping
+
+- `Json.kt` contained a raw NUL byte as its end-of-input sentinel, which made the file `data` rather
+  than text — `grep` skipped it SILENTLY. A reviewer grepping for the parser's depth bound got no
+  match and could reasonably conclude there was none, which is exactly the drift this round found.
+  Both that sentinel and a control-character test fixture are now spelled as escapes, and a test
+  keeps the tree greppable.
+- The non-vacuity harness now dumps build output for any run that produces no `NVCOUNT` line, and
+  accepts `--only=<id>` to run a subset. A broken case that takes a full 15-minute sweep to
+  re-examine is a broken case that gets waved through.
+
 ## [0.8.0] - 2026-07-19
 
 A seventh independent review, conducted against the threat model in `SECURITY.md`. Two High

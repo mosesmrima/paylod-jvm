@@ -482,7 +482,16 @@ internal object Json {
             }
         }
 
-        private fun peek(): Char = if (pos < src.length) src[pos] else ' '
+        /**
+         * The end-of-input sentinel.
+         *
+         * Spelled as the ESCAPE `\u0000`, never as a literal NUL byte in the source. A raw NUL
+         * makes this file `data` rather than text to `file(1)`, and grep then skips it silently
+         * -- so a reviewer grepping the tree for, say, the parser's depth bound gets no match and
+         * concludes there is none. A parser is the last file in this SDK that should be invisible
+         * to review tooling.
+         */
+        private fun peek(): Char = if (pos < src.length) src[pos] else '\u0000'
 
         private fun next(): Char {
             if (pos >= src.length) fail("unexpected end of input")
