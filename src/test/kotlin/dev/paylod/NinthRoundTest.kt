@@ -692,7 +692,11 @@ class NinthRoundTest {
     }
 
     @Test
-    @Tag("nv-write-budget")
+    // Tagged to the WRITE-BOUNDS case, which reverts the writer's depth, size, cycle and
+    // string-emission bounds as a set. `nv-write-budget` was removed as a standalone case because
+    // allocation ORDERING is not behaviourally distinguishable from the in-loop bound, and a tag
+    // with no registered case is a protection claiming a verification it never had.
+    @Tag("nv-json-write-bounds")
     fun `an oversized metadata string is refused BEFORE it is copied, not after`() {
         // The bound used to be checked before `writeValue` was entered and after it returned, which
         // is the wrong side of the work for a scalar: the whole value was copied into the builder
