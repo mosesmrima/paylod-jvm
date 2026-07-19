@@ -141,7 +141,17 @@ object DarajaCatalog {
         RegexOption.IGNORE_CASE,
     )
 
-    private fun normalizeCode(resultCode: Any?): String =
+    /**
+     * The code as a string, LOSSLESSLY.
+     *
+     * `internal` rather than `private` so the lower-layer invariant can be asserted DIRECTLY.
+     * That is not a testing convenience: the non-vacuity sweep proved that restoring the old
+     * `.trim()` here failed no test at all, because every caller checks the lexeme first. The
+     * guarantee was therefore held entirely by the callers, which is precisely the arrangement
+     * requirement 1.1 forbids — "a guard at one layer is not a guard at the layer below it" — and
+     * a property with no test of its own is a property one refactor away from being gone.
+     */
+    internal fun normalizeCode(resultCode: Any?): String =
         when (resultCode) {
             null -> ""
             // NOT trimmed: the token is returned as written, so a lower layer cannot launder

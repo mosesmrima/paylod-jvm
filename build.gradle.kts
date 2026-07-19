@@ -78,6 +78,22 @@ tasks.test {
     // harness is measuring.
     ignoreFailures = (nvTag != null)
     doLast {
+        // A TAG THAT SELECTED NOTHING IS NOT A PASS.
+        //
+        // `isFailOnNoMatchingTests = false` (set above so the harness can inspect the counters
+        // itself) means a tag matching zero tests exits 0 and printed `NVRESULT PASSED` — a
+        // green build that executed nothing, which reads as "the mutation was not caught" when in
+        // truth nothing ever ran. The harness has its own `ran == 0` gate, but a build that can
+        // report success for a run that measured nothing is a hazard for anyone invoking gradle
+        // directly, and the harness should not be the only thing standing between a typo'd tag and
+        // a clean bill of health. Requirement 8.3.
+        if (nvTag != null && ran == 0) {
+            logger.lifecycle("NVRESULT NOTESTS")
+            throw GradleException(
+                "-PnvTag=$nvTag selected 0 tests. A selector that matches nothing cannot catch " +
+                    "anything, and must never be reported as a pass.",
+            )
+        }
         if (nvTag != null && failed > 0) {
             logger.lifecycle("NVRESULT FAILED")
         } else if (nvTag != null) {

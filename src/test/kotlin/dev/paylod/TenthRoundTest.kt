@@ -186,6 +186,23 @@ class TenthRoundTest {
         // §1.4: a dotted code needs at least two dots. `500.0` is a decimal, not a business code.
         assertFalse(DarajaCatalog.isCanonicalCodeLexeme("500.0"))
         assertTrue(DarajaCatalog.isCanonicalCodeLexeme("500.001.1001"))
+
+        // ── THE LOWEST LAYER, ASSERTED DIRECTLY ─────────────────────────────────────────────
+        //
+        // Everything above goes through callers that check the lexeme first, so it passes whether
+        // or not the bottom helper launders anything — the non-vacuity sweep proved exactly that
+        // by restoring the old `.trim()` and watching every assertion above still succeed. A
+        // fixture that cannot distinguish the two states proves nothing (§8.5), so the invariant
+        // is asserted on the helper itself: `normalizeCode` must be LOSSLESS.
+        for (padded in listOf(" 0", "0 ", "0\n", " 1032", "1032\n", "\t1032", "  ")) {
+            assertEquals(
+                padded, DarajaCatalog.normalizeCode(padded),
+                "the lowest normalization helper altered $padded — a padded code became a " +
+                    "canonical one BELOW every check written to reject it",
+            )
+        }
+        // And it does not invent one for a value that has none.
+        assertEquals("", DarajaCatalog.normalizeCode(null))
     }
 
     /** §6.4 / §6.5 — every public webhook entry point bounds before it computes or splits. */

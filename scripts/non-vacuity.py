@@ -1066,6 +1066,94 @@ CASES = [
                 "        } catch (e: PaylodException) {\n            throw e\n        }")],
     ),
 
+
+    # ══ ROUND 10 — the conformance specification ═══════════════════════════════════════════════
+    #
+    # One case per requirement closed this round. Each reverts the protection to the behaviour the
+    # spec forbids — in most cases the literal pre-round-10 source — so a passing sweep means the
+    # guarding test actually distinguishes the two states rather than merely running.
+    dict(
+        id='R10-receipt-grammar', tag='nv-receipt-grammar',
+        what='a receipt is judged by non-emptiness again, not by the positive grammar',
+        edits=[('src/main/kotlin/dev/paylod/Semantics.kt', '        return RECEIPT_RE.matches(receipt)', '        return receipt.isNotBlank()')],
+    ),
+    dict(
+        id='R10-receipt-anchor', tag='nv-receipt-grammar-anchor',
+        what='the receipt grammar is re-anchored with a dollar sign, which in Java also matches before a trailing newline',
+        edits=[('src/main/kotlin/dev/paylod/Semantics.kt', '        return RECEIPT_RE.matches(receipt)', '        return Regex("^[A-Z0-9]{10}$").containsMatchIn(receipt)')],
+    ),
+    dict(
+        id='R10-receipt-placeholder', tag='nv-receipt-placeholder',
+        what='sanitizer output is allowed to satisfy the receipt check again',
+        edits=[('src/main/kotlin/dev/paylod/Semantics.kt', '        if (CredentialShapes.looksSanitized(receipt)) return false', '        if (false) return false')],
+    ),
+    dict(
+        id='R10-ident-placeholder', tag='nv-ident-placeholder',
+        what='a redaction placeholder is accepted as a paymentId, checkoutRequestId and idempotency key (ALL THREE guards reverted)',
+        edits=[('src/main/kotlin/dev/paylod/Validators.kt', 'if (CredentialShapes.looksSanitized(ack["paymentId"] as? String)) {', 'if (false) {'),
+               ('src/main/kotlin/dev/paylod/Validators.kt', 'if (CredentialShapes.looksSanitized(ack["checkoutRequestId"] as? String)) {', 'if (false) {'),
+               ('src/main/kotlin/dev/paylod/Errors.kt', 'if (dev.paylod.internal.CredentialShapes.looksSanitized(key)) {', 'if (false) {')],
+    ),
+    dict(
+        id='R10-retry-language', tag='nv-no-retry-language',
+        what='an indeterminate decode tells the customer to try again, beside retryable = false',
+        edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt', '            customerMessage = "We couldn\'t confirm this payment yet. Please wait while it settles — " +\n                "do not start a new payment.",', '            customerMessage = "The payment didn\'t go through. Please try again.",')],
+    ),
+    dict(
+        id='R10-retryable-agrees', tag='nv-retryable-agrees',
+        what='the catalog retryable is passed through on a non-FAILED verdict, so a nested detail.retryable can contradict the top-level one',
+        edits=[('src/main/kotlin/dev/paylod/PaymentOutcome.kt', '            if (detail == null || !detail.retryable) detail else detail.copy(retryable = false)', '            detail')],
+    ),
+    dict(
+        id='R10-unknown-code', tag='nv-resolution-table',
+        what='a canonically shaped code that is NOT in the catalog becomes terminal failure evidence again',
+        edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt', '            if (!knownStkResultCodes.contains(raw)) return StkOutcome.PENDING', '            if (false) return StkOutcome.PENDING')],
+    ),
+    dict(
+        id='R10-strict-utf8', tag='nv-strict-utf8',
+        what='bytes are decoded with REPLACE semantics again, so malformed input becomes U+FFFD',
+        edits=[('src/main/kotlin/dev/paylod/internal/Utf8.kt', '            decoder.decode(ByteBuffer.wrap(bytes)).toString()', '            String(bytes, StandardCharsets.UTF_8)')],
+    ),
+    dict(
+        id='R10-resultcode-cred', tag='nv-resultcode-credential',
+        what='a server-controlled resultCode is copied into Payment without a credential check',
+        edits=[('src/main/kotlin/dev/paylod/Validators.kt', '        if (redact.containsCredential(resultCode as? String)) {', '        if (false) {')],
+    ),
+    dict(
+        id='R10-decode-redaction', tag='nv-decode-error-redaction',
+        what='the public offline decoder stops redacting and stops bounding its server-supplied fields',
+        edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt', '    private fun sanitized(d: DecodedError): DecodedError = d.copy(\n        code = Redactor.SHAPES_ONLY.text(d.code).take(MAX_DECODED_FIELD_CHARS),\n        cause = Redactor.SHAPES_ONLY.text(d.cause).take(MAX_DECODED_FIELD_CHARS),\n    )', '    private fun sanitized(d: DecodedError): DecodedError = d')],
+    ),
+    dict(
+        id='R10-lexeme', tag='nv-lexeme-preserved',
+        what="the parser discards the sender's numeric token and re-renders it from the decoded value",
+        edits=[('src/main/kotlin/dev/paylod/internal/Json.kt', '                if (token == "-0") return JsonNumber(token, -0.0)\n                token.toLongOrNull()?.let { return JsonNumber(token, it) }', '                if (token == "-0") return JsonNumber("0", 0L)\n                token.toLongOrNull()?.let { return JsonNumber(it.toString(), it) }')],
+    ),
+    dict(
+        id='R10-json-duplicate', tag='nv-json-escaped-dup',
+        what='a repeated object name resolves last-value-wins instead of being refused',
+        edits=[('src/main/kotlin/dev/paylod/internal/Json.kt', '                if (out.containsKey(key)) {', '                if (false) {')],
+    ),
+    dict(
+        id='R10-single-reader', tag='nv-single-reader',
+        what='a second JSON reader appears in the tree, which the one-reader assertion must see',
+        edits=[('src/main/kotlin/dev/paylod/internal/Json.kt', 'internal object Json {', '// a second reader would be spelled ObjectMapper\ninternal object Json {')],
+    ),
+    dict(
+        id='R10-redact-depth', tag='nv-parse-depth',
+        what='the redaction traversal bound drifts BELOW the parse bound -- the historical 8-vs-64',
+        edits=[('src/main/kotlin/dev/paylod/internal/Redaction.kt', '        const val MAX_DEPTH = Json.MAX_DEPTH', '        const val MAX_DEPTH = 8')],
+    ),
+    dict(
+        id='R10-lower-trim', tag='nv-lower-layer-form',
+        what='the lowest normalization helper trims again, laundering a padded code into a canonical one below every check written to reject it',
+        edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt', '            else -> resultCode.toString()\n        }', '            else -> resultCode.toString().trim()\n        }')],
+    ),
+    dict(
+        id='R10-sign-bound', tag='nv-webhook-bounds',
+        what='the public ByteArray signer computes an HMAC before bounding the body',
+        edits=[('src/main/kotlin/dev/paylod/Webhooks.kt', '        assertWithinLimit(payload.size)\n        val v1 = hmacHex(secret, timestampSec.toString(), payload)', '        val v1 = hmacHex(secret, timestampSec.toString(), payload)')],
+    ),
 ]
 
 COUNT_RE = re.compile(r"NVCOUNT tests=(\d+) failed=(\d+) skipped=(\d+)")
@@ -1215,6 +1303,15 @@ for _a in sys.argv[1:]:
     if _a.startswith("--only="):
         ONLY = set(_a.split("=", 1)[1].split(","))
 if ONLY:
+    # EVERY REQUESTED ID MUST EXIST. An unknown `--only` id used to select ZERO cases, run
+    # nothing, print "0/0 mutations caught" and exit 0 -- a successful-looking run that measured
+    # absolutely nothing. That is the same failure this whole harness exists to detect (a selector
+    # matching nothing while the runner reports success), sitting in the harness itself; a review
+    # probe confirmed it by passing a made-up id. A typo in a case id must be an error.
+    unknown = sorted(ONLY - {c["id"] for c in CASES})
+    if unknown:
+        print("--only names case ids that do not exist:\n  " + "\n  ".join(unknown), file=sys.stderr)
+        sys.exit(2)
     CASES = [c for c in CASES if c["id"] in ONLY]
     print(f"--only: running {len(CASES)} case(s): {', '.join(c['id'] for c in CASES)}\n", flush=True)
 
@@ -1223,11 +1320,15 @@ for case in CASES:
 
     # 1. THE SELECTOR MUST BE LIVE. A tag matching nothing exits 0 and reads as "not caught".
     live = run_tag(tag)
-    if not live.trusted:
-        results.append((case, "BROKEN-BUILD", "clean run not trustworthy", live, None))
-        continue
+    # ZERO-MATCH IS DIAGNOSED FIRST, before the exit-code gate. The build now FAILS a tagged run
+    # that selected nothing (see build.gradle.kts), so such a run is untrusted by exit code too --
+    # and reporting it as "the build broke" would bury the actual cause, which is a selector that
+    # matches no tests. The specific message is the useful one.
     if live.ran == 0:
         results.append((case, "BROKEN-SELECTOR", "tag matches 0 tests", live, None))
+        continue
+    if not live.trusted:
+        results.append((case, "BROKEN-BUILD", "clean run not trustworthy", live, None))
         continue
     if live.skipped:
         # A skipped test cannot catch anything. Counting it as live is how a disabled guard keeps
@@ -1298,6 +1399,11 @@ for case, status, detail, live, after in results:
     clean = live.describe() if live else "not run"
     mutated = after.describe() if after else "not run"
     print(f"| {case['id']} | {case['what']} | {case['tag']} | {clean} | {mutated} | {status} ({detail}) |")
+
+# A sweep that measured nothing is not a passing sweep.
+if not results:
+    print("NO RESULTS -- refusing to report a verdict for a sweep that ran nothing.", file=sys.stderr)
+    sys.exit(2)
 
 bad = [(c, s) for c, s, _, _, _ in results if s != "CAUGHT"]
 print(f"\n{len(results) - len(bad)}/{len(results)} mutations caught.")

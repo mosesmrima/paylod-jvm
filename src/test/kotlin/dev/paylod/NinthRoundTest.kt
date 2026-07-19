@@ -712,20 +712,54 @@ class NinthRoundTest {
     }
 
     @Test
-    fun `no source file contains a raw NUL byte, so the whole tree stays greppable`() {
-        // `Json.kt` carried one, as the end-of-input sentinel in `peek()`. A single NUL makes a file
-        // `data` rather than text: `grep` skips it SILENTLY, printing no match and no warning. A
-        // reviewer grepping for the parser's depth bound therefore got nothing back and could
-        // reasonably conclude the parser had none — which is exactly the drift this round found.
+    fun `no source file contains a raw control byte, so the whole tree stays greppable`() {
+        // `Json.kt` carried a raw NUL, as the end-of-input sentinel in `peek()`. A single one makes
+        // a file `data` rather than text: `grep` skips it SILENTLY, printing no match and no
+        // warning. A reviewer grepping for the parser's depth bound therefore got nothing back and
+        // could reasonably conclude the parser had none — which is how an 8-vs-64 depth mismatch
+        // survived NINE rounds of review. Every search for it returned nothing, and nothing is what
+        // "no such problem" looks like.
         //
-        // A parser on a payments path is the last file that should be invisible to review tooling,
-        // so the property is asserted rather than left to whoever next types a control character.
+        // ── Why this is broader than NUL ──────────────────────────────────────────────────
+        // It turned out not to be a JVM quirk. The Node SDK had the same defect in
+        // `test/fixes.test.ts`, which carried a raw NUL *and a raw DEL* inside fixture strings and
+        // hid all 823 of its lines from grep. DEL (0x7F) and the other C0 controls have the same
+        // effect and are just as easy to paste in by accident, so the whole class is refused rather
+        // than the one byte that happened to be found first.
+        //
+        // TAB, LF, FF and CR are excluded: they are ordinary source formatting.
+        val allowed = setOf<Byte>(9, 10, 12, 13)
+        fun isBadControl(b: Byte): Boolean {
+            val v = b.toInt() and 0xFF
+            return (v < 0x20 || v == 0x7F) && b !in allowed
+        }
         val offenders = File("src").walkTopDown()
             .filter { it.isFile && (it.extension == "kt" || it.extension == "java") }
-            .filter { it.readBytes().contains(0) }
-            .map { it.path }
+            .mapNotNull { f ->
+                val bad = f.readBytes().filter { isBadControl(it) }
+                    .map { "0x%02X".format(it.toInt() and 0xFF) }
+                    .distinct()
+                if (bad.isEmpty()) null else "${f.path} contains ${bad.joinToString(", ")}"
+            }
             .toList()
-        assertTrue(offenders.isEmpty(), "source files contain raw NUL bytes: $offenders")
+        assertTrue(offenders.isEmpty(), "source files are not greppable:\n" + offenders.joinToString("\n"))
+
+        // §8.5 — the check must be able to SEE something. A walk that found no files would report
+        // "no offenders" just as cheerfully as a clean tree.
+        val scanned = File("src").walkTopDown()
+            .count { it.isFile && (it.extension == "kt" || it.extension == "java") }
+        assertTrue(scanned >= 20, "only $scanned source files scanned — the walk is not measuring the tree")
+
+        // And it must be able to FAIL. The predicate is exercised directly on bytes that must be
+        // rejected and bytes that must not, so a future edit that neuters it (an inverted
+        // condition, an over-broad allow-list) is caught here rather than by the next reviewer who
+        // greps for something and finds nothing.
+        assertTrue(isBadControl(0), "the NUL that started this would no longer be detected")
+        assertTrue(isBadControl(0x7F), "DEL would no longer be detected")
+        assertTrue(isBadControl(0x1B), "ESC would no longer be detected")
+        for (ok in listOf<Byte>(9, 10, 12, 13, 'a'.code.toByte())) {
+            assertFalse(isBadControl(ok), "ordinary source formatting would now be rejected")
+        }
     }
 
     @Test
