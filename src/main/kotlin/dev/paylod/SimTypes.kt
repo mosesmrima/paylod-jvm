@@ -108,6 +108,15 @@ data class SimulatedPayment(
     val status: PaymentStatus,
     val checkoutRequestId: String,
     val outcomes: List<SimOutcomeChoice>,
+    /**
+     * The idempotency key this simulated collect was ACTUALLY sent with — the same handle
+     * [CollectAck.idempotencyKey] carries, for the same reason.
+     *
+     * A caller who used the `unsafeGeneratedIdempotencyKey` opt-out never supplied a key, so this
+     * is the only place the effective one is visible. Without it, "retry with the same key" is not
+     * something the caller can do even when they want to.
+     */
+    val idempotencyKey: String = "",
 )
 
 /**

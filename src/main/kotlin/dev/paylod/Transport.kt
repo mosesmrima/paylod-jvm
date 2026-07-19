@@ -8,6 +8,24 @@ import java.net.http.HttpResponse
 import java.time.Duration
 
 /**
+ * A foreign throwable's message, or a placeholder — NEVER a throw.
+ *
+ * `Throwable.getMessage()` is overridable ordinary code, and the throwables reaching these call
+ * sites come from the JDK's HTTP stack, a TLS provider, a proxy library, or a caller-supplied
+ * transport. If one of them fails while formatting its own message, the failure lands either inside
+ * a `catch` that is building the SDK's replacement exception, or inside a `Flow.Subscriber` whose
+ * result future would then never complete at all. Neither is worth a diagnostic string.
+ */
+internal fun safeMessageOf(e: Throwable?): String = when (e) {
+    null -> "(no message)"
+    else -> try {
+        e.message ?: "(no message)"
+    } catch (ignored: Throwable) {
+        "(the throwable's own getMessage() failed)"
+    }
+}
+
+/**
  * THE credentialed transport.
  *
  * ── Why this class exists ─────────────────────────────────────────────────────────────────
@@ -272,7 +290,7 @@ internal class Transport(
                     // The lower-level exception is NOT attached as a cause: a JDK/TLS/proxy exception
                     // can embed the request line and headers, which must not reach a log sink.
                     throw PaylodConnectionException(
-                        redact.text("Could not reach paylod at $url: ${cause?.message}"),
+                        redact.text("Could not reach paylod at $url: ${safeMessageOf(cause)}"),
                     )
             }
         }
@@ -350,7 +368,7 @@ internal class Transport(
             // loop exists for, and reclassifying it would turn a blip into a hard failure.
             result.completeExceptionally(
                 PaylodConnectionException(
-                    redact.text("Could not read paylod's response: ${throwable.message}"),
+                    redact.text("Could not read paylod's response: ${safeMessageOf(throwable)}"),
                 ),
             )
         }

@@ -64,12 +64,6 @@ class Simulator internal constructor(
     fun collect(params: SimulateCollectParams = SimulateCollectParams.DEFAULT): SimulatedPayment {
         assertSandboxKey(apiKey, "simulate.collect()")
 
-        val amount = params.amount
-        if (amount <= 0) {
-            throw PaylodInvalidRequestException(
-                "simulate.collect(): amount must be a positive whole number of KES (got $amount).",
-            )
-        }
         // EXACTLY the production rule, through the one shared implementation: the key is REQUIRED,
         // a blank/whitespace/control-char one is refused, and the only route to a generated key is
         // the explicit primitive-`true` opt-out, which warns on every single call.
@@ -83,15 +77,25 @@ class Simulator internal constructor(
             "simulate.collect()",
         )
 
-        val body = LinkedHashMap<String, Any?>()
-        body["phone"] = if (params.phone != null) Phone.normalize(params.phone) else DEFAULT_SIM_PHONE
-        body["amount"] = amount
-        // The backend calls this field `accountRef`; the SDK calls it `accountReference`.
-        if (params.accountReference != null) body["accountRef"] = params.accountReference
-        // Send the FULL body — the idempotency layer fingerprints it, so a dropped field is a field
-        // it cannot fingerprint.
-        if (params.description != null) body["description"] = params.description
-        if (params.metadata != null) body["metadata"] = params.metadata
+        // THE SAME BODY BUILDER AND THE SAME VALIDATORS PRODUCTION RUNS.
+        //
+        // This used to be a hand-rolled body with `amount > 0` as its only rule, so the simulator
+        // accepted 150,001 KES, a whitespace-only `accountReference`, and a 200-character
+        // `description` — all of which `collect()` refuses. A simulator that accepts what production
+        // rejects certifies a request that cannot be made, which is the exact opposite of what a
+        // test double is for. There is now ONE implementation; see [CollectBody].
+        //
+        // The only difference left is the wire name — `/simulate/collect` calls the reference field
+        // `accountRef` — which is a parameter rather than a second validator.
+        val body = CollectBody.build(
+            phone = params.phone ?: DEFAULT_SIM_PHONE,
+            amount = params.amount,
+            accountReference = params.accountReference,
+            description = params.description,
+            metadata = params.metadata,
+            accountRefField = "accountRef",
+            label = "simulate.collect()",
+        )
 
         // THE SAME validator production runs, with the REAL HTTP status — the 202 requirement
         // included. A simulator that tolerates an acknowledgement production would reject teaches
@@ -100,11 +104,40 @@ class Simulator internal constructor(
         // The HTTP status is captured so the simulator's own field checks below can report the
         // response they are rejecting, exactly as the shared validator does.
         var ackStatus = 0
-        val ack = requester.request("POST", "/simulate/collect", body, idempotencyKey) { map, status ->
-            ackStatus = status
-            PaymentValidators.assertCollectAck(map, status, idempotencyKey, "simulate.collect()", redact)
+        // ── THE EFFECTIVE KEY SURVIVES EVERY FAILURE PATH, HERE TOO ──────────────────────────
+        //
+        // `collect()` has wrapped its dispatch in exactly this since round 5: whatever goes wrong
+        // after the request leaves — network, timeout, 5xx, a malformed 2xx, a simulator field the
+        // checks below refuse — the caller must be able to recover the key that was actually sent
+        // and retry with THAT one, because a fresh key is a second charge. `simulate.collect()` had
+        // no such wrapper, so every one of those failures arrived with `idempotencyKey = null`.
+        //
+        // Sandbox money is not real money, but the RULE is what an integration test is exercising.
+        // A simulator that loses the handle teaches the caller's retry code a habit that double-
+        // charges the moment the same code runs against production.
+        //
+        // The wrapper spans the FIELD CHECKS as well, not just the dispatch: a refusal from
+        // `simBad` happens after the request was sent, so it is exactly a case where a charge may
+        // exist and the key is the only way to ask about it.
+        try {
+            val ack = requester.request("POST", "/simulate/collect", body, idempotencyKey) { map, status ->
+                ackStatus = status
+                PaymentValidators.assertCollectAck(
+                    map, status, idempotencyKey, "simulate.collect()", redact,
+                )
+            }
+            return buildSimulatedPayment(ack, ackStatus, idempotencyKey)
+        } catch (e: PaylodException) {
+            if (e.idempotencyKey == null) e.idempotencyKey = idempotencyKey
+            throw e
         }
+    }
 
+    private fun buildSimulatedPayment(
+        ack: Map<String, Any?>,
+        ackStatus: Int,
+        idempotencyKey: String,
+    ): SimulatedPayment {
         // THE SIMULATOR'S OWN FIELDS ARE VALIDATED EXACTLY, LIKE EVERY OTHER RESPONSE.
         //
         // The shared payment validator has approved the parts of this ack it owns. The fields
@@ -135,6 +168,10 @@ class Simulator internal constructor(
             status = PaymentStatus.PENDING,
             checkoutRequestId = simString(ack["checkoutRequestId"], "checkoutRequestId", ackStatus),
             outcomes = choices,
+            // The key that was ACTUALLY SENT, handed back exactly as `CollectAck.idempotencyKey`
+            // does. Without it a caller who used the `unsafeGeneratedIdempotencyKey` opt-out had no
+            // way to learn the key the SDK minted, so a retry could only ever mint a second one.
+            idempotencyKey = idempotencyKey,
         )
     }
 
@@ -224,6 +261,18 @@ class Simulator internal constructor(
     private fun simString(v: Any?, field: String, httpStatus: Int): String {
         if (v !is String) simBad("$field is missing or is not a string", httpStatus)
         if (v.isBlank()) simBad("$field is empty", httpStatus)
+        // SERVER-CONTROLLED, LANDING ON A DATA CLASS. `SimulatedPayment` and `SimOutcomeChoice` are
+        // Kotlin data classes, so `toString()` is generated and prints every field — and printing
+        // the simulated payment is the first thing a test does with it. `paymentId`,
+        // `checkoutRequestId` and every outcome `id`/`label`/`status` came straight off the wire
+        // with no credential check, while the production ack and status read have refused exactly
+        // this since round 7. A guarantee the simulator does not share is not a guarantee.
+        if (redact.containsCredential(v)) {
+            simBad(
+                "$field contains something shaped like an API credential, so it is not a $field",
+                httpStatus,
+            )
+        }
         return v
     }
 

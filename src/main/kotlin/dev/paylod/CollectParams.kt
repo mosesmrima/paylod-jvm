@@ -82,3 +82,82 @@ class CollectParams private constructor(
         fun builder(phone: String, amount: Int): Builder = Builder(phone, amount)
     }
 }
+
+/**
+ * THE collect request body — built once, for every collect surface there is.
+ *
+ * ── Why this is not two functions ─────────────────────────────────────────────────────────
+ * It was. `Paylod.buildCollectBody` enforced the amount ceiling, the blank/length rules on
+ * `accountReference` and `description`, and the validate-the-same-string-you-transmit discipline.
+ * `Simulator.collect` enforced `amount > 0` and nothing else, and sent the caller's strings
+ * untouched. So `simulate.collect()` accepted 150,001 KES, a whitespace-only reference, and a
+ * 200-character description — every one of which production refuses.
+ *
+ * That divergence is the whole problem with a simulator. Its reason for existing is that an
+ * integration test can drive the real settlement path without a handset; a test that passes against
+ * a simulator LOOSER than production is a test that certifies a request production will reject. The
+ * rules are therefore not "mirrored" here, they are the SAME CODE — there is no second
+ * implementation left to drift.
+ *
+ * The one legitimate difference is the wire name for the reference field: production's `/collect`
+ * calls it `accountReference` and `/simulate/collect` calls it `accountRef`. That is a backend
+ * naming fact, so it is a parameter, not a second validator.
+ */
+internal object CollectBody {
+
+    /** The Daraja per-transaction ceiling this SDK will submit, in KES. */
+    const val MAX_AMOUNT = 150_000
+
+    const val MAX_ACCOUNT_REFERENCE = 12
+    const val MAX_DESCRIPTION = 64
+
+    fun build(
+        phone: String,
+        amount: Int,
+        accountReference: String?,
+        description: String?,
+        metadata: Map<String, Any?>?,
+        accountRefField: String,
+        label: String,
+    ): MutableMap<String, Any?> {
+        if (amount <= 0 || amount > MAX_AMOUNT) {
+            throw PaylodInvalidRequestException(
+                "$label: amount must be between 1 and $MAX_AMOUNT KES (got $amount).",
+            )
+        }
+
+        val out = LinkedHashMap<String, Any?>()
+        out["amount"] = amount
+        out["phone"] = Phone.normalize(phone)
+
+        // Validate AND transmit the SAME trimmed representation — never validate the trimmed length
+        // while transmitting the untrimmed original (that would let " x…(12 spaces) " slip past a
+        // 12-char bound). A provided-but-blank value is rejected rather than sent as empty.
+        if (accountReference != null) {
+            val ref = accountReference.trim()
+            if (ref.isEmpty()) {
+                throw PaylodInvalidRequestException("$label: accountReference must not be blank.")
+            }
+            if (ref.length > MAX_ACCOUNT_REFERENCE) {
+                throw PaylodInvalidRequestException(
+                    "$label: accountReference must be $MAX_ACCOUNT_REFERENCE characters or fewer.",
+                )
+            }
+            out[accountRefField] = ref
+        }
+        if (description != null) {
+            val desc = description.trim()
+            if (desc.isEmpty()) {
+                throw PaylodInvalidRequestException("$label: description must not be blank.")
+            }
+            if (desc.length > MAX_DESCRIPTION) {
+                throw PaylodInvalidRequestException(
+                    "$label: description must be $MAX_DESCRIPTION characters or fewer.",
+                )
+            }
+            out["description"] = desc
+        }
+        if (metadata != null) out["metadata"] = metadata
+        return out
+    }
+}

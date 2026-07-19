@@ -2,6 +2,7 @@ package dev.paylod
 
 import dev.paylod.internal.CredentialShapes
 import dev.paylod.internal.Json
+import dev.paylod.internal.Redactor
 import java.nio.charset.StandardCharsets
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -214,7 +215,48 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-    ): Map<String, Any?> = verifySignatureAt(payload, signature, secret, toleranceSec, null)
+    ): Map<String, Any?> = scrubTree(
+        verifySignatureAt(payload, signature, secret, toleranceSec, null), Redactor(listOf(secret)),
+    )
+
+    /**
+     * Scrub every string in a decoded webhook body — keys included — before it crosses the public
+     * boundary.
+     *
+     * ── Why the typed path's guards do not cover this one ─────────────────────────────────
+     * [parseAndVerify] hands back a TYPED event built from an allowlist, and every field on it is
+     * either refused or scrubbed. [verifySignature] hands back THE WHOLE PARSED BODY, arbitrary and
+     * unbounded in shape: unknown fields, nested objects, arrays, and object NAMES, none of which
+     * any allowlist ever sees. A signature proves who sent the bytes; it does not stop a
+     * compromised or merely buggy signer from echoing an `Authorization: Bearer mp_live_…` header,
+     * or the webhook signing secret itself, into a field of its choosing — and the first thing a
+     * handler does with this map is log it.
+     *
+     * The redactor is seeded with the SECRET THE CALLER JUST SUPPLIED, so the one credential this
+     * path definitely holds is masked by value and not merely by shape.
+     *
+     * Scrubbed rather than refused, unlike the typed identifiers: this map has no schema, so there
+     * is no field whose meaning a mask would destroy, and refusing an arbitrary body over a
+     * substring match would reject payloads that are perfectly legitimate.
+     */
+    private fun scrubTree(value: Any?, redact: Redactor): Map<String, Any?> {
+        @Suppress("UNCHECKED_CAST")
+        return scrubValue(value, redact) as Map<String, Any?>
+    }
+
+    private fun scrubValue(value: Any?, redact: Redactor): Any? = when (value) {
+        is String -> redact.text(value)
+        is Map<*, *> -> {
+            val out = LinkedHashMap<String, Any?>(value.size)
+            for ((k, v) in value) out[redact.text(k.toString())] = scrubValue(v, redact)
+            out
+        }
+        is List<*> -> value.map { scrubValue(it, redact) }
+        // Numbers, booleans and null carry no text to leak and keep their exact wire value — the
+        // money path reads `resultCode` off this map in some integrations, and coercing its type
+        // here would be the very laundering the readers refuse to do.
+        else -> value
+    }
 
     /** The internal fixed-clock seam. Test-only; see the note on [parseAndVerify]. */
     internal fun verifySignatureAt(
@@ -335,8 +377,9 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-    ): Map<String, Any?> = verifySignatureAt(
-        boundedBytes(payload), signature, secret, toleranceSec, null,
+    ): Map<String, Any?> = scrubTree(
+        verifySignatureAt(boundedBytes(payload), signature, secret, toleranceSec, null),
+        Redactor(listOf(secret)),
     )
 
     /** The internal fixed-clock seam, `String` overload. */
@@ -535,6 +578,24 @@ object Webhooks {
                 "data.mpesaReceipt contains something shaped like an API credential, so it is not a " +
                     "receipt",
             )
+        }
+        // THE SAME RULE FOR THE REMAINING IDENTIFIER-SHAPED FIELDS. `paymentId`,
+        // `checkoutRequestId` and `mpesaReceipt` were covered; `applicationId`, `phone` and
+        // `accountRef` were not, and all three land on the SAME `WebhookEventData` data class whose
+        // generated `toString()` a handler logs on its first line. A server echoing the request back
+        // has three unguarded routes into the log instead of none — the guard was written for the
+        // fields someone happened to think of rather than for every identifier on the object.
+        //
+        // Refused rather than scrubbed, exactly like the other three: an identifier that carries a
+        // bearer token is not an identifier with a formatting problem, it is a field whose value is
+        // not what the schema says it is, and acting on it is the mistake.
+        for (field in arrayOf("applicationId", "phone", "accountRef")) {
+            if (CredentialShapes.looksLikeCredential(data[field] as? String)) {
+                invalid(
+                    "data.$field contains something shaped like an API credential, so it is not a " +
+                        "valid $field",
+                )
+            }
         }
 
         val status = data["status"]

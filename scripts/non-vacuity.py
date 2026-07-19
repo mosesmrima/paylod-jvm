@@ -338,51 +338,67 @@ CASES = [
         id="R5-wh-decoded", tag="nv-wh-decoded-retryable",
         what="webhook `decoded` is read from the payload instead of the canonical catalog",
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
-                """        val decoded = if (rawType == "payment.failed") {
-            val code = data["resultCode"]
-            if (code == null) null else DarajaCatalog.decodeError(normalizeCode(code), asString(data["resultDesc"]))
-        } else {
-            null
-        }""",
-                """        val decodedMap = data["decoded"] as? Map<String, Any?>
-        val decoded = if (decodedMap != null) {
-            DecodedError(
-                code = decodedMap["code"]?.toString() ?: "",
-                title = decodedMap["title"]?.toString() ?: "",
-                cause = decodedMap["cause"]?.toString() ?: "",
-                fix = decodedMap["fix"]?.toString() ?: "",
-                category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
-                retryable = decodedMap["retryable"] as? Boolean ?: false,
-                customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
-            )
-        } else {
-            null
-        }""")],
+                """            if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }""",
+                """            @Suppress("UNCHECKED_CAST")
+            val decodedMap = data["decoded"] as? Map<String, Any?>
+            if (decodedMap != null) {
+                DecodedError(
+                    code = decodedMap["code"]?.toString() ?: "",
+                    title = decodedMap["title"]?.toString() ?: "",
+                    cause = decodedMap["cause"]?.toString() ?: "",
+                    fix = decodedMap["fix"]?.toString() ?: "",
+                    category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
+                    retryable = decodedMap["retryable"] as? Boolean ?: false,
+                    customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
+                )
+            } else if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }""")],
     ),
     dict(
         id="R5-wh-decoded-malformed", tag="nv-wh-decoded-malformed",
         what="the same revert, seen as a raw parser exception escaping a handler",
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
-                """        val decoded = if (rawType == "payment.failed") {
-            val code = data["resultCode"]
-            if (code == null) null else DarajaCatalog.decodeError(normalizeCode(code), asString(data["resultDesc"]))
-        } else {
-            null
-        }""",
-                """        val decodedMap = data["decoded"] as? Map<String, Any?>
-        val decoded = if (decodedMap != null) {
-            DecodedError(
-                code = decodedMap["code"]?.toString() ?: "",
-                title = decodedMap["title"]?.toString() ?: "",
-                cause = decodedMap["cause"]?.toString() ?: "",
-                fix = decodedMap["fix"]?.toString() ?: "",
-                category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
-                retryable = decodedMap["retryable"] as? Boolean ?: false,
-                customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
-            )
-        } else {
-            null
-        }""")],
+                """            if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }""",
+                """            @Suppress("UNCHECKED_CAST")
+            val decodedMap = data["decoded"] as? Map<String, Any?>
+            if (decodedMap != null) {
+                DecodedError(
+                    code = decodedMap["code"]?.toString() ?: "",
+                    title = decodedMap["title"]?.toString() ?: "",
+                    cause = decodedMap["cause"]?.toString() ?: "",
+                    fix = decodedMap["fix"]?.toString() ?: "",
+                    category = DarajaCategory.fromWire(decodedMap["category"]?.toString() ?: "mpesa_system"),
+                    retryable = decodedMap["retryable"] as? Boolean ?: false,
+                    customerMessage = decodedMap["customerMessage"]?.toString() ?: "",
+                )
+            } else if (code == null) {
+                null
+            } else {
+                DarajaCatalog.decodeError(
+                    normalizeCode(code),
+                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                )
+            }""")],
     ),
     dict(
         id="R5-wh-amount", tag="nv-wh-amount",
@@ -462,27 +478,46 @@ CASES = [
         what="result code zero is recognised numerically again (toDouble() == 0.0)",
         edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
                 "if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS",
-                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS")],
+                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS"),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "        val lexeme = codeLexeme(resultCode)\n"
+                "        if (lexeme != null && lexeme.isNotEmpty() && !isCanonicalCodeLexeme(lexeme)) {\n"
+                "            return StkOutcome.PENDING\n"
+                "        }\n",
+                "")],
     ),
     dict(
         id="R5-zero-evidence", tag="nv-zero-evidence",
         what="the same revert, seen as a zero impostor manufacturing PAID evidence",
         edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
                 "if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS",
-                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS")],
+                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS"),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "        val lexeme = codeLexeme(resultCode)\n"
+                "        if (lexeme != null && lexeme.isNotEmpty() && !isCanonicalCodeLexeme(lexeme)) {\n"
+                "            return StkOutcome.PENDING\n"
+                "        }\n",
+                "")],
     ),
     dict(
         id="R5-zero-webhook", tag="nv-zero-webhook",
         what="the same revert, on the webhook delivery path",
         edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
                 "if (isCanonicalSuccessCode(resultCode)) return StkOutcome.SUCCESS",
-                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS")],
+                "if (raw.toDoubleOrNull() == 0.0) return StkOutcome.SUCCESS"),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "        val lexeme = codeLexeme(resultCode)\n"
+                "        if (lexeme != null && lexeme.isNotEmpty() && !isCanonicalCodeLexeme(lexeme)) {\n"
+                "            return StkOutcome.PENDING\n"
+                "        }\n",
+                "")],
     ),
     dict(
         id="R5-zero-launder", tag="nv-zero-nolaunder",
         what="a JSON float zero is collapsed into the canonical success code again",
         edits=[("src/main/kotlin/dev/paylod/Validators.kt",
-                "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()",
+                "        is Double -> v.toString()",
+                "        is Double ->\n"
                 "            if (v == Math.floor(v)) v.toLong().toString() else v.toString()")],
     ),
 
@@ -648,7 +683,16 @@ CASES = [
                 "        is Double -> v.toString()\n        else -> v.toString()",
                 "        is Double ->\n"
                 "            if (v == Math.floor(v) && v != 0.0) v.toLong().toString() else v.toString()\n"
-                "        else -> v.toString()")],
+                "        else -> v.toString()"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "                is Byte, is Short, is Int, is Long -> resultCode.toString()\n"
+                "                // A float has no lexeme — `1032.0` and `1.032e3` are not tokens Daraja sends.\n"
+                "                else -> null",
+                "                is Byte, is Short, is Int, is Long -> resultCode.toString()\n"
+                "                is Double ->\n"
+                "                    if (resultCode == Math.floor(resultCode)) resultCode.toLong().toString()\n"
+                "                    else resultCode.toString()\n"
+                "                else -> null")],
     ),
     dict(
         id="R7-detail-retryable", tag="nv-detail-retryable",
@@ -710,6 +754,9 @@ CASES = [
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
                 '            if (lexeme == null || lexeme.isBlank() || !DarajaCatalog.isCanonicalCodeLexeme(lexeme)) {',
                 "            if (false) {"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                '            if (DarajaCatalog.classifyStkResult(lexeme, data["resultDesc"] as? String) != StkOutcome.FAILED) {',
+                "            if (false) {"),
                ("src/main/kotlin/dev/paylod/Semantics.kt",
                 FAILED_NONE_FIND, FAILED_NONE_REPL)],
     ),
@@ -765,6 +812,155 @@ CASES = [
         edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
                 'if (type == "payment.failed" && judgement.verdict != PaymentVerdict.FAILED) {',
                 "if (false) {")],
+    ),
+    # ── ROUND 8 ───────────────────────────────────────────────────────────────────────────────
+    dict(
+        id="R8-classifier-canonical", tag="nv-classifier-canonical",
+        what="a non-canonical result code launders into TERMINAL FAILURE at the classifier "
+             "(all three guards reverted)",
+        edits=[("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "        val lexeme = codeLexeme(resultCode)\n"
+                "        if (lexeme != null && lexeme.isNotEmpty() && !isCanonicalCodeLexeme(lexeme)) {\n"
+                "            return StkOutcome.PENDING\n"
+                "        }\n",
+                ""),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                "            if (!CANONICAL_CODE_RE.matches(raw)) return StkOutcome.PENDING\n",
+                ""),
+               ("src/main/kotlin/dev/paylod/DarajaCatalog.kt",
+                'Regex("(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){2,6}")',
+                'Regex("(?:0|[1-9][0-9]*)(?:\\\\.[0-9]{1,8}){1,6}")')],
+    ),
+    dict(
+        id="R8-exotic-message", tag="nv-exotic-message",
+        what="the post-acknowledgement wrapper interpolates a hostile getMessage() again, so the "
+             "charge handles are lost when it throws",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "            val kind = safeTypeName(e)\n            val detail = safeMessage(e)",
+                "            val kind = e.javaClass.simpleName\n            val detail = e.message")],
+    ),
+    dict(
+        id="R8-wh-ident-credential", tag="nv-wh-ident-credential",
+        what="applicationId / phone / accountRef accept an echoed credential again",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                'for (field in arrayOf("applicationId", "phone", "accountRef")) {',
+                'for (field in arrayOf<String>()) {')],
+    ),
+    dict(
+        id="R8-wh-rawmap-scrub", tag="nv-wh-rawmap-scrub",
+        what="verifySignature hands back the raw parsed body again, unknown fields and all "
+             "(BOTH public overloads reverted)",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "    ): Map<String, Any?> = scrubTree(\n"
+                "        verifySignatureAt(payload, signature, secret, toleranceSec, null), Redactor(listOf(secret)),\n"
+                "    )",
+                "    ): Map<String, Any?> = verifySignatureAt(payload, signature, secret, toleranceSec, null)"),
+               ("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "    ): Map<String, Any?> = scrubTree(\n"
+                "        verifySignatureAt(boundedBytes(payload), signature, secret, toleranceSec, null),\n"
+                "        Redactor(listOf(secret)),\n"
+                "    )",
+                "    ): Map<String, Any?> = verifySignatureAt(\n"
+                "        boundedBytes(payload), signature, secret, toleranceSec, null,\n"
+                "    )")],
+    ),
+    dict(
+        id="R8-sim-validators", tag="nv-sim-validators",
+        what="simulate.collect() goes back to its own loose body, with amount > 0 as its only rule",
+        edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
+                """        val body = CollectBody.build(
+            phone = params.phone ?: DEFAULT_SIM_PHONE,
+            amount = params.amount,
+            accountReference = params.accountReference,
+            description = params.description,
+            metadata = params.metadata,
+            accountRefField = "accountRef",
+            label = "simulate.collect()",
+        )""",
+                """        if (params.amount <= 0) {
+            throw PaylodInvalidRequestException(
+                "simulate.collect(): amount must be a positive whole number of KES.",
+            )
+        }
+        val body = LinkedHashMap<String, Any?>()
+        body["phone"] = if (params.phone != null) Phone.normalize(params.phone) else DEFAULT_SIM_PHONE
+        body["amount"] = params.amount
+        if (params.accountReference != null) body["accountRef"] = params.accountReference
+        if (params.description != null) body["description"] = params.description
+        if (params.metadata != null) body["metadata"] = params.metadata""")],
+    ),
+    dict(
+        id="R8-sim-key", tag="nv-sim-key",
+        what="the simulator loses the effective idempotency key — on the returned record and on "
+             "every failure path (BOTH reverted)",
+        edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
+                "        } catch (e: PaylodException) {\n"
+                "            if (e.idempotencyKey == null) e.idempotencyKey = idempotencyKey\n"
+                "            throw e\n"
+                "        }",
+                "        } catch (e: PaylodException) {\n"
+                "            throw e\n"
+                "        }"),
+               ("src/main/kotlin/dev/paylod/Simulator.kt",
+                "            idempotencyKey = idempotencyKey,",
+                '            idempotencyKey = "",')],
+    ),
+    dict(
+        id="R8-sim-credential", tag="nv-sim-credential",
+        what="the simulator's own server-controlled strings accept an echoed credential again",
+        edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
+                "        if (redact.containsCredential(v)) {", "        if (false) {")],
+    ),
+    dict(
+        id="R8-json-write-bounds", tag="nv-json-write-bounds",
+        what="the outbound writer loses its depth, size and cycle bounds (ALL FOUR reverted)",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "        if (sb.length > MAX_WRITE_CHARS) {", "        if (false) {"),
+               ("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "        if (depth > MAX_WRITE_DEPTH) {", "        if (false) {"),
+               ("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "                if (!seen.add(value)) throw cycle()\n                sb.append('{')",
+                "                sb.append('{')"),
+               ("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "                if (!seen.add(value)) throw cycle()\n                sb.append('[')",
+                "                sb.append('[')")],
+    ),
+    dict(
+        id="R8-json-escaped-key", tag="nv-json-escaped-key",
+        what="a repeated object name resolves last-wins again, so an escaped duplicate can mean "
+             "one thing to this parser and another to every other reader",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "                if (out.containsKey(key)) {", "                if (false) {")],
+    ),
+    dict(
+        id="R8-no-decompression", tag="nv-no-decompression",
+        what="the SDK asks for a content coding whose EXPANDED size its byte cap does not bound",
+        edits=[("src/main/kotlin/dev/paylod/Transport.kt",
+                'publicHeaders["accept"] = "application/json"',
+                'publicHeaders["accept"] = "application/json"\n'
+                '        publicHeaders["accept-encoding"] = "gzip"')],
+    ),
+    dict(
+        id="R8-no-credential-in-cause", tag="nv-no-credential-in-cause",
+        what="the post-acknowledgement wrapper stops redacting and attaches the foreign throwable "
+             "as a cause, so the credential rides out on the exception",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                """            val wrapped = PaylodConnectionException(
+                redact.text(
+                    "The collect was ACKNOWLEDGED and an STK prompt is live, but waiting for it to " +
+                        "settle failed with an unexpected $kind: $detail. " +
+                        "The charge state is INDETERMINATE. Read payment ${ack.paymentId} (or retry " +
+                        "with THIS idempotencyKey) before starting any new attempt — minting a fresh " +
+                        "key would risk a second charge.",
+                ),
+            )""",
+                """            val wrapped = PaylodConnectionException(
+                "The collect was ACKNOWLEDGED and an STK prompt is live, but waiting for it to " +
+                    "settle failed with an unexpected $kind: $detail. " +
+                    "The charge state is INDETERMINATE. Read payment ${ack.paymentId} (or retry " +
+                    "with THIS idempotencyKey) before starting any new attempt — minting a fresh " +
+                    "key would risk a second charge.",
+            )""")],
     ),
 ]
 

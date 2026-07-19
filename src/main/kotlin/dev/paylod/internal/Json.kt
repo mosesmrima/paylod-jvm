@@ -35,13 +35,65 @@ internal object Json {
 
     // ── Writing ─────────────────────────────────────────────────────────────────────────────
 
+    /**
+     * The largest request body this writer will produce, in characters, and the deepest structure
+     * it will descend into.
+     *
+     * ── Why the WRITER needs bounds the reader already has ────────────────────────────────
+     * The reader is bounded because a response is attacker-controlled. The writer looked safe by
+     * comparison: it serialises the SDK's own request bodies. But one field in those bodies is
+     * arbitrary caller data — `metadata`, which is a `Map<String, Any?>` the caller fills with
+     * whatever they like, and which is very often built from data the caller's own users supplied.
+     * Three shapes then reach a recursive-descent writer with no limits at all:
+     *
+     *   • DEEP. `writeValue` recurses per level, so a few tens of thousands of nested maps is a
+     *     `StackOverflowError` — an `Error`, not a `PaylodException`, so it escapes every catch on
+     *     the money path and surfaces as a stack overflow inside the caller's request handler.
+     *   • CYCLIC. A map containing itself recurses forever. Same outcome, reached faster, and
+     *     trivially produced by ordinary application code — an ORM entity graph, a memoised
+     *     structure, a parent/child pair.
+     *   • HUGE. A large collection materialises the whole document in one `StringBuilder` before a
+     *     single byte is dispatched, so the memory cost is unbounded and is paid before the request
+     *     the caller is waiting on has even started.
+     *
+     * All three are DoS against the SDK's own caller, which is squarely in scope, and all three are
+     * refused BEFORE dispatch as an ordinary typed validation error — the one moment at which
+     * refusing costs nothing, because no charge exists yet.
+     */
+    const val MAX_WRITE_DEPTH = 32
+    const val MAX_WRITE_CHARS = 256 * 1024
+
+    class JsonWriteException(message: String) : RuntimeException(message)
+
     fun write(value: Any?): String {
         val sb = StringBuilder()
-        writeValue(sb, value)
+        // Identity-based, not equality-based: two structurally equal siblings are perfectly legal
+        // and must both be written, whereas the SAME object reachable from inside itself is the
+        // cycle. `HashMap.equals` on a self-containing map is itself infinite, so an equality-based
+        // seen-set would hang in the very case it exists to detect.
+        writeValue(sb, value, 0, java.util.Collections.newSetFromMap(java.util.IdentityHashMap()))
         return sb.toString()
     }
 
-    private fun writeValue(sb: StringBuilder, value: Any?) {
+    private fun checkBudget(sb: StringBuilder) {
+        if (sb.length > MAX_WRITE_CHARS) {
+            throw JsonWriteException(
+                "The request body exceeded the ${MAX_WRITE_CHARS}-character limit this SDK will " +
+                    "serialise. This is almost always an oversized `metadata` value; send an " +
+                    "identifier your own system can expand instead of the whole object.",
+            )
+        }
+    }
+
+    private fun writeValue(sb: StringBuilder, value: Any?, depth: Int, seen: MutableSet<Any>) {
+        checkBudget(sb)
+        if (depth > MAX_WRITE_DEPTH) {
+            throw JsonWriteException(
+                "The request body nested deeper than $MAX_WRITE_DEPTH levels — refusing to recurse " +
+                    "through it, because doing so would overflow the stack rather than return an " +
+                    "error. Check `metadata` for a deeply nested or self-referencing value.",
+            )
+        }
         when (value) {
             null -> sb.append("null")
             is String -> writeString(sb, value)
@@ -61,8 +113,9 @@ internal object Json {
                     sb.append(value.toString())
                 }
             }
-            is Float -> writeValue(sb, value.toDouble())
+            is Float -> writeValue(sb, value.toDouble(), depth, seen)
             is Map<*, *> -> {
+                if (!seen.add(value)) throw cycle()
                 sb.append('{')
                 var first = true
                 for ((k, v) in value) {
@@ -70,25 +123,38 @@ internal object Json {
                     first = false
                     writeString(sb, k.toString())
                     sb.append(':')
-                    writeValue(sb, v)
+                    writeValue(sb, v, depth + 1, seen)
+                    checkBudget(sb)
                 }
                 sb.append('}')
+                // Removed on the way out so a DAG — the same object referenced twice as SIBLINGS —
+                // still serialises. Only a value reachable from INSIDE ITSELF is a cycle.
+                seen.remove(value)
             }
             is Iterable<*> -> {
+                if (!seen.add(value)) throw cycle()
                 sb.append('[')
                 var first = true
                 for (v in value) {
                     if (!first) sb.append(',')
                     first = false
-                    writeValue(sb, v)
+                    writeValue(sb, v, depth + 1, seen)
+                    checkBudget(sb)
                 }
                 sb.append(']')
+                seen.remove(value)
             }
             else -> throw IllegalArgumentException(
                 "JSON cannot encode a value of type ${value.javaClass.name}",
             )
         }
     }
+
+    private fun cycle() = JsonWriteException(
+        "The request body contains a value that refers to ITSELF, so serialising it would never " +
+            "terminate. Check `metadata` for a self-referencing structure (an entity graph, a " +
+            "parent/child pair, a memoised object).",
+    )
 
     private fun writeString(sb: StringBuilder, s: String) {
         sb.append('"')

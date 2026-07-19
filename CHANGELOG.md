@@ -4,6 +4,127 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-19
+
+A seventh independent review, conducted against the threat model in `SECURITY.md`. Two High
+findings on the money path, three Medium, one Low. Every fix carries a test that is verified
+non-vacuously by `scripts/non-vacuity.py`, which reverts the fix in the source and requires the
+guarding test to FAIL. Signing is unchanged (the shared golden webhook vector still matches
+byte-for-byte) and the Java interop suite still passes.
+
+### HIGH — a non-canonical result code became TERMINAL FAILURE evidence at the classifier
+
+`DarajaCatalog.decodeError` has required a canonical code lexeme before a catalog lookup since
+0.6.0. `classifyStkResult` — the call that actually produces the money verdict — did not. It went
+through `normalizeCode`, which TRIMS, so `" 1032"`, `"1032\n"`, `"1032 "`, `"+1032"`, `"01032"`
+and the string `"1032.0"` all parsed as a non-zero finite number and returned `FAILED`. A token
+Daraja never sent became proof of terminal failure, and `PaymentSemantics` turned it into a
+`FAILED` verdict on a payment whose real state nobody knew.
+
+`"1032.0"` is the worst of the set, because it is what `PaymentValidators.normalizeResultCode`
+produces *deliberately* for a raw JSON `1032.0` — precisely so the float cannot be laundered into
+`"1032"`. It then matched `CANONICAL_DOTTED_RE`, which accepted a TWO-component dotted value, and
+was pronounced canonical. Every dotted code Daraja actually issues has three components, so that
+pattern now requires at least two dots and the two-component space — the one in which a decimal
+float and a business code are spelled identically — no longer exists. Three guards now stand where
+one did: the lexeme check at the classifier, the tightened dotted pattern, and a bare-decimal
+requirement on the terminal branch itself.
+
+A non-canonical code is neither proof of success nor proof of failure. It is ambiguous, and
+ambiguity resolves to `PENDING`/`INDETERMINATE` — never to a terminal verdict. A genuine `1032`,
+`0`, `4999` and `500.001.1001` are unaffected.
+
+### HIGH — an exotic throwable took the reconciliation handles down with it
+
+After a collect is ACKNOWLEDGED, an STK prompt is live on a handset and the idempotency key is the
+only safe way to ask about it. The fallback wrapper in `collectAndWait` built its message — which
+interpolates `e.message` — BEFORE assigning `idempotencyKey` and `paymentId`.
+
+`Throwable.getMessage()` is ordinary overridable code. A third-party throwable is free to compute
+it lazily and fail while doing so, and that throw happens *inside the string template*, so the
+catch block itself unwinds and the caller receives that second throwable with NO handles at all —
+for a live charge. The whole point of the block is that no failure after acknowledgement loses the
+handles, and the block was reachable in a state where it lost them.
+
+Every term of the message now comes from a helper that cannot propagate, and the same treatment is
+applied to the two places in `Transport.kt` that format a foreign throwable's message — one of
+them inside a `Flow.Subscriber`, where a throw would have left the result future uncompleted.
+
+### MEDIUM — server-controlled credentials on the webhook surface
+
+Two gaps, both on objects a handler logs on its first line:
+
+- `data.paymentId`, `data.checkoutRequestId` and `data.mpesaReceipt` were refused when they carried
+  something credential-shaped. `data.applicationId`, `data.phone` and `data.accountRef` were not —
+  and all six land on the same `WebhookEventData` data class, whose generated `toString()` prints
+  every field. The guard covered the fields someone thought of rather than every identifier on the
+  object. All six are now refused.
+- `Webhooks.verifySignature` returns THE WHOLE PARSED BODY: unknown fields, nested objects, array
+  elements and object NAMES, none of which any allowlist sees. A signature proves who sent the
+  bytes; it does not stop a compromised or buggy signer echoing an `Authorization: Bearer` header —
+  or the webhook signing secret itself — into a field of its choosing. The returned map is now
+  deep-scrubbed by a redactor seeded with the caller's own secret. The typed `parseAndVerify` path
+  is unchanged: it still refuses rather than masks.
+
+### MEDIUM — the simulator diverged from production on the collect path
+
+`simulate.collect()` enforced `amount > 0` and nothing else, so it accepted 150,001 KES, a
+whitespace-only `accountReference` and a 200-character `description` — every one of which
+`collect()` refuses. A simulator LOOSER than production certifies a request that cannot be made,
+which is the opposite of what a test double is for. Both surfaces now share one implementation
+(`CollectBody`); the only difference left is the backend's wire name for the reference field, which
+is a parameter rather than a second validator.
+
+Two further gaps closed on the same surface: `simulate.collect()` had no failure envelope, so every
+post-dispatch failure arrived with `idempotencyKey = null` (it now attaches the effective key on
+every path, dispatch and field checks alike); and `SimulatedPayment` did not report the effective
+key at all, so a caller using the generated-key opt-out could not retry with the key that was
+actually sent. The simulator's own server-controlled strings — `paymentId`, `checkoutRequestId` and
+every outcome `id`/`label`/`status` — are now refused when credential-shaped, exactly as the
+production ack and status read have been since 0.7.0.
+
+### MEDIUM — the non-vacuity harness had three dead anchors
+
+`R5-wh-decoded`, `R5-wh-decoded-malformed` and `R5-zero-launder` named source text that no longer
+existed, so all three reported `BROKEN-ANCHOR` instead of a verdict. The harness caught this
+correctly and refused to pass — the guard was working — but three protections had no live
+measurement behind them. All three anchors are repaired against current source, and eleven new
+cases cover this round's fixes.
+
+The harness's own safeguards were re-verified and are intact: a measurement still requires exit
+code ZERO and zero skipped tests on both runs, every `nv-` tag in the test tree is checked against
+the case list before any case runs, and a non-unique or non-matching anchor is a hard failure.
+
+### LOW — the outbound JSON writer had no bounds at all
+
+The reader is bounded because a response is attacker-controlled. The writer serialises the SDK's
+own request bodies — except for `metadata`, which is arbitrary caller data, very often built from
+the caller's own users' input. A deeply nested map overflowed the stack (a `StackOverflowError`,
+which is an `Error`, so it escaped every catch on the money path); a self-referencing map recursed
+forever; a huge one materialised the whole document before a byte was dispatched. All three are
+DoS against the SDK's own caller, and all three are now refused BEFORE dispatch as a typed
+`PaylodInvalidRequestException` — the one moment at which refusing is free, because no charge yet
+exists. Cycle detection is identity-based, so a DAG (the same object as two siblings) still
+serialises.
+
+### Cross-SDK checks carried over from the sibling reviews
+
+Three defects found in the PHP and Python SDKs this round were checked here explicitly, and are
+now covered by tests so they stay checked:
+
+- **Escaped member names / duplicate keys.** PHP scanned raw JSON bytes for a literal
+  `"resultCode"` key, which an escaped spelling walked past. This SDK has no such scanner: it parses
+  the JSON itself and looks keys up on the DECODED map, and a repeated object name is already fatal
+  rather than last-wins, so a body cannot mean different things to different readers.
+- **Decompression bombs.** Python applied its size cap AFTER automatic decompression. The JDK's
+  `HttpClient` neither requests nor decodes a content coding, and this SDK adds no
+  `Accept-Encoding` header, so the bounded subscriber counts the same bytes that crossed the wire
+  and there is no expansion step to outrun.
+- **Credentials surviving in inner frames.** The credentialed request never crosses a public
+  boundary, no foreign throwable is attached as a `cause`, and every message on the path is
+  redacted — asserted now by walking the whole cause and suppressed chain of a post-acknowledgement
+  refusal.
+
 ## [0.7.0] - 2026-07-18
 
 A sixth independent review, conducted against the threat model in `SECURITY.md`, found no

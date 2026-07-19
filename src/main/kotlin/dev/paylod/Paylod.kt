@@ -12,8 +12,6 @@ import java.util.UUID
 /** The base URL. Identical for every paylod customer, so it is baked in — you never pass it. */
 const val DEFAULT_BASE_URL = "https://paylod.dev/functions/v1"
 
-private const val MAX_AMOUNT = 150_000
-
 // The ceiling on any single sleep when the operation has no absolute deadline of its own.
 private const val MAX_UNBOUNDED_SLEEP_MS = 60_000L
 
@@ -207,7 +205,23 @@ class Paylod internal constructor(
         // Serialize the body ONCE, before the retry loop. Re-serialising on each attempt would let a
         // mutable `metadata` map be mutated under a FIXED Idempotency-Key — the second attempt would
         // send a different body than the first, defeating the double-charge guard.
-        val bodyStr = if (body == null) null else Json.write(body)
+        //
+        // A body the writer refuses — too large, too deep, or self-referencing `metadata` — becomes
+        // a TYPED, PRE-DISPATCH validation error. This is the one place where refusing is free:
+        // nothing has been sent, so no charge can exist, and there is no idempotency key to lose.
+        // Letting the raw writer exception out instead would hand the caller a bare
+        // `RuntimeException` (or, before the writer had limits at all, a `StackOverflowError`) from
+        // inside a payments call, which is neither catchable as a paylod error nor classifiable as a
+        // money state.
+        val bodyStr = if (body == null) {
+            null
+        } else {
+            try {
+                Json.write(body)
+            } catch (e: Json.JsonWriteException) {
+                throw PaylodInvalidRequestException(redact.text(e.message))
+            }
+        }
 
         var attempt = 0
         while (attempt <= maxRetries) {
@@ -322,42 +336,19 @@ class Paylod internal constructor(
 
     // ── Validation ──────────────────────────────────────────────────────────────────────────
 
-    private fun buildCollectBody(params: CollectParams): Map<String, Any?> {
-        val amount = params.amount
-        if (amount <= 0 || amount > MAX_AMOUNT) {
-            throw PaylodInvalidRequestException("amount must be between 1 and $MAX_AMOUNT KES (got $amount).")
-        }
-
-        val out = LinkedHashMap<String, Any?>()
-        out["amount"] = amount
-        out["phone"] = Phone.normalize(params.phone)
-
-        // Validate AND transmit the SAME trimmed representation — never validate the trimmed length
-        // while transmitting the untrimmed original (that would let " x…(12 spaces) " slip past a
-        // 12-char bound). A provided-but-blank value is rejected rather than sent as empty.
-        if (params.accountReference != null) {
-            val ref = params.accountReference.trim()
-            if (ref.isEmpty()) {
-                throw PaylodInvalidRequestException("accountReference must not be blank.")
-            }
-            if (ref.length > 12) {
-                throw PaylodInvalidRequestException("accountReference must be 12 characters or fewer.")
-            }
-            out["accountReference"] = ref
-        }
-        if (params.description != null) {
-            val desc = params.description.trim()
-            if (desc.isEmpty()) {
-                throw PaylodInvalidRequestException("description must not be blank.")
-            }
-            if (desc.length > 64) {
-                throw PaylodInvalidRequestException("description must be 64 characters or fewer.")
-            }
-            out["description"] = desc
-        }
-        if (params.metadata != null) out["metadata"] = params.metadata
-        return out
-    }
+    /**
+     * THE shared body builder — the same one `simulate.collect()` runs. See [CollectBody] for why
+     * this stopped being a private method with a looser twin on the simulator.
+     */
+    private fun buildCollectBody(params: CollectParams): Map<String, Any?> = CollectBody.build(
+        phone = params.phone,
+        amount = params.amount,
+        accountReference = params.accountReference,
+        description = params.description,
+        metadata = params.metadata,
+        accountRefField = "accountReference",
+        label = "collect()",
+    )
 
     // ── Public API ──────────────────────────────────────────────────────────────────────────
 
@@ -587,10 +578,29 @@ class Paylod internal constructor(
                 }
                 throw e
             }
+            // ── THE HANDLES ARE ATTACHED BEFORE ANY DIAGNOSTIC IS COMPUTED ────────────────────
+            //
+            // This used to build the message FIRST and assign `idempotencyKey`/`paymentId` after.
+            // Every term in that message is safe except one: `e.message`. `Throwable.getMessage()`
+            // is an ORDINARY OVERRIDABLE METHOD, and a third-party throwable is free to compute it
+            // — lazily formatting a response, dereferencing a field a failed constructor never set,
+            // consulting a closed resource. If it throws, the throw happens INSIDE the string
+            // template, before `wrapped` exists, so this catch block itself unwinds and the caller
+            // is handed that second throwable with NO idempotency key and NO payment id — for a
+            // charge that is live on a handset. The whole point of this block is that no failure
+            // after acknowledgement loses the handles, and the block was reachable in a state where
+            // it lost them.
+            //
+            // So every term of the message is obtained through a helper that CANNOT propagate:
+            // [safeTypeName] and [safeMessage] both swallow whatever the throwable does and fall
+            // back to a placeholder. The diagnostic is worth having, but not at the price of the
+            // only two handles on a live charge.
+            val kind = safeTypeName(e)
+            val detail = safeMessage(e)
             val wrapped = PaylodConnectionException(
                 redact.text(
                     "The collect was ACKNOWLEDGED and an STK prompt is live, but waiting for it to " +
-                        "settle failed with an unexpected ${e.javaClass.simpleName}: ${e.message}. " +
+                        "settle failed with an unexpected $kind: $detail. " +
                         "The charge state is INDETERMINATE. Read payment ${ack.paymentId} (or retry " +
                         "with THIS idempotencyKey) before starting any new attempt — minting a fresh " +
                         "key would risk a second charge.",
@@ -611,13 +621,41 @@ class Paylod internal constructor(
     private fun chargeContext(ack: CollectAck, cause: Throwable): PaylodException {
         val ctx = PaylodIndeterminateException(
             "The collect was ACKNOWLEDGED and an STK prompt is live for payment ${ack.paymentId}, " +
-                "but waiting for it to settle died with a ${cause.javaClass.simpleName}. The charge " +
+                "but waiting for it to settle died with a ${safeTypeName(cause)}. The charge " +
                 "state is INDETERMINATE. Read that payment, or retry with the idempotencyKey on " +
                 "this exception — never a fresh one.",
             ack.idempotencyKey,
         )
         ctx.paymentId = ack.paymentId
         return ctx
+    }
+
+    /**
+     * The throwable's type name, or a placeholder — NEVER a throw.
+     *
+     * `getClass()` cannot fail, but `Class.getSimpleName()` can: for a malformed or
+     * synthetically-named class the JDK throws `InternalError`/`ClassFormatError` out of the name
+     * parser. That is a remote possibility and it is on the post-acknowledgement path, where the
+     * cost of the remote possibility is a live charge whose idempotency key nobody holds.
+     */
+    private fun safeTypeName(e: Throwable): String = try {
+        e.javaClass.simpleName.ifEmpty { "throwable" }
+    } catch (ignored: Throwable) {
+        "throwable"
+    }
+
+    /**
+     * The throwable's message, or a placeholder — NEVER a throw.
+     *
+     * `Throwable.getMessage()` is overridable ordinary code. A third-party throwable can compute it
+     * lazily and fail while doing so, and a throw from inside a string template on this path takes
+     * the idempotency key and the payment id down with it. Nothing this function is asked for is
+     * worth that, so nothing it does can escape.
+     */
+    private fun safeMessage(e: Throwable): String = try {
+        e.message ?: "(no message)"
+    } catch (ignored: Throwable) {
+        "(the throwable's own getMessage() failed)"
     }
 
     /** Java-friendly overload of [collectAndWait]. */

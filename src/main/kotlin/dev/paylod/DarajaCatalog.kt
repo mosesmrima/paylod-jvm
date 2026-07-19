@@ -206,8 +206,22 @@ object DarajaCatalog {
     /**
      * A dotted Daraja business code — `500.001.1001`, `400.002.02`. Each segment is bare digits; the
      * FIRST segment carries no leading zero, later segments may (`002` is how Daraja writes them).
+     *
+     * ── Why THREE components, not two ─────────────────────────────────────────────────────
+     * This accepted `{1,6}` trailing segments, so a two-component value was canonical — and the
+     * two-component values are exactly the FLOAT SPELLINGS. `"1032.0"` is what
+     * `PaymentValidators.normalizeResultCode` produces for a raw JSON `1032.0`, deliberately, so
+     * that the float cannot be laundered into `"1032"`. It then matched here, was pronounced
+     * canonical, and reached the classifier's numeric branch as a non-zero finite number: TERMINAL
+     * FAILURE, for a float Daraja never sent. The refusal one layer up was undone by the pattern
+     * meant to enforce it.
+     *
+     * Every dotted code Daraja actually issues has exactly three components — see
+     * `daraja-error-codes.json`, where all eight are `NNN.NNN.NN…`. Requiring at least two dots is
+     * therefore not a narrowing of anything real, and it removes the entire two-component space in
+     * which a decimal float and a business code are spelled identically.
      */
-    private val CANONICAL_DOTTED_RE = Regex("(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){1,6}")
+    private val CANONICAL_DOTTED_RE = Regex("(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8}){2,6}")
 
     /** An alphanumeric result code — `C2B00011`. Always starts with a letter, never with a digit. */
     private val CANONICAL_ALNUM_RE = Regex("[A-Za-z][A-Za-z0-9_]{0,31}")
@@ -258,6 +272,29 @@ object DarajaCatalog {
         // float is what let `1032.0` classify as a terminal cancellation.
         if (resultCode != null && codeLexeme(resultCode) == null) return StkOutcome.PENDING
 
+        // ── FORM BEFORE MEANING, AT THE CLASSIFIER TOO ────────────────────────────────────────
+        //
+        // `decodeError` has required a canonical lexeme before a catalog lookup since round 6. The
+        // CLASSIFIER did not, and the classifier is the one that produces the money verdict. It
+        // reached the numeric branch below through `normalizeCode`, which TRIMS — so `" 1032"`,
+        // `"1032\n"`, `"+1032"`, `"01032"` and the string `"1032.0"` (which is what
+        // `PaymentValidators.normalizeResultCode` hands over for a raw JSON `1032.0`, precisely so
+        // the float cannot be laundered) all parsed as a non-zero finite number and returned
+        // FAILED. A token Daraja never sent became TERMINAL FAILURE EVIDENCE, and `PaymentSemantics`
+        // turned that into a `FAILED` verdict on a payment whose real state nobody knew.
+        //
+        // The refusal is the same one the decoder makes, for the same reason: a non-canonical code
+        // is neither proof of success nor proof of failure. It is AMBIGUOUS, and ambiguity resolves
+        // to PENDING — never to a terminal verdict — so the webhook or a later read settles it.
+        //
+        // The float type is refused twice over: once above (a `Double` has no lexeme) and once here
+        // (the string `"1032.0"` is not a canonical lexeme), because the two layers launder it
+        // differently and a guarantee with two ways in has to be closed at both.
+        val lexeme = codeLexeme(resultCode)
+        if (lexeme != null && lexeme.isNotEmpty() && !isCanonicalCodeLexeme(lexeme)) {
+            return StkOutcome.PENDING
+        }
+
         val raw = normalizeCode(resultCode)
         val desc = (resultDesc ?: "").trim()
 
@@ -280,6 +317,12 @@ object DarajaCatalog {
                 return StkOutcome.PENDING
             }
             // A known-numeric, non-zero code is terminal — UNLESS the description says otherwise.
+            // Belt and braces on the FORM: only a BARE DECIMAL lexeme may take the terminal branch.
+            // The canonical set also contains dotted and alphanumeric spellings, and a dotted one
+            // that `toDoubleOrNull` happens to parse must not be judged as though it were a plain
+            // number. Two independent readings of "is this a number" is how the float spelling got
+            // in the first time.
+            if (!CANONICAL_CODE_RE.matches(raw)) return StkOutcome.PENDING
             return if (PENDING_DESC_RE.containsMatchIn(desc)) StkOutcome.PENDING else StkOutcome.FAILED
         }
 
