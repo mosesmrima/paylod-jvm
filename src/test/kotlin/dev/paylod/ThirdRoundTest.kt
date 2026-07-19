@@ -1,6 +1,7 @@
 package dev.paylod
 
 import dev.paylod.internal.Json
+import dev.paylod.internal.JsonNumber
 import dev.paylod.internal.RealTimeSource
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -391,11 +392,15 @@ class ThirdRoundTest {
             assertThrows<Json.JsonParseException>("accepted the number \"$text\"") { Json.parse(text) }
         }
         // The legal shapes still parse.
-        assertEquals(0L, Json.parse("0"))
-        assertEquals(-1L, Json.parse("-1"))
-        assertEquals(1.5, Json.parse("1.5"))
-        assertEquals(1000.0, Json.parse("1e3"))
-        assertEquals(0.5, Json.parse("0.5"))
+        // Asserted on the TOKEN the parser retained, which is what the money path reads.
+        // `1e3` is the case that makes the point: numerically it is 1000.0, and its lexeme is
+        // `1e3` -- a spelling no Daraja code uses, which is why it must stay distinguishable.
+        assertEquals("0", (Json.parse("0") as JsonNumber).lexeme)
+        assertEquals("-1", (Json.parse("-1") as JsonNumber).lexeme)
+        assertEquals("1.5", (Json.parse("1.5") as JsonNumber).lexeme)
+        assertEquals("1e3", (Json.parse("1e3") as JsonNumber).lexeme)
+        assertEquals(1000.0, (Json.parse("1e3") as JsonNumber).toDouble())
+        assertEquals("0.5", (Json.parse("0.5") as JsonNumber).lexeme)
     }
 
     @Test

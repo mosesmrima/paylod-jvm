@@ -4,6 +4,19 @@ import dev.paylod.internal.Json
 import dev.paylod.internal.TimeSource
 import java.util.Random
 
+/**
+ * Replace every [dev.paylod.internal.JsonNumber] in a parsed structure with the plain JVM number it
+ * decoded to, recursively. See the call site in [StubTransport.execute].
+ */
+@Suppress("UNCHECKED_CAST")
+fun unwrapNumbers(v: Any?): Any? = when (v) {
+    is dev.paylod.internal.JsonNumber ->
+        if (v.isIntegral) v.toLong() else v.toDouble()
+    is Map<*, *> -> v.entries.associate { (k, value) -> k as String to unwrapNumbers(value) }
+    is List<*> -> v.map { unwrapNumbers(it) }
+    else -> v
+}
+
 /** A recorded outbound call, so tests can assert what actually hit the wire. */
 data class RecordedCall(
     val url: String,
@@ -49,7 +62,15 @@ class StubTransport(private val steps: List<Step>) : HttpTransport {
     @Suppress("UNCHECKED_CAST")
     override fun execute(request: HttpRequestSpec): HttpResponseSpec {
         lastRequestSpec = request
-        val parsedBody = request.body?.let { Json.parse(it) as? Map<String, Any?> }
+        // The parser now hands back [dev.paylod.internal.JsonNumber] for every number, carrying the
+        // sender's original token (conformance requirement 2.1). That is exactly right on the money
+        // path and pure noise HERE: `RecordedCall` is a test convenience for asserting what the SDK
+        // put on the wire, and a fixture written as `mapOf("amount" to 100L)` should keep comparing
+        // equal. So numbers are unwrapped to ordinary JVM values at this boundary and nowhere else.
+        //
+        // Note what is NOT done: the SDK's real request body is the raw `request.body` STRING, which
+        // is untouched. Any test that cares about the exact bytes reads that.
+        val parsedBody = request.body?.let { unwrapNumbers(Json.parse(it)) as? Map<String, Any?> }
         calls.add(RecordedCall(request.url, request.method, request.headers, parsedBody, request.timeoutMs))
 
         val step = steps.getOrElse(minOf(index, steps.size - 1)) {

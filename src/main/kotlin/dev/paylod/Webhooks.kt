@@ -2,6 +2,7 @@ package dev.paylod
 
 import dev.paylod.internal.CredentialShapes
 import dev.paylod.internal.Json
+import dev.paylod.internal.JsonNumber
 import dev.paylod.internal.Redactor
 import dev.paylod.internal.Utf8
 import java.nio.charset.StandardCharsets
@@ -636,8 +637,17 @@ object Webhooks {
         // Unix seconds are an integer; `1e400`, `1.5` and `1.0` are none of them things a
         // conforming emitter sends, and accepting a float here only re-opens the question of which
         // floats are safe.
+        // The reader now hands over the sender's TOKEN alongside the value ([JsonNumber]), so the
+        // integrality test is made on the SPELLING rather than on the JVM type it decoded to. That
+        // is strictly stronger: `1e400`, `1.0` and `1032.0` are refused because of how they are
+        // WRITTEN, not because of which type they happened to land in. See requirement 2.1.
         val created = root["created"]
-        if (created !is Long && created !is Int && created !is Short && created !is Byte) {
+        val createdIsIntegral = when (created) {
+            is JsonNumber -> created.isIntegral
+            is Long, is Int, is Short, is Byte -> true
+            else -> false
+        }
+        if (!createdIsIntegral) {
             invalid(
                 "created is ${redact.field(created)}, not an integral JSON number of unix seconds " +
                     "— a floating-point spelling (including 1e400, which decodes to infinity and " +
@@ -759,13 +769,13 @@ object Webhooks {
         // exist, be non-blank, be written the way Daraja writes result codes, and actually classify
         // as a failure.
         if (type == "payment.failed") {
-            val lexeme = when (resultCode) {
-                null -> null
-                is String -> resultCode
-                is Byte, is Short, is Int, is Long -> resultCode.toString()
-                // A float has no lexeme — `1032.0` and `1.032e3` are not tokens Daraja sends.
-                else -> null
-            }
+            // ONE definition of "what token did the sender write", shared with the classifier and
+            // the decoder. This layer still asks the question independently — requirement 1.1 is
+            // about each layer CHECKING, not about each layer reimplementing — but a fourth private
+            // copy of the rule is a fourth place for `JsonNumber` (or the next representation) to be
+            // missed. This block was exactly that: it predated the parser keeping tokens, so every
+            // number arrived here as "no lexeme" and every legitimate failure webhook was refused.
+            val lexeme = DarajaCatalog.codeLexeme(resultCode)
             if (lexeme == null || lexeme.isBlank() || !DarajaCatalog.isCanonicalCodeLexeme(lexeme)) {
                 invalid(
                     "it announces a failed payment but carries no canonical Daraja result code " +
@@ -837,6 +847,9 @@ object Webhooks {
 
     private fun asLong(v: Any?): Long? = when (v) {
         null -> null
+        // Read from the TOKEN, so a value whose spelling is not an integer cannot be coerced into
+        // one here after the schema check approved it on the same grounds.
+        is JsonNumber -> if (v.isIntegral) v.lexeme.toLongOrNull() else null
         is Long -> v
         is Int -> v.toLong()
         is Double -> v.toLong()
@@ -858,6 +871,8 @@ object Webhooks {
      */
     private fun normalizeCode(v: Any?): String? = when (v) {
         null -> null
+        // The sender's own token, unchanged. No collapse at any value, and no trim.
+        is JsonNumber -> v.lexeme
         // No collapse at any value. A float has no lexeme, so it can never select a catalog entry.
         is Double -> v.toString()
         else -> v.toString()

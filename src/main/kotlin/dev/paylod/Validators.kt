@@ -268,6 +268,9 @@ internal object PaymentValidators {
      */
     private fun normalizeResultCode(v: Any?): String? = when (v) {
         null -> null
+        // The parser kept the sender's token; hand it on unchanged. Nothing here re-renders a
+        // number, so there is no longer any point at which `1032.0` could become `"1032"`.
+        is dev.paylod.internal.JsonNumber -> v.lexeme
         // No collapse, at any value. Not just at zero: the non-zero float path selected a RETRYABLE
         // cancellation entry, which is strictly worse than manufacturing a success code.
         is Double -> v.toString()

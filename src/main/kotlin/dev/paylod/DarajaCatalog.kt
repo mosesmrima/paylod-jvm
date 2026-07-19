@@ -1,6 +1,7 @@
 package dev.paylod
 
 import dev.paylod.internal.Json
+import dev.paylod.internal.JsonNumber
 import dev.paylod.internal.Redactor
 import java.util.Collections
 
@@ -143,6 +144,9 @@ object DarajaCatalog {
     private fun normalizeCode(resultCode: Any?): String =
         when (resultCode) {
             null -> ""
+            // NOT trimmed: the token is returned as written, so a lower layer cannot launder
+            // `" 1032"` into `"1032"` behind the checks above it. See requirement 1.1.
+            is JsonNumber -> resultCode.lexeme
             // A Double keeps its OWN representation — no collapse, at any value. Collapsing a
             // whole float to its integer form was a lookup convenience that manufactured a
             // canonical code out of a token Daraja never sent; the zero carve-out closed only the
@@ -184,7 +188,13 @@ object DarajaCatalog {
      */
     @JvmStatic
     fun isCanonicalSuccessCode(resultCode: Any?): Boolean = when (resultCode) {
-        // Integral JVM numbers. A JSON `0` parses to `Long` here, which is the ordinary wire case.
+        // A number read from a document: compared as the TOKEN, not as a value. This is the
+        // strongest form of the rule — `-0`, `0.0` and `0e999` are all numerically zero and none of
+        // them is spelled `0`, so each is rejected on the one property that actually distinguishes
+        // it from the canonical code.
+        is JsonNumber -> resultCode.lexeme == "0"
+        // Integral JVM numbers built by a CALLER rather than parsed (the simulator, a hand-made
+        // fixture, a Java integration). No document, so no token; the value is all there is.
         is Byte, is Short, is Int, is Long -> (resultCode as Number).toLong() == 0L
         // The canonical string, byte for byte. Not trimmed, not parsed, not coerced.
         is String -> resultCode == "0"
@@ -261,12 +271,27 @@ object DarajaCatalog {
      * rendering of a `Double` back to the token the sender wrote (`0.0`, `-0.0`, `1032.0` and
      * `1.0e3` all collapse), and the schema specifies an integer — so a float-typed code is refused
      * rather than guessed at. Mirrors the PHP and Python SDKs exactly.
+     *
+     * PUBLIC because three layers must each ask this question independently (requirement 1.1) —
+     * the classifier, the decoder and the webhook schema check. Each CALLS it separately, which is
+     * the independence the requirement asks for; what they must not have is three separate
+     * DEFINITIONS of what a lexeme is. The webhook path had its own `when` block, and a fourth
+     * spelling is a fourth thing to forget to update.
      */
-    private fun codeLexeme(resultCode: Any?): String? = when (resultCode) {
+    @JvmStatic
+    fun codeLexeme(resultCode: Any?): String? = when (resultCode) {
         null -> null
         is Boolean -> null
+        // The token EXACTLY as the sender wrote it, straight from the parser. This is the case that
+        // used to be handled by refusing every `Double` for "having no lexeme": correct in outcome,
+        // but it judged the JVM TYPE rather than the spelling. `1032.0`, `1.032e3`, `0e999` and
+        // `-0` now each arrive with their own distinct lexeme and are each refused by
+        // [isCanonicalCodeLexeme] on their own spelling. See [dev.paylod.internal.JsonNumber].
+        is JsonNumber -> resultCode.lexeme
         is Byte, is Short, is Int, is Long -> resultCode.toString()
         is String -> resultCode
+        // A bare Double/Float/BigDecimal — one built by a caller rather than read from a document,
+        // so there is no token to recover and no lossless rendering back to one.
         else -> null
     }
 

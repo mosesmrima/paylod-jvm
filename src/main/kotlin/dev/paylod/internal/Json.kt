@@ -31,6 +31,68 @@ package dev.paylod.internal
 internal fun isNegativeZero(v: Double): Boolean =
     v == 0.0 && java.lang.Double.doubleToRawLongBits(v) != 0L
 
+/**
+ * A JSON number that still knows the TOKEN the sender actually wrote.
+ *
+ * ── Why the parsed value alone is not enough (conformance requirement 2.1) ────────────────────
+ * The money decision this SDK makes most often is "is this result code the canonical success code
+ * `0`?", and a whole family of tokens are numerically equal to a canonical code without being one:
+ * `-0`, `0.0`, `0e999`, `1032.0`, `1.032e3`. Every mainstream parser — `json.loads`, `JSON.parse`,
+ * and this one before this class existed — answers with a NUMBER, at which point the spelling is
+ * gone: `1.032e3` and `1032.0` are the same `Double`, and `-0` is a `Long` zero indistinguishable
+ * from a genuine `0` unless the sign bit is rescued by hand.
+ *
+ * The previous design rescued the safety property WITHOUT the token, by discriminating on TYPE: an
+ * integral `Long` could be a code, a `Double` could not, so every fractional or exponential
+ * spelling was refused for having "no lexeme". That was sound — none of the dangerous tokens got
+ * through — but it was sound by a proxy, and it had two costs. A caller who sent `1.032e3` was told
+ * their code had no lexeme rather than being shown what arrived. And the guarantee rested on the
+ * mapping from token to JVM type, so anyone later relaxing "a Double is never a code" would have
+ * reopened the whole family at once with no test naming the tokens.
+ *
+ * So the token is now simply kept. `codeLexeme` returns what the sender wrote, `isCanonicalCodeLexeme`
+ * judges THAT, and `isCanonicalSuccessCode` compares it to the literal `"0"`. The refusals are
+ * unchanged; the reason for each is now the actual spelling.
+ *
+ * It IS a [Number], so every `is Number` shape check, every redaction traversal and every arithmetic
+ * consumer keeps working unchanged.
+ */
+internal class JsonNumber(
+    /** The token exactly as it appeared in the document. Never normalized, trimmed or re-rendered. */
+    val lexeme: String,
+    private val parsed: Number,
+) : Number() {
+
+    /**
+     * Was this written as a whole number — no fraction, no exponent, and not the signed zero?
+     *
+     * `-0` is deliberately NOT integral. It is spelled like an integer and is the one token whose
+     * numeric value (`0`) is the canonical success code while its spelling is not.
+     */
+    val isIntegral: Boolean =
+        lexeme != "-0" && lexeme.none { it == '.' || it == 'e' || it == 'E' }
+
+    override fun toByte(): Byte = parsed.toByte()
+    override fun toDouble(): Double = parsed.toDouble()
+    override fun toFloat(): Float = parsed.toFloat()
+    override fun toInt(): Int = parsed.toInt()
+    override fun toLong(): Long = parsed.toLong()
+    override fun toShort(): Short = parsed.toShort()
+
+    /** The token, so any diagnostic that interpolates this value shows what actually arrived. */
+    override fun toString(): String = lexeme
+
+    /**
+     * Identity is the TOKEN, not the numeric value.
+     *
+     * `1032.0` and `1.032e3` are equal as numbers and are different documents. On this path the
+     * document is what matters, so two values are equal only when they were written the same way.
+     */
+    override fun equals(other: Any?): Boolean = other is JsonNumber && other.lexeme == lexeme
+
+    override fun hashCode(): Int = lexeme.hashCode()
+}
+
 internal object Json {
 
     // ── Writing ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +158,11 @@ internal object Json {
         }
         when (value) {
             null -> sb.append("null")
+            // Emitted as the ORIGINAL TOKEN, so a parse/write round-trip is byte-exact. Rendering
+            // it from the parsed value instead would re-introduce, on the way out, precisely the
+            // laundering the reader refuses to do on the way in — and would make a round-trip
+            // through a test stub unable to carry the very spellings these tests exist to check.
+            is JsonNumber -> sb.append(value.lexeme)
             is String -> writeString(sb, value)
             is Boolean -> sb.append(if (value) "true" else "false")
             is Int, is Long, is Short, is Byte -> sb.append(value.toString())
@@ -430,6 +497,9 @@ internal object Json {
             }
 
             val token = src.substring(start, pos)
+            // THE TOKEN IS KEPT, ALWAYS. Every return below wraps the parsed value in a
+            // [JsonNumber] carrying `token` exactly as it was written, so no consumer downstream
+            // has to reconstruct a spelling from a JVM type. See [JsonNumber] and requirement 2.1.
             if (!isDouble) {
                 // NEGATIVE ZERO IS NOT THE INTEGER ZERO, AND MUST NOT BECOME IT HERE.
                 //
@@ -447,10 +517,11 @@ internal object Json {
                 // that must round-trip. Rejection belongs at classification, where the canonical
                 // success code is decided — and a `Double` is never the canonical success code,
                 // so it now fails that test exactly like the quoted `"-0"` always did.
-                if (token == "-0") return -0.0
-                token.toLongOrNull()?.let { return it }
+                if (token == "-0") return JsonNumber(token, -0.0)
+                token.toLongOrNull()?.let { return JsonNumber(token, it) }
             }
-            return token.toDoubleOrNull() ?: fail("invalid number '$token'")
+            val d = token.toDoubleOrNull() ?: fail("invalid number '$token'")
+            return JsonNumber(token, d)
         }
 
         private fun parseBoolean(): Boolean {

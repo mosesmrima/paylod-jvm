@@ -1,6 +1,7 @@
 package dev.paylod
 
 import dev.paylod.internal.Json
+import dev.paylod.internal.JsonNumber
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -30,7 +31,12 @@ class JsonTest {
         val map = Json.parseObject("""{"id":"pay_1","status":"success","resultCode":0,"receipt":null}""")
         assertEquals("pay_1", map["id"])
         assertEquals("success", map["status"])
-        assertEquals(0L, map["resultCode"])
+        // The parser keeps the sender's TOKEN (requirement 2.1), so the assertion is on the
+        // spelling. `0L` would also hold numerically for `-0`, `0.0` and `0e999` -- the exact
+        // family that must never be mistaken for the canonical success code -- so asserting the
+        // lexeme is the stronger statement, not merely the newer one.
+        assertEquals("0", (map["resultCode"] as JsonNumber).lexeme)
+        assertEquals(0L, (map["resultCode"] as JsonNumber).toLong())
         assertNull(map["receipt"])
     }
 
@@ -39,8 +45,9 @@ class JsonTest {
         val v = Json.parse("""[true,false,1.5,-2,"x"]""") as List<*>
         assertEquals(true, v[0])
         assertEquals(false, v[1])
-        assertEquals(1.5, v[2])
-        assertEquals(-2L, v[3])
+        assertEquals("1.5", (v[2] as JsonNumber).lexeme)
+        assertEquals(1.5, (v[2] as JsonNumber).toDouble())
+        assertEquals("-2", (v[3] as JsonNumber).lexeme)
         assertEquals("x", v[4])
     }
 
@@ -50,7 +57,7 @@ class JsonTest {
         @Suppress("UNCHECKED_CAST")
         val a = v["a"] as Map<String, Any?>
         val b = a["b"] as List<*>
-        assertEquals(1L, b[0])
+        assertEquals("1", (b[0] as JsonNumber).lexeme)
         @Suppress("UNCHECKED_CAST")
         assertEquals("d", (b[1] as Map<String, Any?>)["c"])
     }

@@ -153,6 +153,174 @@ class TenthRoundTest {
         assertTrue(bad.message!!.contains("placeholder"), bad.message)
     }
 
+    // ── §2.1 — the numeric lexeme of a money-critical field survives parsing ────────────────
+
+    /**
+     * §2.1. The named failures are `-0` becoming `0` and `1032.0` becoming `1032`. Neither happens,
+     * and now the ORIGINAL TOKEN is what the money path actually reads.
+     */
+    @Test
+    @Tag("nv-lexeme-preserved")
+    fun `every numeric spelling survives parsing as the token that was written`() {
+        val tokens = listOf(
+            "0", "-0", "0.0", "0e999", "1032", "1032.0", "1.032e3", "-1032", "1e3", "500.0",
+        )
+        for (t in tokens) {
+            val parsed = dev.paylod.internal.Json.parse(t)
+            assertEquals(t, (parsed as dev.paylod.internal.JsonNumber).lexeme, "lexeme lost for $t")
+            // And a write round-trip is byte-exact, so a stub cannot hide a spelling from a test.
+            assertEquals(t, dev.paylod.internal.Json.write(parsed))
+        }
+
+        // The two collapses the requirement names, asserted as NON-collapses.
+        val negZero = dev.paylod.internal.Json.parse("-0") as dev.paylod.internal.JsonNumber
+        val zero = dev.paylod.internal.Json.parse("0") as dev.paylod.internal.JsonNumber
+        assertNotEquals(zero.lexeme, negZero.lexeme)
+        val floatCode = dev.paylod.internal.Json.parse("1032.0") as dev.paylod.internal.JsonNumber
+        assertNotEquals("1032", floatCode.lexeme)
+        // Numerically equal spellings stay DISTINCT documents.
+        val exp = dev.paylod.internal.Json.parse("1.032e3") as dev.paylod.internal.JsonNumber
+        assertEquals(floatCode.toDouble(), exp.toDouble())
+        assertNotEquals(floatCode.lexeme, exp.lexeme)
+
+        // Only the exact token `0` is the canonical success code. Every numeric zero impostor is not.
+        assertTrue(DarajaCatalog.isCanonicalSuccessCode(zero))
+        for (impostor in listOf("-0", "0.0", "0e999")) {
+            assertFalse(
+                DarajaCatalog.isCanonicalSuccessCode(dev.paylod.internal.Json.parse(impostor)),
+                "$impostor was accepted as the canonical success code",
+            )
+        }
+    }
+
+    /** §2.1, end to end: a raw `1032.0` on the wire never selects the RETRYABLE cancellation entry. */
+    @Test
+    @Tag("nv-lexeme-preserved")
+    fun `a float-spelled cancellation code never becomes a retryable cancellation`() {
+        val raw = """{"id":"pay_123","status":"failed","resultCode":1032.0,"mpesaReceipt":null}"""
+        val (client, _) = testClient(listOf(Step(status = 200, raw = raw)))
+        val outcome = Outcomes.of(client.status("pay_123"))
+        assertFalse(outcome.retryable, "1032.0 was laundered into the retryable cancellation entry")
+        assertFalse(outcome.paid)
+        assertEquals(OutcomeStatus.PENDING, outcome.status)
+
+        // CONTROL (§8.5): the INTEGER 1032 in the same position IS the cancellation, and IS
+        // retryable. Without this the test would pass just as well against an SDK that refused
+        // everything.
+        val ok = """{"id":"pay_123","status":"failed","resultCode":1032,"mpesaReceipt":null}"""
+        val (c2, _) = testClient(listOf(Step(status = 200, raw = ok)))
+        val good = Outcomes.of(c2.status("pay_123"))
+        assertEquals(OutcomeStatus.CANCELLED, good.status)
+        assertTrue(good.retryable)
+    }
+
+    // ── §2.2 / §2.3 / §2.4 / §2.5 — member names, duplicates, agreement, depth ──────────────
+
+    /** §2.2 — member names are compared AFTER escapes are decoded. */
+    @Test
+    @Tag("nv-json-escaped-dup")
+    fun `an escaped member name is the same member as its literal spelling`() {
+        // `resultCode` decodes to `resultCode`. A raw-bytes scan matching only the literal
+        // spelling would see two different names and let the duplicate through.
+        val body = """{"resultCode":1032,"resultCode":-0}"""
+        val e = assertThrows<dev.paylod.internal.Json.JsonParseException> {
+            dev.paylod.internal.Json.parse(body)
+        }
+        assertTrue(e.message!!.contains("duplicate"), e.message)
+
+        // And the decoding itself is right, on a non-duplicate document.
+        val ok = dev.paylod.internal.Json.parseObject("""{"resultCode":"0"}""")
+        assertEquals("0", ok["resultCode"])
+    }
+
+    /**
+     * §2.3 — duplicate money-critical members are REFUSED, not resolved.
+     *
+     * The point is not which value wins. It is that "which value wins" must never be a question
+     * this SDK's safety depends on answering the same way as the sender, an upstream proxy, a WAF
+     * and a logger. This parser rejects ALL duplicates, which is stricter than the requirement.
+     */
+    @Test
+    @Tag("nv-json-escaped-dup")
+    fun `duplicate object names are refused regardless of which value a parser would keep`() {
+        val bodies = listOf(
+            """{"resultCode":1032,"resultCode":-0}""",
+            """{"resultCode":-0,"resultCode":1032}""",
+            """{"id":"pay_A","id":"pay_B"}""",
+            """{"status":"failed","status":"success"}""",
+            """{"mpesaReceipt":"SFF6XYZ123","mpesaReceipt":"[redacted]"}""",
+            // Nested, and with an escape on one side only.
+            """{"data":{"resultCode":0,"resultCode":1032}}""",
+        )
+        for (b in bodies) {
+            val e = assertThrows<dev.paylod.internal.Json.JsonParseException> {
+                dev.paylod.internal.Json.parse(b)
+            }
+            assertTrue(e.message!!.contains("duplicate"), "$b -> ${e.message}")
+        }
+        // CONTROL: the same names in SEPARATE objects are perfectly legal.
+        dev.paylod.internal.Json.parse("""[{"id":"pay_A"},{"id":"pay_B"}]""")
+    }
+
+    /**
+     * §2.4 — the scanner and the parser cannot disagree, because there is exactly one reader.
+     *
+     * PHP needs an incremental scanner running alongside `json_decode` and has to fail closed when
+     * the two disagree, since it cannot make `json_decode` preserve a lexeme. This SDK owns its
+     * parser, so the lexeme is retained by the ONE reader that produces the values — there is no
+     * second opinion to reconcile. This test pins that architectural fact so a future change that
+     * introduces a second reader has to confront it.
+     */
+    @Test
+    @Tag("nv-single-reader")
+    fun `there is exactly one JSON reader, so no scanner can disagree with a parser`() {
+        val main = java.io.File("src/main/kotlin/dev/paylod")
+        val readers = main.walkTopDown().filter { it.extension == "kt" }.flatMap { f ->
+            val src = f.readText()
+            // Any other JSON entry point would show up as a distinct parse call.
+            Regex("""\b(JSONObject|ObjectMapper|Gson|kotlinx\.serialization|Json\.decodeFromString)\b""")
+                .findAll(src).map { "${f.name}: ${it.value}" }
+        }.toList()
+        assertTrue(readers.isEmpty(), "a second JSON reader appeared: $readers")
+
+        // And every production parse goes through the one reader.
+        val parseSites = main.walkTopDown().filter { it.extension == "kt" }
+            .sumOf { f -> Regex("""Json\.parse(Object)?\(""").findAll(f.readText()).count() }
+        assertTrue(parseSites > 0, "found no parse sites at all — this check is measuring nothing")
+    }
+
+    /** §2.5 — parse depth is bounded, and exceeding the bound REFUSES. */
+    @Test
+    @Tag("nv-parse-depth")
+    fun `parse depth is bounded and the bound refuses rather than overflows`() {
+        val depth = dev.paylod.internal.Json.MAX_DEPTH
+        // Just inside: accepted.
+        val ok = "[".repeat(depth) + "]".repeat(depth)
+        dev.paylod.internal.Json.parse(ok)
+        // Just outside: a typed refusal, NOT a StackOverflowError.
+        val tooDeep = "[".repeat(depth + 1) + "]".repeat(depth + 1)
+        val e = assertThrows<dev.paylod.internal.Json.JsonParseException> {
+            dev.paylod.internal.Json.parse(tooDeep)
+        }
+        assertTrue(e.message!!.contains("nested deeper"), e.message)
+        // Far outside: still a typed refusal, which is the case that used to be an Error.
+        assertThrows<dev.paylod.internal.Json.JsonParseException> {
+            dev.paylod.internal.Json.parse("[".repeat(200_000) + "]".repeat(200_000))
+        }
+    }
+
+    /** §4.4 — the redaction traversal bound is pinned to the parse bound, asserted not commented. */
+    @Test
+    @Tag("nv-parse-depth")
+    fun `the redaction depth bound is at least the parse depth bound`() {
+        assertTrue(
+            dev.paylod.internal.Redactor.MAX_DEPTH >= dev.paylod.internal.Json.MAX_DEPTH,
+            "REDACT_DEPTH (${dev.paylod.internal.Redactor.MAX_DEPTH}) < " +
+                "PARSE_DEPTH (${dev.paylod.internal.Json.MAX_DEPTH}) — content that parses would " +
+                "reach a scanner that cannot see it",
+        )
+    }
+
     // ── §4.1 / §4.9 — credentials reach no public surface, including the offline ones ───────
 
     /**

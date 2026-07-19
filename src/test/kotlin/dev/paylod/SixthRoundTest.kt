@@ -1,6 +1,7 @@
 package dev.paylod
 
 import dev.paylod.internal.Json
+import dev.paylod.internal.JsonNumber
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
@@ -36,17 +37,19 @@ class SixthRoundTest {
     @Tag("nv-rawzero-parse")
     fun `the JSON reader preserves a raw -0 instead of collapsing it to an integer zero`() {
         val parsed = Json.parse("-0")
-        assertFalse(parsed is Long, "a raw -0 must not arrive as an integral zero: got $parsed")
-        assertTrue(parsed is Double)
+        // The token itself now survives, which subsumes the old sign-bit rescue: `-0` is not
+        // merely distinguishable from `0`, it is still spelled `-0`. (Requirement 2.1.)
+        assertEquals("-0", (parsed as JsonNumber).lexeme)
+        assertFalse(parsed.isIntegral, "-0 is spelled like an integer but must not count as one")
         assertTrue(
-            java.lang.Double.doubleToRawLongBits(parsed as Double) != 0L,
+            java.lang.Double.doubleToRawLongBits(parsed.toDouble()) != 0L,
             "the sign bit must survive, otherwise -0 and 0 are indistinguishable downstream",
         )
         // And it is therefore NOT the canonical success code, which is the whole point.
         assertFalse(DarajaCatalog.isCanonicalSuccessCode(parsed))
 
         // A genuine integer zero is untouched — this is a tightening, not a blanket change.
-        assertEquals(0L, Json.parse("0"))
+        assertEquals("0", (Json.parse("0") as JsonNumber).lexeme)
         assertTrue(DarajaCatalog.isCanonicalSuccessCode(Json.parse("0")))
 
         // The WRITER must not re-launder it on the way out either. `Json.write(-0.0)` used to emit
