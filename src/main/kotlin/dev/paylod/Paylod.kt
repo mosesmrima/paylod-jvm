@@ -815,8 +815,19 @@ class Paylod internal constructor(
             val scheme = parsed.scheme?.lowercase()
             val isLive = apiKey.startsWith("mp_live_")
 
+            // THE DIAGNOSTICS CHOKE POINT, applied to a CALLER-controlled value.
+            //
+            // `sanitizeUrl` removes userinfo, query and fragment — but keeps the PATH verbatim, and
+            // a path is a perfectly ordinary place for a credential to end up: a copied signed URL,
+            // a callback endpoint with the key in it, an environment variable assembled wrong. The
+            // adversarial sweep produced exactly that and watched the key land in this message,
+            // which is the first thing a misconfigured integration prints at startup.
+            //
+            // Redacting rather than refusing, because this is the message that TELLS the caller
+            // their configuration is wrong — it has to remain readable enough to act on.
+            val redact = Redactor(listOf(apiKey))
             fun reject(why: String): Nothing = throw PaylodConfigException(
-                "baseUrl is not an allowed paylod origin: $why (got \"${sanitizeUrl(parsed)}\"). The API key can move " +
+                "baseUrl is not an allowed paylod origin: $why (got ${redact.field(sanitizeUrl(parsed))}). The API key can move " +
                     "money, so it is only ever sent to https://$CANONICAL_HOST. Loopback HTTP " +
                     "(localhost, 127.0.0.1) is allowed ONLY with allowInsecureBaseUrl = true and NEVER " +
                     "with an mp_live_ key.",

@@ -34,10 +34,21 @@ class StubTransport(private val steps: List<Step>) : HttpTransport {
     val calls = mutableListOf<RecordedCall>()
     private var index = 0
 
+    /**
+     * The last [HttpRequestSpec] the SDK actually handed over, kept as the SDK's own type.
+     *
+     * [RecordedCall] is a convenience shape belonging to the tests; this is the real object a custom
+     * transport receives, which is what the adversarial sweep needs to inspect — SECURITY.md claims
+     * the credential never crosses this boundary, and that claim is about THIS object.
+     */
+    var lastRequestSpec: HttpRequestSpec? = null
+        private set
+
     val count: Int get() = index
 
     @Suppress("UNCHECKED_CAST")
     override fun execute(request: HttpRequestSpec): HttpResponseSpec {
+        lastRequestSpec = request
         val parsedBody = request.body?.let { Json.parse(it) as? Map<String, Any?> }
         calls.add(RecordedCall(request.url, request.method, request.headers, parsedBody, request.timeoutMs))
 
