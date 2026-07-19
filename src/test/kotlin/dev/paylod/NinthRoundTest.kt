@@ -660,6 +660,27 @@ class NinthRoundTest {
 
     @Test
     @Tag("nv-diag-choke-point")
+    fun `an invalid-schema diagnostic REDACTS a credential the server put in the quoted field`() {
+        // The bounding test alone was not enough: it passes whether or not `field()` redacts, so
+        // the redaction half of the choke point needs its own assertion. A FOREIGN credential is
+        // used deliberately — a body echoing our OWN secret is refused earlier, before any
+        // diagnostic is built, so it could never reach this path to prove anything about it.
+        val foreign = "mp_live_someoneelseskeyaaaaaaaaaaaaaaaa"
+        val body = """{"type":"payment.success","created":1700000000,"data":{""" +
+            """"paymentId":"pay_1","status":"$foreign","amount":10}}"""
+        val sig = Webhooks.sign(body, WEBHOOK_SECRET, 1_700_000_000L)
+        val e = assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.parseAndVerifyAt(body, sig, WEBHOOK_SECRET, 300L, 1_700_000_000L)
+        }
+        assertFalse(
+            e.message!!.contains(foreign),
+            "the invalid-schema diagnostic quoted a credential verbatim: ${e.message}",
+        )
+        assertTrue(e.message!!.contains("[redacted]"), "the value was not masked, merely absent")
+    }
+
+    @Test
+    @Tag("nv-diag-choke-point")
     fun `the credential SHAPE list covers whsec_ and sk_`() {
         // `whsec_` was absent, which is the shape of the webhook signing secret — the credential
         // this very module handles, and the one most likely to be echoed by a misconfigured

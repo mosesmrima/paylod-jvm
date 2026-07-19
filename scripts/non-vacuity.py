@@ -343,7 +343,9 @@ CASES = [
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    // The SECRET-SEEDED redactor, not the shape-only scrubber. `DecodedError` is a
+                    // public data class too, and its `description` is server prose.
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }""",
                 """            @Suppress("UNCHECKED_CAST")
@@ -363,7 +365,7 @@ CASES = [
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }""")],
     ),
@@ -376,7 +378,9 @@ CASES = [
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    // The SECRET-SEEDED redactor, not the shape-only scrubber. `DecodedError` is a
+                    // public data class too, and its `description` is server prose.
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }""",
                 """            @Suppress("UNCHECKED_CAST")
@@ -396,7 +400,7 @@ CASES = [
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }""")],
     ),
@@ -609,7 +613,7 @@ CASES = [
         id="R6-baseurl-redact", tag="nv-baseurl-redact",
         what="a rejected baseUrl is echoed verbatim, userinfo and query string included",
         edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
-                '(got \\"${sanitizeUrl(parsed)}\\")', '(got \\"$baseUrl\\")')],
+                '(got ${redact.field(sanitizeUrl(parsed))})', '(got \\"$baseUrl\\")')],
     ),
     dict(
         id="R6-decode-zero", tag="nv-s6-decode-zero",
@@ -738,7 +742,7 @@ CASES = [
                 'if (CredentialShapes.looksLikeCredential(data["mpesaReceipt"] as? String)) {',
                 "if (false) {"),
                ("src/main/kotlin/dev/paylod/Webhooks.kt",
-                '                resultDesc = CredentialShapes.scrub(asString(data["resultDesc"])),',
+                '                resultDesc = redact.optionalText(asString(data["resultDesc"])),',
                 '                resultDesc = asString(data["resultDesc"]),')],
     ),
     dict(
@@ -782,7 +786,9 @@ CASES = [
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    // The SECRET-SEEDED redactor, not the shape-only scrubber. `DecodedError` is a
+                    // public data class too, and its `description` is server prose.
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }""",
                 """            @Suppress("UNCHECKED_CAST")
@@ -802,7 +808,7 @@ CASES = [
             } else {
                 DarajaCatalog.decodeError(
                     normalizeCode(code),
-                    CredentialShapes.scrub(asString(data["resultDesc"])),
+                    redact.optionalText(asString(data["resultDesc"])),
                 )
             }""")],
     ),
@@ -915,7 +921,12 @@ CASES = [
         id="R8-json-write-bounds", tag="nv-json-write-bounds",
         what="the outbound writer loses its depth, size and cycle bounds (ALL FOUR reverted)",
         edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
-                "        if (sb.length > MAX_WRITE_CHARS) {", "        if (false) {"),
+                "        if (sb.length > MAX_WRITE_CHARS) throw budgetExceeded()",
+                "        if (false) throw budgetExceeded()"),
+               ("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "        val remaining = MAX_WRITE_CHARS.toLong() - sb.length.toLong()\n"
+                "        if (s.length.toLong() + 2L > remaining) throw budgetExceeded()\n",
+                ""),
                ("src/main/kotlin/dev/paylod/internal/Json.kt",
                 "        if (depth > MAX_WRITE_DEPTH) {", "        if (false) {"),
                ("src/main/kotlin/dev/paylod/internal/Json.kt",
@@ -1038,15 +1049,6 @@ CASES = [
         edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
                 "                            'u' -> {",
                 "                            'u' -> if (true) { sb.append(\"\\\\u\"); } else {")],
-    ),
-    dict(
-        id="R9-write-budget", tag="nv-write-budget",
-        what="a scalar string or map key is copied into the builder in full before the size "
-             "budget is consulted, so the allocation the bound exists to prevent still happens",
-        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
-                "        val remaining = MAX_WRITE_CHARS.toLong() - sb.length.toLong()\n"
-                "        if (s.length.toLong() + 2L > remaining) throw budgetExceeded()\n",
-                "")],
     ),
     dict(
         id="R9-sim-outcome-handles", tag="nv-sim-outcome-handles",
