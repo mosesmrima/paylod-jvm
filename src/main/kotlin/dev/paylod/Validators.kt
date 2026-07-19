@@ -208,6 +208,23 @@ internal object PaymentValidators {
             bad("resultCode is neither a string nor a number")
         }
         if (resultCode is String && resultCode.isBlank()) bad("resultCode is a blank string")
+        // A CREDENTIAL ECHOED INTO `resultCode` IS NOT A RESULT CODE.
+        //
+        // `resultCode` was the one server-controlled field on this body with no credential check at
+        // all, and it is copied verbatim into `Payment.resultCode`, into `PaymentOutcome.code`, into
+        // `DecodedError.code`, and therefore into the GENERATED `toString()` of all three — the
+        // objects an integrator logs by default, with no logging mistake required. `mpesaReceipt`,
+        // `id`, `paymentId` and `checkoutRequestId` were each closed in an earlier round; this field
+        // was missed because it is thought of as a number rather than as server-controlled text.
+        //
+        // REFUSED rather than scrubbed, like the other identity-bearing fields: a masked result code
+        // is not a result code with a secret hidden inside it, it is a value the evidence functions
+        // would then classify — and `"[redacted]"` classifying as anything at all is precisely the
+        // sanitizer-output-as-evidence defect requirement 3.4 exists to forbid.
+        // Requirements 4.1 and 4.9.
+        if (redact.containsCredential(resultCode as? String)) {
+            bad("resultCode contains something shaped like an API credential, so it is not a result code")
+        }
 
         val resultDesc = p["resultDesc"]
         if (resultDesc != null && resultDesc !is String) bad("resultDesc is present but is not a string")

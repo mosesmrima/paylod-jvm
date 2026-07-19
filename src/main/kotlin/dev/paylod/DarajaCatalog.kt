@@ -1,6 +1,7 @@
 package dev.paylod
 
 import dev.paylod.internal.Json
+import dev.paylod.internal.Redactor
 import java.util.Collections
 
 /** WHO/what is at fault — lets a merchant tell their config apart from the customer or M-Pesa. */
@@ -488,6 +489,53 @@ object DarajaCatalog {
         resultCode: Any?,
         rawDesc: String? = null,
         family: DarajaFamily = DarajaFamily.STK_RESULT,
+    ): DecodedError = sanitized(decodeUnsanitized(resultCode, rawDesc, family))
+
+    /**
+     * THE redaction boundary for the offline decoder (conformance requirement 4.9).
+     *
+     * ── Why a PUBLIC OFFLINE surface needs its own redaction ──────────────────────────────
+     * Everything else that builds a public object from server data does it inside the client, and
+     * the client has a [Redactor] holding the configured API key and webhook secret. This function
+     * has no client. It is `@JvmStatic`, it never touches the network, and it is documented as the
+     * way to decode a code you already have — which means the values reaching it came from a
+     * webhook body, a database row, or a log line, all of which are server-controlled.
+     *
+     * Two of [DecodedError]'s fields are built from those inputs: `code` (from `resultCode`, echoed
+     * back deliberately so a caller debugging `" 0"` sees what they actually received) and `cause`
+     * (from `rawDesc` on the indeterminate path). Both land on a public data class whose
+     * `toString()` is GENERATED, so a server that echoed `Authorization: Bearer mp_live_…` into
+     * `resultDesc` had it printed by any caller who logged the decode. The offline surface has no
+     * client to redact for it, so it redacts for itself.
+     *
+     * [Redactor.SHAPES_ONLY] is the right instrument here and its limit is worth stating: it holds
+     * no configured secret, so it masks anything SHAPED like a credential (`mp_live_`, `mp_test_`,
+     * `whsec_`, `sk_`, `Bearer …`) but cannot match a secret by value. That is all a static function
+     * can do. [Paylod.decodeError] runs the CLIENT's redactor over the result as well, which does
+     * know the configured values — so a caller who has a client gets both, and a caller who does not
+     * still gets shape masking rather than nothing.
+     *
+     * The length bound comes along with it: `Redactor.field` bounds interpolated server values, so a
+     * megabyte-long `resultDesc` cannot become a megabyte-long log line.
+     */
+    private fun sanitized(d: DecodedError): DecodedError = d.copy(
+        code = Redactor.SHAPES_ONLY.text(d.code).take(MAX_DECODED_FIELD_CHARS),
+        cause = Redactor.SHAPES_ONLY.text(d.cause).take(MAX_DECODED_FIELD_CHARS),
+    )
+
+    /**
+     * The longest `code`/`cause` a decode will carry.
+     *
+     * These two fields are the only ones built from caller- or server-supplied text; the rest come
+     * from the catalog and are fixed-length by construction. Bounding them stops a hostile
+     * `resultDesc` from making every log line that renders a decode arbitrarily large.
+     */
+    private const val MAX_DECODED_FIELD_CHARS = 512
+
+    private fun decodeUnsanitized(
+        resultCode: Any?,
+        rawDesc: String?,
+        family: DarajaFamily,
     ): DecodedError {
         val code = normalizeCode(resultCode)
 

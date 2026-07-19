@@ -153,6 +153,74 @@ class TenthRoundTest {
         assertTrue(bad.message!!.contains("placeholder"), bad.message)
     }
 
+    // ── §4.1 / §4.9 — credentials reach no public surface, including the offline ones ───────
+
+    /**
+     * §4.1. `resultCode` was the last server-controlled field on a status body with no credential
+     * check, and it is copied into `Payment.resultCode`, `PaymentOutcome.code`, `DecodedError.code`
+     * and therefore into the GENERATED `toString()` of all three.
+     */
+    @Test
+    @Tag("nv-resultcode-credential")
+    fun `a credential echoed into resultCode is refused, not copied into a public object`() {
+        val key = "mp_test_abc123"
+        val (client, _) = testClient(
+            listOf(Step(status = 200, json = paymentJson(resultCode = "Bearer $key-and-more"))),
+            apiKey = key,
+        )
+        val e = assertThrows<PaylodApiException> { client.status("pay_123") }
+        assertTrue(e.indeterminate)
+        assertFalse(e.toString().contains(key), "the credential survived into the exception")
+
+        // And a `whsec_`-shaped value, which is the credential most likely to be echoed.
+        val (c2, _) = testClient(
+            listOf(Step(status = 200, json = paymentJson(resultCode = "whsec_abcdefghijkl"))),
+        )
+        assertThrows<PaylodApiException> { c2.status("pay_123") }
+    }
+
+    /**
+     * §4.9. The public OFFLINE decoder has no client to redact for it, so it must redact for
+     * itself. Both surfaces are checked: the static one (shape masking, all a static function can
+     * do) and the instance one (which additionally knows the configured values BY VALUE).
+     */
+    @Test
+    @Tag("nv-decode-error-redaction")
+    fun `the offline error decoder redacts on both the static and the instance surface`() {
+        val live = "Bearer mp_live_supersecretvalue"
+        // Static surface: shape masking, with no client in existence at all.
+        val staticDecoded = DarajaCatalog.decodeError("4242", "upstream said: $live")
+        assertFalse(staticDecoded.cause.contains("mp_live_supersecretvalue"), staticDecoded.cause)
+        assertFalse(staticDecoded.toString().contains("mp_live_supersecretvalue"))
+
+        // A credential echoed into the CODE itself, not just the description.
+        val codeDecoded = DarajaCatalog.decodeError("whsec_abcdefghijkl", null)
+        assertFalse(codeDecoded.toString().contains("whsec_abcdefghijkl"), codeDecoded.toString())
+
+        // Instance surface: a configured key that matches NO known credential shape. This is the
+        // case the static decoder structurally cannot catch, and it is why the instance method
+        // does not merely delegate.
+        val odd = "zzz-selfhosted-key-9182"
+        val (client, _) = testClient(listOf(Step(status = 200, json = ACK)), apiKey = odd)
+        val decoded = client.decodeError("4242", "the server echoed $odd back at us")
+        assertFalse(decoded.cause.contains(odd), "configured key leaked: ${decoded.cause}")
+        assertFalse(decoded.toString().contains(odd))
+
+        // CONTROL (§8.5): ordinary prose still survives, or "redacted" would just mean "destroyed".
+        val plain = DarajaCatalog.decodeError("4242", "Insufficient funds in the account")
+        assertTrue(plain.cause.contains("Insufficient funds"), plain.cause)
+    }
+
+    /** §4.2 — an interpolated server value is length-bounded, not merely redacted. */
+    @Test
+    @Tag("nv-decode-error-redaction")
+    fun `a hostile resultDesc cannot make a decode arbitrarily large`() {
+        val huge = "A".repeat(2_000_000)
+        val d = DarajaCatalog.decodeError("4242", huge)
+        assertTrue(d.cause.length <= 512, "cause was ${d.cause.length} chars — unbounded")
+        assertTrue(d.code.length <= 512)
+    }
+
     // ── §2.6 — malformed bytes are refused, never decoded with replacement semantics ────────
 
     /**

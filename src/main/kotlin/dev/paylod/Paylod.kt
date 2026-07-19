@@ -681,8 +681,26 @@ class Paylod internal constructor(
      * are identical to the ones the API puts in `event.data.decoded`.
      */
     @JvmOverloads
-    fun decodeError(resultCode: Any?, rawDesc: String? = null): DecodedError =
-        DarajaCatalog.decodeError(resultCode, rawDesc)
+    fun decodeError(resultCode: Any?, rawDesc: String? = null): DecodedError {
+        // ── THE CLIENT'S OWN REDACTOR, on an offline surface (requirements 4.1 and 4.9) ────────
+        //
+        // This used to be a bare delegation to the static decoder. The static decoder now masks
+        // credential SHAPES for itself, which is everything a function with no client can do — but
+        // it holds no secret, so it cannot recognise THIS client's configured API key or webhook
+        // secret by value. A key that does not match `mp_live_`/`mp_test_`/`whsec_`/`sk_`/`Bearer `
+        // (a self-hosted deployment's key, a rotated format, a test fixture) passed straight
+        // through into `DecodedError.code` and `.cause`, and from there into the generated
+        // `toString()` of a public data class.
+        //
+        // `this` HAS the configured values. An instance method that declined to use them while a
+        // static one did its best is the wrong way round, so the result goes through both: shapes
+        // from the decoder, exact configured secrets here.
+        val decoded = DarajaCatalog.decodeError(resultCode, rawDesc)
+        return decoded.copy(
+            code = redact.text(decoded.code),
+            cause = redact.text(decoded.cause),
+        )
+    }
 
     /**
      * Verify a raw webhook body + signature header, returning `true`/`false`. HMAC-SHA256 over
