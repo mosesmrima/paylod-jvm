@@ -555,7 +555,7 @@ object DarajaCatalog {
     private fun loadEntries(): List<CatalogEntry> {
         val stream = DarajaCatalog::class.java.getResourceAsStream("/dev/paylod/daraja-error-codes.json")
             ?: throw IllegalStateException("daraja-error-codes.json is missing from the classpath")
-        val text = stream.use { it.readBytes().toString(Charsets.UTF_8) }
+        val text = stream.use { dev.paylod.internal.Utf8.decode(it.readBytes(), "the bundled Daraja catalog resource") }
         val root = Json.parseObject(text)
         val codes = root["codes"] as? List<Any?>
             ?: throw IllegalStateException("daraja-error-codes.json has no `codes` array")

@@ -1,5 +1,6 @@
 package dev.paylod
 
+import dev.paylod.internal.Utf8
 import dev.paylod.internal.Redactor
 import java.net.URI
 import java.net.http.HttpClient
@@ -374,7 +375,20 @@ internal class Transport(
         }
 
         override fun onComplete() {
-            result.complete(buffer.toString(java.nio.charset.StandardCharsets.UTF_8))
+            // STRICT UTF-8, not `ByteArrayOutputStream.toString(charset)` — which decodes with
+            // REPLACE semantics and would silently rewrite malformed bytes to `U+FFFD`. A response
+            // body the SDK cannot actually read must be refused, not laundered into an ordinary
+            // string that then satisfies field checks written on the assumption it was readable.
+            // See [Utf8] and conformance requirement 2.6.
+            try {
+                result.complete(Utf8.decode(buffer.toByteArray(), "paylod's response body"))
+            } catch (e: Utf8.InvalidUtf8Exception) {
+                // INDETERMINATE, not a plain error: this is the response to a request that may have
+                // raised a charge, and we now cannot read what it said about it.
+                result.completeExceptionally(
+                    PaylodIndeterminateException(redact.text(e.message ?: "response body is not valid UTF-8")),
+                )
+            }
         }
 
         /** Cancel the exchange and fail with the money-state classification an oversized body carries. */

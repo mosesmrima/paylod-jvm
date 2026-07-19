@@ -3,6 +3,7 @@ package dev.paylod
 import dev.paylod.internal.CredentialShapes
 import dev.paylod.internal.Json
 import dev.paylod.internal.Redactor
+import dev.paylod.internal.Utf8
 import java.nio.charset.StandardCharsets
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -416,7 +417,21 @@ object Webhooks {
             )
         }
 
-        val text = String(payload, StandardCharsets.UTF_8)
+        // STRICT UTF-8, not `String(payload, UTF_8)` — which decodes with REPLACE semantics and
+        // rewrites malformed bytes to `U+FFFD`. Ten raw `FF FE` pairs inside a receipt field are
+        // not text, but under replacement decoding they become a ten-character nonblank string;
+        // and every distinct invalid sequence collapses into the SAME string, so values that are
+        // not equal compare equal on the id-binding and correlation checks. A signature proves who
+        // sent the bytes, not that the bytes are readable. See [Utf8], requirement 2.6.
+        val text = try {
+            Utf8.decode(payload, "the webhook body")
+        } catch (e: Utf8.InvalidUtf8Exception) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INVALID_PAYLOAD,
+                "Webhook body is signed correctly but is not valid UTF-8, so it cannot be read. It " +
+                    "is refused rather than decoded with replacement characters.",
+            )
+        }
         val parsedBody: Any? = try {
             Json.parse(text)
         } catch (e: Exception) {

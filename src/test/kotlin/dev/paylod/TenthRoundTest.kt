@@ -153,6 +153,61 @@ class TenthRoundTest {
         assertTrue(bad.message!!.contains("placeholder"), bad.message)
     }
 
+    // ── §2.6 — malformed bytes are refused, never decoded with replacement semantics ────────
+
+    /**
+     * §2.6. The demonstration first: replacement decoding turns unreadable bytes into an ordinary
+     * nonblank string, and collapses distinct inputs into an identical one.
+     */
+    @Test
+    @Tag("nv-strict-utf8")
+    fun `replacement decoding is exactly the laundering this refuses`() {
+        val a = byteArrayOf(-1, -2, -1, -2, -1, -2, -1, -2, -1, -2)      // FF FE x5
+        val b = byteArrayOf(-64, -128, -64, -128, -64, -128, -64, -128, -64, -128) // C0 80 x5
+
+        // What the JDK's lossy constructor does with them, which is why it may not be used here.
+        val lossyA = String(a, Charsets.UTF_8)
+        val lossyB = String(b, Charsets.UTF_8)
+        assertTrue(lossyA.isNotBlank(), "unreadable bytes became a blank string, not the hazard")
+        assertEquals(lossyA, lossyB, "distinct invalid sequences did NOT collapse — fixture is stale")
+
+        // What this SDK does with them.
+        for (bytes in listOf(a, b)) {
+            assertThrows<dev.paylod.internal.Utf8.InvalidUtf8Exception> {
+                dev.paylod.internal.Utf8.decode(bytes, "test input")
+            }
+        }
+        // Valid UTF-8, including multi-byte, still decodes.
+        assertEquals("héllo ✓", dev.paylod.internal.Utf8.decode("héllo ✓".toByteArray(Charsets.UTF_8), "x"))
+    }
+
+    /** §2.6 — on the real webhook path, end to end, with a genuinely valid signature. */
+    @Test
+    @Tag("nv-strict-utf8")
+    fun `a correctly signed webhook body that is not valid UTF-8 is refused`() {
+        val secret = "whsec_test_secret_value"
+        // A body that is well-formed JSON in ASCII except for raw invalid bytes inside the receipt.
+        val prefix = """{"id":"evt_1","type":"payment.success","data":{"mpesaReceipt":""""
+        val suffix = """"}}"""
+        val body = prefix.toByteArray(Charsets.UTF_8) +
+            byteArrayOf(-1, -2, -1, -2, -1, -2, -1, -2, -1, -2) +
+            suffix.toByteArray(Charsets.UTF_8)
+
+        // Signed for real, so the refusal cannot be mistaken for a signature failure.
+        val sig = Webhooks.sign(body, secret)
+        val e = assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.verifySignature(body, sig, secret)
+        }
+        assertEquals(SignatureFailureReason.INVALID_PAYLOAD, e.reason)
+        assertTrue(e.message!!.contains("UTF-8"), e.message)
+
+        // CONTROL (§8.5): the identical body with a VALID receipt in place of the bad bytes must be
+        // accepted, or this test would pass for the wrong reason.
+        val good = (prefix + "SFF6XYZ123" + suffix).toByteArray(Charsets.UTF_8)
+        val map = Webhooks.verifySignature(good, Webhooks.sign(good, secret), secret)
+        assertEquals("evt_1", map["id"])
+    }
+
     // ── §3.7 — a non-retryable outcome never invites another attempt ────────────────────────
 
     /**
