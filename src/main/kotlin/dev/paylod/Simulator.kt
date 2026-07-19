@@ -203,6 +203,27 @@ class Simulator internal constructor(
         // `Payment` from the map a second time, with the lenient `PaymentStatus.fromWire` — so the
         // strict check and the record the outcome was actually rendered from were two different
         // readings of the same bytes, and money used the lenient one. There is now one reading.
+        // ── EVERY failure below carries the handles ───────────────────────────────────────────
+        // The dispatch AND the post-dispatch field checks are inside this block on purpose. A
+        // validator refusal, a malformed 2xx, or a missing `webhookQueued` all happen AFTER the
+        // settle may have taken effect, so each one is a state the caller has to reconcile — and
+        // each one used to escape with neither the deterministic idempotency key nor the payment
+        // id on it. "Retry with the same key" is not something a caller can do when the key was
+        // never handed to them.
+        return try {
+            settleOutcome(paymentId, body, idempotencyKey)
+        } catch (e: PaylodException) {
+            if (e.idempotencyKey == null) e.idempotencyKey = idempotencyKey
+            if (e.paymentId == null) e.paymentId = paymentId
+            throw e
+        }
+    }
+
+    private fun settleOutcome(
+        paymentId: String,
+        body: Map<String, Any?>,
+        idempotencyKey: String,
+    ): SimulatedOutcome {
         var validated: Payment? = null
         var settleStatus = 0
         val ack = requester.request("POST", "/simulate/outcome", body, idempotencyKey) { map, status ->
@@ -235,7 +256,17 @@ class Simulator internal constructor(
         params: SimulateCollectParams = SimulateCollectParams.DEFAULT,
     ): SimulatedOutcome {
         val created = collect(params)
-        return outcome(created.paymentId, outcome)
+        // The collect ALREADY SUCCEEDED — a real sandbox payment exists. If settling it now fails,
+        // an exception carrying only the settle's own handles would strand the payment `collect`
+        // just created, so the created payment's id and key are attached when nothing nearer has
+        // claimed those slots.
+        return try {
+            outcome(created.paymentId, outcome)
+        } catch (e: PaylodException) {
+            if (e.paymentId == null) e.paymentId = created.paymentId
+            if (e.idempotencyKey == null) e.idempotencyKey = created.idempotencyKey
+            throw e
+        }
     }
 
     /**

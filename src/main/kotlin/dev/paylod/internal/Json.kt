@@ -75,14 +75,14 @@ internal object Json {
         return sb.toString()
     }
 
+    private fun budgetExceeded() = JsonWriteException(
+        "The request body exceeded the ${MAX_WRITE_CHARS}-character limit this SDK will " +
+            "serialise. This is almost always an oversized `metadata` value; send an " +
+            "identifier your own system can expand instead of the whole object.",
+    )
+
     private fun checkBudget(sb: StringBuilder) {
-        if (sb.length > MAX_WRITE_CHARS) {
-            throw JsonWriteException(
-                "The request body exceeded the ${MAX_WRITE_CHARS}-character limit this SDK will " +
-                    "serialise. This is almost always an oversized `metadata` value; send an " +
-                    "identifier your own system can expand instead of the whole object.",
-            )
-        }
+        if (sb.length > MAX_WRITE_CHARS) throw budgetExceeded()
     }
 
     private fun writeValue(sb: StringBuilder, value: Any?, depth: Int, seen: MutableSet<Any>) {
@@ -156,7 +156,25 @@ internal object Json {
             "parent/child pair, a memoised object).",
     )
 
+    /**
+     * Emit a JSON string, BUDGET-AWARE on every append.
+     *
+     * ── Why the surrounding checks were not enough ────────────────────────────────────────
+     * [checkBudget] ran before [writeValue] was entered and after it returned. For a scalar string
+     * that is the wrong side of the work: the ENTIRE value — a caller's oversized `metadata` field,
+     * or a map KEY, both of which can be arbitrarily long — was copied into the `StringBuilder`
+     * character by character, and only then was the budget consulted and the whole thing thrown
+     * away. The allocation the bound exists to prevent had already happened, so a large enough
+     * value was still an `OutOfMemoryError` rather than the typed refusal it is supposed to be.
+     *
+     * The pre-check is on the RAW length and is exact enough to be safe: escaping only ever makes a
+     * string longer, so a value that does not fit before escaping cannot fit after it. Arithmetic
+     * is done in `Long` so a near-`Int.MAX_VALUE` length cannot overflow the comparison into
+     * looking small — which would turn the bound into its own bypass.
+     */
     private fun writeString(sb: StringBuilder, s: String) {
+        val remaining = MAX_WRITE_CHARS.toLong() - sb.length.toLong()
+        if (s.length.toLong() + 2L > remaining) throw budgetExceeded()
         sb.append('"')
         for (c in s) {
             when (c) {
@@ -175,6 +193,10 @@ internal object Json {
                         sb.append(c)
                     }
             }
+            // Escaping EXPANDS — a control character becomes six characters — so a string that fit
+            // before escaping can still cross the budget while being written. Checked as we go, so
+            // the refusal happens at the boundary rather than after the overshoot.
+            checkBudget(sb)
         }
         sb.append('"')
     }

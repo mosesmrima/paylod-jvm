@@ -669,4 +669,68 @@ class NinthRoundTest {
         assertFalse(shapes.text("secret sk_abcdefghijklmnop here").contains("sk_abcdefghijklmnop"))
         assertFalse(shapes.text("secret mp_live_abcdefghijklmnop").contains("mp_live_abcdefghijklmnop"))
     }
+
+    @Test
+    @Tag("nv-write-budget")
+    fun `an oversized metadata string is refused BEFORE it is copied, not after`() {
+        // The bound used to be checked before `writeValue` was entered and after it returned, which
+        // is the wrong side of the work for a scalar: the whole value was copied into the builder
+        // and only then measured. The refusal has to happen without the allocation, so the probe is
+        // a string far larger than the budget rather than budget+1 — the old implementation
+        // "passed" at budget+1 while still copying everything.
+        val huge = "x".repeat(Json.MAX_WRITE_CHARS * 8)
+        assertThrows<Json.JsonWriteException> { Json.write(mapOf("metadata" to huge)) }
+        // A map KEY is exactly as caller-controlled and takes the same route.
+        assertThrows<Json.JsonWriteException> { Json.write(mapOf(huge to "v")) }
+        // CONTROL: an ordinary body still serialises.
+        assertEquals("""{"a":"b"}""", Json.write(mapOf("a" to "b")))
+    }
+
+    @Test
+    @Tag("nv-sim-outcome-handles")
+    fun `simulate outcome attaches its deterministic key and payment id to every failure`() {
+        // Each of these fails AFTER the settle may have taken effect, so each is a state the caller
+        // must reconcile — and each one used to escape with no handle at all.
+        val cases = mapOf(
+            "malformed 2xx" to Step(status = 200, raw = "not json"),
+            "wrong-record body" to Step(status = 200, json = paymentJson(id = "pay_OTHER", status = "success")),
+            "missing webhookQueued" to Step(
+                status = 200,
+                json = paymentJson(id = "pay_1", status = "success", mpesaReceipt = "SFF6XYZ123", resultCode = "0"),
+            ),
+        )
+        for ((label, step) in cases) {
+            val (paylod, _) = testClient(listOf(step), apiKey = API_KEY)
+            val e = assertThrows<PaylodException>(label) {
+                paylod.simulate.outcome("pay_1", SimOutcomeId.APPROVE)
+            }
+            assertEquals("sim-outcome-pay_1-approve", e.idempotencyKey, "[$label] lost the settle key")
+            assertEquals("pay_1", e.paymentId, "[$label] lost the payment id")
+        }
+    }
+
+    @Test
+    @Tag("nv-sim-outcome-handles")
+    fun `simulate pay propagates the created payment when the settle fails`() {
+        val (paylod, _) = testClient(
+            listOf(
+                Step(
+                    status = 202,
+                    json = mapOf(
+                        "paymentId" to "pay_sim_9", "status" to "pending", "checkoutRequestId" to "ws_9",
+                        "outcomes" to listOf(mapOf("id" to "success", "label" to "Paid", "status" to "success")),
+                    ),
+                ),
+                Step(status = 200, raw = "not json"),
+            ),
+            apiKey = API_KEY,
+        )
+        val e = assertThrows<PaylodException> {
+            paylod.simulate.pay(
+                SimOutcomeId.APPROVE,
+                SimulateCollectParams.builder().phone("0712345678").amount(10).idempotencyKey("sim-pay-1").build(),
+            )
+        }
+        assertEquals("pay_sim_9", e.paymentId, "the payment the collect already created was stranded")
+    }
 }

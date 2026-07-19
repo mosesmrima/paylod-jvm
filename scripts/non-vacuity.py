@@ -941,9 +941,9 @@ CASES = [
                 '        publicHeaders["accept-encoding"] = "gzip"')],
     ),
     dict(
-        id="R8-no-credential-in-cause", tag="nv-no-credential-in-cause",
-        what="the post-acknowledgement wrapper stops redacting and attaches the foreign throwable "
-             "as a cause, so the credential rides out on the exception",
+        id="R8-no-credential-in-message", tag="nv-no-credential-in-cause",
+        what="the post-acknowledgement wrapper stops redacting its MESSAGE, so a credential the "
+             "foreign throwable mentioned rides out in the message text",
         edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
                 """            val wrapped = PaylodConnectionException(
                 redact.text(
@@ -961,7 +961,106 @@ CASES = [
                     "with THIS idempotencyKey) before starting any new attempt — minting a fresh " +
                     "key would risk a second charge.",
             )""")],
+    ),    # ── ROUND 9 ───────────────────────────────────────────────────────────────────────────────
+    dict(
+        # THE MUTATION THAT WAS MISSING. Round 9 found that the case above removes only message
+        # redaction and never supplies the foreign throwable as a cause — so a CAUGHT verdict
+        # established nothing about the CAUSE CHAIN, which is a separate route: `printStackTrace()`
+        # walks it without touching a single field. This one keeps the message redacted and
+        # reattaches the cause, so only a cause-chain assertion can catch it.
+        id="R9-credential-in-cause-chain", tag="nv-adversarial-sweep",
+        what="the post-acknowledgement wrapper keeps redacting its message but REATTACHES the "
+             "foreign throwable as a cause, so the credential rides out on the cause chain",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "            val wrapped = PaylodConnectionException(\n                redact.text(",
+                "            val wrapped = PaylodConnectionException(\n                cause = e,\n                message = redact.text(")],
     ),
+    dict(
+        id="R9-wh-secret-not-threaded", tag="nv-wh-refuse-own-secret",
+        what="the typed webhook path stops refusing a signed body that echoes the configured "
+             "signing secret, so the secret reaches a public field or a diagnostic",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "        if (redact.containsCredentialDeep(root)) {",
+                "        if (false) {")],
+    ),
+    dict(
+        id="R9-diag-choke-point", tag="nv-diag-choke-point",
+        what="an invalid-schema diagnostic interpolates the raw server value again, unredacted "
+             "and unbounded",
+        edits=[("src/main/kotlin/dev/paylod/internal/Redaction.kt",
+                "    fun field(value: Any?): String {\n        if (value == null) return \"absent\"\n        val redacted = text(value.toString())",
+                "    fun field(value: Any?): String {\n        if (value == null) return \"absent\"\n        val redacted = value.toString()")],
+    ),
+    dict(
+        id="R9-redact-depth-pin", tag="nv-redact-depth-pin",
+        what="the redaction traversal bound drifts back below the parser's, so structures exist "
+             "that this SDK parses but cannot scan",
+        edits=[("src/main/kotlin/dev/paylod/internal/Redaction.kt",
+                "        const val MAX_DEPTH = Json.MAX_DEPTH",
+                "        const val MAX_DEPTH = 8")],
+    ),
+    dict(
+        id="R9-short-secret", tag="nv-short-secret-redacted",
+        what="configured secrets shorter than eight characters are silently dropped from the "
+             "redaction needles again",
+        edits=[("src/main/kotlin/dev/paylod/internal/Redaction.kt",
+                "        .filter { it.isNotEmpty() }",
+                "        .filter { it.length >= 8 }")],
+    ),
+    dict(
+        id="R9-sig-header-bound", tag="nv-sig-header-bound",
+        what="the unauthenticated signature header is split with no length bound, so an anonymous "
+             "sender commands memory and CPU proportional to its length",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "        if (header.length > MAX_SIGNATURE_HEADER_CHARS) return null",
+                "        if (false) return null")],
+    ),
+    dict(
+        id="R9-created-integral", tag="nv-created-integral",
+        what="signed event `created` accepts a floating-point spelling again, so 1e400 decodes to "
+             "infinity and is published as Long.MAX_VALUE",
+        edits=[("src/main/kotlin/dev/paylod/Webhooks.kt",
+                "        if (created !is Long && created !is Int && created !is Short && created !is Byte) {",
+                "        if (created !is Number || created.toDouble() != Math.floor(created.toDouble())) {")],
+    ),
+    dict(
+        id="R9-baseurl-redaction", tag="nv-adversarial-sweep",
+        what="the baseUrl refusal prints the rejected URL verbatim again, so a credential in the "
+             "PATH lands in the message a misconfigured integration logs at startup",
+        edits=[("src/main/kotlin/dev/paylod/Paylod.kt",
+                "(got ${redact.field(sanitizeUrl(parsed))})",
+                "(got \"${sanitizeUrl(parsed)}\")")],
+    ),
+    dict(
+        id="R9-json-escape-decoding", tag="nv-json-escaped-key",
+        what="the parser stops decoding \\uXXXX escapes in member names, so an escaped spelling "
+             "no longer denotes the key it names",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "                            'u' -> {",
+                "                            'u' -> if (true) { sb.append(\"\\\\u\"); } else {")],
+    ),
+    dict(
+        id="R9-write-budget", tag="nv-write-budget",
+        what="a scalar string or map key is copied into the builder in full before the size "
+             "budget is consulted, so the allocation the bound exists to prevent still happens",
+        edits=[("src/main/kotlin/dev/paylod/internal/Json.kt",
+                "        val remaining = MAX_WRITE_CHARS.toLong() - sb.length.toLong()\n"
+                "        if (s.length.toLong() + 2L > remaining) throw budgetExceeded()\n",
+                "")],
+    ),
+    dict(
+        id="R9-sim-outcome-handles", tag="nv-sim-outcome-handles",
+        what="simulate.outcome() stops attaching the deterministic settle key and payment id, so "
+             "a post-dispatch refusal strands a payment the caller cannot reconcile",
+        edits=[("src/main/kotlin/dev/paylod/Simulator.kt",
+                "        } catch (e: PaylodException) {\n"
+                "            if (e.idempotencyKey == null) e.idempotencyKey = idempotencyKey\n"
+                "            if (e.paymentId == null) e.paymentId = paymentId\n"
+                "            throw e\n"
+                "        }",
+                "        } catch (e: PaylodException) {\n            throw e\n        }")],
+    ),
+
 ]
 
 COUNT_RE = re.compile(r"NVCOUNT tests=(\d+) failed=(\d+) skipped=(\d+)")

@@ -401,17 +401,33 @@ class EighthRoundTest {
         // spelling walked straight past. This SDK parses the JSON itself and looks the key up on
         // the DECODED map, so an escaped spelling cannot mean one thing to a scanner and another to
         // the reader — there is no scanner. Asserted rather than assumed.
-        val escaped = Json.parseObject("""{"resultCode":-0}""")
-        assertTrue(escaped.containsKey("resultCode"), "an escaped member name did not decode")
+        // THE FIXTURE MUST ACTUALLY BE ESCAPED. This test previously spelled every key as the
+        // literal `resultCode`, which means it passed whether or not escaped-key decoding existed
+        // at all — a test guarding PHP's Critical that could not fail. `r` is `r`, so the
+        // name below decodes to `resultCode` while sharing not one byte of its spelling.
+        val escaped = Json.parseObject("""{"\u0072esultCode":-0}""")
+        assertTrue(
+            escaped.containsKey("resultCode"),
+            "an escaped member name did not decode to the key it denotes",
+        )
+        // And nothing is left under the RAW escaped spelling.
+        // A RAW string: Kotlin processes \u escapes in an ordinary literal, so the non-raw
+        // spelling here would just be "resultCode" again and the assertion would be vacuous.
+        assertFalse(escaped.containsKey("""\u0072esultCode"""), "the raw escape survived as a key")
 
-        // And a repeated name is refused outright rather than resolved last-wins, so
-        // `{"resultCode":1032,"resultCode":-0}` cannot mean different things to different readers.
+        // A repeated name is refused outright rather than resolved last-wins, so it cannot mean
+        // different things to different readers.
         assertThrows<Json.JsonParseException> {
             Json.parseObject("""{"resultCode":1032,"resultCode":-0}""")
         }
-        // Including when the duplicate is spelled with an escape.
+        // INCLUDING the mixed literal/escaped pair — the shape that defeats a byte-level
+        // duplicate check, because the two keys are equal only AFTER decoding.
         assertThrows<Json.JsonParseException> {
-            Json.parseObject("""{"resultCode":1032,"resultCode":-0}""")
+            Json.parseObject("""{"resultCode":1032,"\u0072esultCode":-0}""")
+        }
+        // And the other way round, so the check cannot depend on which spelling came first.
+        assertThrows<Json.JsonParseException> {
+            Json.parseObject("""{"\u0072esultCode":1032,"resultCode":-0}""")
         }
     }
 
@@ -421,7 +437,7 @@ class EighthRoundTest {
         // The whole point of the PHP bypass: the escaped key decoded to integer zero and was
         // accepted as PAID. Here it reaches the ordinary reader, which keeps `-0` as a negative
         // zero, which is not the canonical success code on any path.
-        val parsed = Json.parseObject("""{"resultCode":-0}""")
+        val parsed = Json.parseObject("""{"\u0072esultCode":-0}""")
         assertFalse(DarajaCatalog.isCanonicalSuccessCode(parsed["resultCode"]))
         assertNotEquals(StkOutcome.SUCCESS, DarajaCatalog.classifyStkResult(parsed["resultCode"]))
     }
