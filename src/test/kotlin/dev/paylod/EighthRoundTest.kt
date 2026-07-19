@@ -184,24 +184,68 @@ class EighthRoundTest {
 
     @Test
     @Tag("nv-wh-rawmap-scrub")
-    fun `verifySignature scrubs credentials and the signing secret out of the raw map`() {
+    fun `verifySignature REFUSES our own secret and scrubs credentials we do not hold`() {
         // `verifySignature` returns the WHOLE parsed body — unknown fields, nested objects, array
         // elements and object NAMES included, none of which any allowlist ever sees.
+        //
+        // The two cases are handled DIFFERENTLY on purpose, and the difference is the point:
+        //
+        //   • OUR OWN CONFIGURED SECRET, echoed back, is REFUSED (conformance 4.6). Nobody can
+        //     echo it without holding it, so this is not a formatting problem to mask — the
+        //     emitter is misconfigured or the sender is compromised. `parseAndVerify` has refused
+        //     it since round 9; this surface used to sanitise and DELIVER, so a caller using the
+        //     manual helper silently got the weaker posture.
+        //
+        //   • A credential merely SHAPED like one, which this client does not hold, is scrubbed
+        //     and delivered. Refusing an arbitrary body over a substring resemblance would reject
+        //     payloads that are perfectly legitimate.
+
+        // 1. Our own secret, nested three levels down: REFUSED, not returned.
+        val poisoned = Json.write(
+            linkedMapOf(
+                "type" to "payment.success",
+                "nested" to linkedMapOf("deeper" to listOf(linkedMapOf("echo" to "held: $secret"))),
+            ),
+        ).toByteArray()
+        val refusal = assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.verifySignature(poisoned, Webhooks.sign(poisoned, secret), secret)
+        }
+        assertTrue(refusal.message!!.contains("signing secret"), refusal.message)
+
+        // 2. A credential shape we do NOT hold: scrubbed, and the rest of the body survives.
         val body = Json.write(
             linkedMapOf(
                 "type" to "payment.success",
                 "echoedAuth" to "Bearer mp_live_abcdefghijklmnop",
-                "echoedSecret" to "the secret is $secret ok",
                 "nested" to linkedMapOf("deep" to listOf("mp_live_abcdefghijklmnop")),
             ),
         ).toByteArray()
         val map = Webhooks.verifySignature(body, Webhooks.sign(body, secret), secret)
-
         val rendered = map.toString()
         assertFalse(rendered.contains("mp_live_abcdefghijklmnop"), "a bearer token survived: $rendered")
         assertFalse(rendered.contains(secret), "the signing secret survived: $rendered")
         // Still usable: the fields that carried nothing sensitive are untouched.
         assertEquals("payment.success", map["type"])
+
+        // 3. The traversal is DEPTH-PINNED and FAILS CLOSED (4.4/4.5). The old private walker had
+        // no cap at all, so a body deeper than the redactor could follow was a StackOverflowError
+        // inside a verification path. Build one deeper than the redaction bound and require a
+        // refusal or a placeholder — never the raw subtree.
+        //
+        // Built as RAW TEXT, not through `Json.write` — the writer has its own, lower bound (32)
+        // and would refuse to build the fixture, which would prove the writer works rather than
+        // the reader. What is under test is a body arriving from the network.
+        val n = dev.paylod.internal.Redactor.MAX_DEPTH + 5
+        val deepBody = ("""{"type":"payment.success","d":""" + "[".repeat(n) + "]".repeat(n) + "}")
+            .toByteArray()
+        // The PARSER refuses it before the redaction walker is ever entered. That is the whole
+        // force of pinning the redaction bound to the parse bound (4.4): the walker's own cap is
+        // unreachable through the parser, and it is the assertion that keeps it unreachable rather
+        // than an assumption that it already is.
+        val tooDeep = assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.verifySignature(deepBody, Webhooks.sign(deepBody, secret), secret)
+        }
+        assertEquals(SignatureFailureReason.INVALID_PAYLOAD, tooDeep.reason)
     }
 
     // ══ MEDIUM 2 — simulator parity ══════════════════════════════════════════════════════════

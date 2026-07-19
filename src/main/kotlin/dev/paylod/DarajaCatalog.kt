@@ -152,7 +152,13 @@ object DarajaCatalog {
             // canonical code out of a token Daraja never sent; the zero carve-out closed only the
             // success half of it. See [normalizeResultCode] in `Validators.kt`.
             is Double -> resultCode.toString()
-            else -> resultCode.toString().trim()
+            // NOT TRIMMED. This helper used to `.trim()`, which independently turned `" 0"` into
+            // `"0"` and `"1032\n"` into `"1032"` — canonical codes, manufactured one layer BELOW
+            // every check written to reject them. Its callers happened to guard it, so nothing was
+            // reachable through them; but requirement 1.1 says a guard at one layer is not a guard
+            // at the layer below it, and "currently unreachable" is a property of today's call
+            // graph rather than of this function. A padded code is not a code, here as everywhere.
+            else -> resultCode.toString()
         }
 
     /**

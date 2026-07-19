@@ -153,6 +153,80 @@ class TenthRoundTest {
         assertTrue(bad.message!!.contains("placeholder"), bad.message)
     }
 
+    // ── §1.1 / §6.4 / §6.5 — form and bounds at EVERY layer, not just the top one ───────────
+
+    /**
+     * §1.1. The lowest normalization helper must not launder a non-canonical spelling into a
+     * canonical one, even when today's callers happen to guard it.
+     *
+     * `normalizeCode` used to `.trim()`. Its callers checked the lexeme first, so nothing was
+     * reachable through them — but "currently unreachable" is a property of today's call graph,
+     * and the requirement is explicit that a guard at one layer is not a guard at the layer below.
+     */
+    @Test
+    @Tag("nv-lower-layer-form")
+    fun `a padded result code is never laundered into a canonical one, at any layer`() {
+        // The classifier: never SUCCESS, never a terminal FAILED.
+        for (padded in listOf(" 0", "0 ", "0\n", "0\t", " 1032", "1032\n", "\t1032")) {
+            assertEquals(
+                StkOutcome.PENDING, DarajaCatalog.classifyStkResult(padded),
+                "$padded classified as something other than ambiguous",
+            )
+            assertFalse(DarajaCatalog.isCanonicalSuccessCode(padded), "$padded read as success")
+            assertFalse(DarajaCatalog.isCanonicalCodeLexeme(padded), "$padded read as canonical")
+        }
+        // The decoder: never selects a catalog entry, so never a retryable cancellation.
+        val cancelled = DarajaCatalog.decodeError("1032")
+        assertTrue(cancelled.retryable, "control: a bare 1032 IS the retryable cancellation")
+        for (padded in listOf(" 1032", "1032\n", "1032 ")) {
+            val d = DarajaCatalog.decodeError(padded)
+            assertFalse(d.retryable, "$padded selected the retryable cancellation entry")
+            assertEquals("Payment state unknown", d.title)
+        }
+        // §1.4: a dotted code needs at least two dots. `500.0` is a decimal, not a business code.
+        assertFalse(DarajaCatalog.isCanonicalCodeLexeme("500.0"))
+        assertTrue(DarajaCatalog.isCanonicalCodeLexeme("500.001.1001"))
+    }
+
+    /** §6.4 / §6.5 — every public webhook entry point bounds before it computes or splits. */
+    @Test
+    @Tag("nv-webhook-bounds")
+    fun `webhook bodies and signature headers are bounded before any work is done on them`() {
+        val secret = "whsec_test_secret_value"
+        val huge = ByteArray(Webhooks.MAX_PAYLOAD_BYTES + 1) { 'a'.code.toByte() }
+
+        // The public SIGNING helper computes an HMAC, so it must bound first (6.4). This was the
+        // one public function here without the check.
+        assertThrows<PaylodSignatureVerificationException> { Webhooks.sign(huge, secret) }
+        // Every verification entry point, byte and string overloads alike.
+        assertThrows<PaylodSignatureVerificationException> { Webhooks.verifySignature(huge, "t=1,v1=x", secret) }
+        assertThrows<PaylodSignatureVerificationException> { Webhooks.parseAndVerify(huge, "t=1,v1=x", secret) }
+        // `verify` is the boolean variant by contract, so the refusal arrives as `false` rather
+        // than as a throw. What matters for 6.4 is that it is refused on LENGTH, before the HMAC.
+        assertFalse(Webhooks.verify(huge, "t=1,v1=x", secret))
+
+        // 6.5 — the header is length-bounded BEFORE it is split.
+        val body = """{"type":"payment.success"}""".toByteArray()
+        val vastHeader = "t=1," + "x=y,".repeat(Webhooks.MAX_SIGNATURE_HEADER_CHARS)
+        assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.verifySignature(body, vastHeader, secret)
+        }
+
+        // §1.1 applied to the header: a whitespace-padded timestamp is not a strict decimal token.
+        val sig = Webhooks.sign(body, secret)
+        val t = sig.substringAfter("t=").substringBefore(",")
+        val v1 = sig.substringAfter("v1=")
+        assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.verifySignature(body, "t= $t ,v1=$v1", secret)
+        }
+        assertThrows<PaylodSignatureVerificationException> {
+            Webhooks.verifySignature(body, "t=$t,v1= $v1", secret)
+        }
+        // CONTROL (§8.5): the unpadded header is accepted, so the refusals above are about the
+        // padding and not about the fixture being broken.
+        Webhooks.verifySignature(body, sig, secret)
+    }
+
     // ── §2.1 — the numeric lexeme of a money-critical field survives parsing ────────────────
 
     /**

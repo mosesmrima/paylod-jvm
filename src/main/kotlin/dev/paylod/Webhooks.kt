@@ -96,6 +96,12 @@ object Webhooks {
         secret: String,
         timestampSec: Long = System.currentTimeMillis() / 1000,
     ): String {
+        // BOUNDED BEFORE THE HMAC, like every verification entry point (requirement 6.4). This is
+        // documented as a fixture helper, but it is `@JvmStatic` and public, so "callers only use
+        // it in tests" is a convention rather than a property. `Mac.update` over an unbounded array
+        // is unbounded work, and a helper that is the ONE public function here without the body
+        // bound is the one a future refactor will reach for on a request path.
+        assertWithinLimit(payload.size)
         val v1 = hmacHex(secret, timestampSec.toString(), payload)
         return "t=$timestampSec,v1=$v1"
     }
@@ -150,7 +156,13 @@ object Webhooks {
             val idx = s.indexOf("=")
             if (idx <= 0) continue
             val key = s.substring(0, idx).trim()
-            val value = s.substring(idx + 1).trim()
+            // The VALUE is taken exactly as it arrived. Trimming it here meant `t= 1700000000 `
+            // and a whitespace-padded `v1` both passed checks written to be strict about their
+            // form — the same normalize-before-validate shape as `" 0"` reaching a result-code
+            // check as `"0"`, applied to the anti-replay timestamp. Whitespace around the KEY is
+            // ordinary comma-list formatting and is still tolerated; whitespace inside the signed
+            // material is not. (Requirement 1.1.)
+            val value = s.substring(idx + 1)
             when (key) {
                 "t" -> { t = value; tCount++ }
                 "v1" -> { v1 = value; v1Count++ }
@@ -277,7 +289,7 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-    ): Map<String, Any?> = scrubTree(
+    ): Map<String, Any?> = refuseOrScrub(
         verifySignatureAt(payload, signature, secret, toleranceSec, null), Redactor(listOf(secret)),
     )
 
@@ -301,23 +313,41 @@ object Webhooks {
      * is no field whose meaning a mask would destroy, and refusing an arbitrary body over a
      * substring match would reject payloads that are perfectly legitimate.
      */
-    private fun scrubTree(value: Any?, redact: Redactor): Map<String, Any?> {
-        @Suppress("UNCHECKED_CAST")
-        return scrubValue(value, redact) as Map<String, Any?>
-    }
-
-    private fun scrubValue(value: Any?, redact: Redactor): Any? = when (value) {
-        is String -> redact.text(value)
-        is Map<*, *> -> {
-            val out = LinkedHashMap<String, Any?>(value.size)
-            for ((k, v) in value) out[redact.text(k.toString())] = scrubValue(v, redact)
-            out
+    /**
+     * REFUSE a signed body that echoes our own signing secret; otherwise scrub and hand it back.
+     *
+     * ── Why this used to scrub where the typed path refuses ───────────────────────────────
+     * [parseAndVerify] has refused such a body since round 9: a correctly-signed payload quoting
+     * the signing secret back at us is not a formatting problem to be masked, it means the sender
+     * HOLDS the secret and is echoing it — the emitter is misconfigured or the server is
+     * compromised — and the right answer is to stop, not to print a tidier version of the same
+     * body. [verifySignature] is the same trust decision reached through a different public
+     * function, and it sanitized and DELIVERED. A caller using the manual helper got the weaker
+     * posture with nothing telling them so. Requirement 4.6.
+     *
+     * ── And why the second recursive walker had to go ─────────────────────────────────────
+     * The scrubbing was done by a private `scrubValue` with NO DEPTH CAP AT ALL. Two defects in
+     * one: an adversarially nested body was a `StackOverflowError` thrown from inside a
+     * verification path (an `Error`, so it escaped every `catch` here), and the traversal policy
+     * was not pinned to the parser's depth the way [Redactor] is — the exact drift requirement 4.4
+     * exists to prevent, reintroduced by a duplicate implementation sitting beside the correct one.
+     *
+     * So this now uses [Redactor.body], which is depth-pinned to [Json.MAX_DEPTH] and FAILS CLOSED
+     * (an unreachable subtree is replaced, never returned). One redactor, one traversal, one bound.
+     */
+    private fun refuseOrScrub(value: Any?, redact: Redactor): Map<String, Any?> {
+        if (redact.containsCredentialDeep(value)) {
+            throw PaylodSignatureVerificationException(
+                SignatureFailureReason.INVALID_PAYLOAD,
+                "The webhook body is correctly signed but contains this integration's own webhook " +
+                    "signing secret. That cannot happen by accident: whoever sent it holds the " +
+                    "secret and echoed it back, so the emitter is misconfigured or the sender is " +
+                    "compromised. The body is REFUSED rather than sanitised and delivered — rotate " +
+                    "the signing secret.",
+            )
         }
-        is List<*> -> value.map { scrubValue(it, redact) }
-        // Numbers, booleans and null carry no text to leak and keep their exact wire value — the
-        // money path reads `resultCode` off this map in some integrations, and coercing its type
-        // here would be the very laundering the readers refuse to do.
-        else -> value
+        @Suppress("UNCHECKED_CAST")
+        return redact.body(value) as Map<String, Any?>
     }
 
     /** The internal fixed-clock seam. Test-only; see the note on [parseAndVerify]. */
@@ -453,7 +483,7 @@ object Webhooks {
         signature: String?,
         secret: String,
         toleranceSec: Long = DEFAULT_TOLERANCE_SEC,
-    ): Map<String, Any?> = scrubTree(
+    ): Map<String, Any?> = refuseOrScrub(
         verifySignatureAt(boundedBytes(payload), signature, secret, toleranceSec, null),
         Redactor(listOf(secret)),
     )
