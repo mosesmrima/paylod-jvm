@@ -1,22 +1,23 @@
 name: Release
 
-# THIS WORKFLOW DOES NOT PUBLISH. Read RELEASING.md before changing that.
+# THIS WORKFLOW PUBLISHES TO MAVEN CENTRAL. Read RELEASING.md before changing it.
+#
+# A Maven Central release is PERMANENT -- a published version can never be withdrawn or replaced,
+# only superseded. Every gate below is deliberate:
+#
+#   1. Trigger is a PUBLISHED GitHub Release, and nothing else. No push, no tag, no dispatch.
+#   2. The job runs in the `maven-central` environment, which carries a required-reviewer rule.
+#      A human approves before any step executes.
+#   3. The release tag must equal gradle.properties:version, or the job stops.
+#   4. Tests run, and the artifacts are staged and uploaded, BEFORE the publish step. The publish
+#      step is last in the same job, so it cannot run unless everything above it passed.
+#   5. The upload lands in the Central Portal as a DRAFT deployment. The plugin is configured not
+#      to auto-release, so the irreversible step is still a human pressing the button at
+#      <https://central.sonatype.com/publishing/deployments>.
 #
 # Maven Central (Sonatype) does NOT support GitHub OIDC trusted publishing the way npm and PyPI
-# do. Releasing `dev.paylod:paylod` requires two things the owner has not set up yet:
-#
-#   1. A Sonatype Central account with the `dev.paylod` namespace verified.
-#   2. A GPG signing key (Central rejects unsigned artifacts).
-#
-# Rather than ship a publish step wired to secrets that do not exist -- which would fail at the
-# worst possible moment, or worse, appear to work -- this workflow does the honest half: it
-# builds, tests, and produces the exact artifact set Central expects (jar, sources, javadoc, POM)
-# into the in-project staging repo. The publish step below is commented out and is NOT
-# credential-complete. Uncommenting it is not sufficient; see RELEASING.md.
-#
-# The trigger is still the narrowest one (published GitHub Release, gated behind a `maven-central`
-# environment) so that when publishing IS wired up, the safety posture is already correct and the
-# only change is enabling the final step.
+# do, so unlike the other paylod SDKs this one authenticates with long-lived secrets. They live in
+# the `maven-central` environment and are listed in RELEASING.md.
 
 on:
   release:
@@ -29,7 +30,7 @@ permissions:
 
 jobs:
   build:
-    name: Verify and stage artifacts (no publish)
+    name: Verify, stage, and publish to Maven Central
     runs-on: ubuntu-latest
     environment: maven-central
 
@@ -68,12 +69,25 @@ jobs:
       - name: Test
         run: ./gradlew test --no-daemon
 
-      - name: Build (jar, sources jar, javadoc jar)
+      # Compiles and runs `check` (which includes the Daraja catalog drift guard). The javadoc jar
+      # is NOT produced here: the publishing plugin attaches it to the publication rather than to
+      # `assemble`. The staging step below is what builds the complete artifact set.
+      - name: Build
         run: ./gradlew build --no-daemon
 
-      - name: Stage artifacts to build/repo
-        run: ./gradlew publishMavenPublicationToLocalStagingRepository --no-daemon
+      # Staged SIGNED, with the same key the Central upload will use. This is the dress rehearsal:
+      # if the GPG secrets are wrong, this step fails here -- before anything has been uploaded --
+      # rather than at the Portal with the tag already cut. build.gradle.kts makes signing
+      # mandatory whenever a key is configured, so an unsignable artifact cannot slip through as
+      # an unsigned one.
+      - name: Stage signed artifacts to build/repo
+        env:
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: ./gradlew publishAllPublicationsToLocalStagingRepository --no-daemon
 
+      # Uploaded before the publish step, so that if the Central upload misbehaves the exact bytes
+      # that were offered to it are already preserved and inspectable.
       - name: Upload staged artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -81,22 +95,38 @@ jobs:
           path: build/repo
           if-no-files-found: error
 
-      - name: Publishing is not automated
+      # Central requires a .asc beside every artifact. Catch a silently-unsigned staging dir here
+      # rather than discovering it from a Portal validation error.
+      - name: Verify every artifact is signed
         run: |
-          echo "Built and staged dev.paylod:paylod locally. NOTHING was published."
-          echo "Maven Central publishing is not wired up; see RELEASING.md."
+          missing=0
+          while IFS= read -r f; do
+            if [ ! -f "$f.asc" ]; then
+              echo "::error::missing signature for $f" >&2
+              missing=1
+            fi
+          done < <(find build/repo -type f \
+            \( -name '*.jar' -o -name '*.pom' -o -name '*.module' \) ! -name '*.asc')
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Refusing to publish: some artifacts are unsigned." >&2
+            exit 1
+          fi
+          echo "All artifacts carry a detached signature."
 
-      # ---------------------------------------------------------------------------------------
-      # NOT ACTIVE. Do not uncomment until every item in RELEASING.md is done. This is a sketch of
-      # the shape the step will take, not a working step -- the secrets it names do not exist, the
-      # `dev.paylod` namespace is unverified, and build.gradle.kts has no Central repository
-      # configured (it publishes to build/repo only, and signing is `isRequired = false`).
-      #
-      # - name: Publish to Maven Central
-      #   env:
-      #     ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
-      #     ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
-      #     ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_SIGNING_KEY }}
-      #     ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
-      #   run: ./gradlew publishToMavenCentral --no-daemon
-      # ---------------------------------------------------------------------------------------
+      # LAST step in the job: everything above it has already passed. Uploads a zipped bundle to
+      # the Central Portal Publisher API (this is NOT the old OSSRH nexus-staging API). The plugin
+      # does not auto-release, so this creates a DRAFT deployment that a human must then publish
+      # at <https://central.sonatype.com/publishing/deployments>.
+      - name: Publish to Maven Central
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: ./gradlew publishToMavenCentral --no-daemon
+
+      - name: Next step is manual
+        run: |
+          echo "Uploaded dev.paylod:paylod ${{ github.event.release.tag_name }} to the Central Portal."
+          echo "It is a DRAFT deployment. Nothing is public yet."
+          echo "Review and release it at https://central.sonatype.com/publishing/deployments"

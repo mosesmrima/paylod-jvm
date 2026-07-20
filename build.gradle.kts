@@ -1,3 +1,5 @@
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.KotlinJvm
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -5,6 +7,18 @@ plugins {
     `java-library`
     `maven-publish`
     signing
+    // Sonatype's Central Portal is NOT the old OSSRH `nexus-staging` API: it takes a zipped
+    // bundle uploaded to the Publisher API, not a plain Maven repository PUT. This plugin speaks
+    // that protocol; hand-rolling it with `maven { url = ... }` cannot work.
+    //
+    // Pinned to 0.34.0, NOT the newest 0.37.0, and the two bounds that pick it are both hard:
+    //   - 0.36.0+ requires Kotlin Gradle Plugin 2.2.0; this project builds on Kotlin 2.0.21.
+    //   - 0.35.0  requires Gradle 8.13; the wrapper here is 8.10.2.
+    // 0.34.0 is the newest release under both ceilings (Kotlin 1.9.20+, Gradle 8.5+), and it is
+    // already past the point where the plugin dropped OSSRH and made the Central Portal its only
+    // host — so pinning here gives up nothing that matters. Moving this version forward means
+    // moving the Gradle wrapper, and then Kotlin, first.
+    id("com.vanniktech.maven.publish") version "0.34.0"
 }
 
 // Read from gradle.properties, which is the single source of truth for the published coordinates.
@@ -37,10 +51,9 @@ kotlin {
     }
 }
 
-java {
-    withSourcesJar()
-    withJavadocJar()
-}
+// The sources jar and javadoc jar are produced by the publishing plugin (see `configure(KotlinJvm)`
+// below) rather than by `java { withSourcesJar(); withJavadocJar() }`. Central rejects a release
+// missing either, and letting one owner build them keeps them from being added twice.
 
 tasks.test {
     // `-PnvTag=<tag>` runs ONLY the tests carrying that JUnit tag. This is what the non-vacuity
@@ -102,60 +115,95 @@ tasks.test {
     }
 }
 
-// ── Maven Central coordinates (prepared, NOT published) ─────────────────────────────────────
-// Coordinates: dev.paylod:paylod:<version>. The publication is fully described here so that a
-// future `publishToSonatype` (or the central-portal plugin) works without surgery, but no
-// publishing repository is wired up and nothing is signed by default — running `publish` locally
-// only writes to the in-project `build/repo` staging dir.
-publishing {
-    publications {
-        create<MavenPublication>("maven") {
-            from(components["java"])
-            groupId = project.group.toString()
-            artifactId = "paylod"
-            version = project.version.toString()
+// ── Signing: mandatory when a key is configured, absent when one is not ──────────────────────
+//
+// Central rejects unsigned artifacts, so a RELEASE must be signed or it must fail. But a
+// developer running `./gradlew build` has no GPG key and must never be prompted for one. The old
+// `signing { isRequired = false }` bought the second property by giving up the first: a release
+// with a mis-set secret would have shipped unsigned artifacts and only failed later, at the
+// Portal, with the tag already cut.
+//
+// So signing is wired CONDITIONALLY instead. `signAllPublications()` (which makes signing
+// mandatory) is called only when a key is actually configured, by any of the three mechanisms
+// Gradle and this plugin understand:
+//
+//   signingInMemoryKey       ASCII-armoured private key — what CI passes, as
+//                            ORG_GRADLE_PROJECT_signingInMemoryKey
+//   signing.keyId            a secring.gpg keyring
+//   signing.gnupg.keyName    the local gpg agent, for a developer dry run:
+//                            ./gradlew publishAllPublicationsToLocalStagingRepository \
+//                              -Psigning.gnupg.keyName=<key id>
+//
+// With none of them set the signing plugin is never asked to sign anything, so there is nothing
+// to prompt for. With any of them set, an unsignable artifact fails the build.
+val inMemorySigningKey = providers.gradleProperty("signingInMemoryKey")
+val keyringSigningKeyId = providers.gradleProperty("signing.keyId")
+val gnupgSigningKeyName = providers.gradleProperty("signing.gnupg.keyName")
+val signingKeyConfigured =
+    inMemorySigningKey.isPresent || keyringSigningKeyId.isPresent || gnupgSigningKeyName.isPresent
 
-            pom {
-                name.set("paylod")
-                description.set(
-                    "Official JVM (Kotlin/Java) client for the paylod API — hosted M-Pesa " +
-                        "(Safaricom Daraja) STK Push, status polling, signed webhooks and offline " +
-                        "error decoding, with no third-party runtime dependencies beyond the Kotlin " +
-                        "standard library.",
-                )
-                url.set("https://paylod.dev/docs/sdk")
-                licenses {
-                    license {
-                        name.set("MIT License")
-                        url.set("https://opensource.org/licenses/MIT")
-                    }
-                }
-                developers {
-                    developer {
-                        id.set("paylod")
-                        name.set("paylod / Moses Mrima")
-                    }
-                }
-                scm {
-                    url.set("https://github.com/mosesmrima/paylod-jvm")
-                    connection.set("scm:git:https://github.com/mosesmrima/paylod-jvm.git")
-                }
+if (gnupgSigningKeyName.isPresent) {
+    // Delegate to the gpg binary/agent rather than to a keyring file, so a local dry run can use
+    // the key already in the developer's keyring. No passphrase is read or stored by the build.
+    signing { useGpgCmd() }
+}
+
+// ── Maven Central publishing ──────────────────────────────────────────────────────────────────
+// Coordinates come from gradle.properties via project.group / project.version — the single source
+// of truth — and are NOT restated here. The artifact id is the only piece this file owns.
+mavenPublishing {
+    // Sonatype Central Portal. `publishToMavenCentral()` uploads a zipped bundle to the Publisher
+    // API; it deliberately does NOT auto-release, so a deployment lands in the Portal as a
+    // reviewable draft and a human presses the button. A Maven Central release is permanent.
+    publishToMavenCentral()
+
+    if (signingKeyConfigured) {
+        signAllPublications()
+    }
+
+    // Central rejects a release missing a sources jar or a javadoc jar.
+    configure(KotlinJvm(javadocJar = JavadocJar.Javadoc()))
+
+    coordinates(project.group.toString(), "paylod", project.version.toString())
+
+    pom {
+        name.set("paylod")
+        description.set(
+            "Official JVM (Kotlin/Java) client for the paylod API — hosted M-Pesa " +
+                "(Safaricom Daraja) STK Push, status polling, signed webhooks and offline " +
+                "error decoding, with no third-party runtime dependencies beyond the Kotlin " +
+                "standard library.",
+        )
+        url.set("https://paylod.dev/docs/sdk")
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
             }
         }
+        developers {
+            developer {
+                id.set("paylod")
+                name.set("paylod / Moses Mrima")
+            }
+        }
+        scm {
+            url.set("https://github.com/mosesmrima/paylod-jvm")
+            connection.set("scm:git:https://github.com/mosesmrima/paylod-jvm.git")
+        }
     }
+}
+
+publishing {
     repositories {
-        // Local staging only. Deliberately NOT Sonatype/Central — publishing is out of scope.
+        // Kept alongside Central, not replaced by it. The release workflow stages here first and
+        // uploads the result as a workflow artifact, so the exact bytes headed for Central can be
+        // inspected before anyone publishes them. This is also the local dry-run target.
         maven {
             name = "localStaging"
             url = uri(layout.buildDirectory.dir("repo"))
         }
     }
-}
-
-// Sign only when signing keys are configured, so a normal build never asks for a GPG key.
-signing {
-    isRequired = false
-    sign(publishing.publications["maven"])
 }
 
 // ── The Daraja catalog is VENDORED, not authored here ─────────────────────────────────────────
