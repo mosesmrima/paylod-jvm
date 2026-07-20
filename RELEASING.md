@@ -116,19 +116,19 @@ present, not to have content, so this passes; producing real API docs would mean
    | `GPG_SIGNING_KEY` | ASCII-armoured private key block |
    | `GPG_SIGNING_PASSPHRASE` | Passphrase for that key |
 
-   Plus one **repository-level** secret, used by `ci.yml` as well as by this workflow, so it must
-   NOT be scoped to the `maven-central` environment:
+   No other secret is needed. In particular there is **no** `MPESA_REPO_TOKEN`. An earlier
+   revision of this file required one, with read access to the private `mosesmrima/mpesa-baas`
+   monorepo, so that CI could clone the canonical Daraja error catalog for the drift guard to
+   compare against. That was rejected and removed: it meant a long-lived credential with read
+   access to the whole private monorepo, stored in four SDK repos, three of them public, to solve
+   what is only a file-availability problem.
 
-   | Secret | What it is |
-   | --- | --- |
-   | `MPESA_REPO_TOKEN` | Token with read access to `mosesmrima/mpesa-baas` (contents: read) |
-
-   `MPESA_REPO_TOKEN` supplies the canonical Daraja error catalog, which lives in the monorepo and
-   not in this repo. Without it `checkDarajaCatalog` warns and returns, `DarajaCatalogDriftTest`
-   calls `assumeTrue` and skips, and the non-vacuity sweep's `R11-catalog-drift` case fails as
-   `BROKEN-SELECTOR` — the harness scores a skipped guard as broken, not as a pass, because a
-   guard that did not run cannot have caught anything. Verified: with the monorepo absent that
-   case reports `1 of 1 selected test(s) were SKIPPED on clean source` and the harness exits 1.
+   The drift guard now verifies the vendored catalog against `daraja-catalog.sha256`, a committed
+   pin recording the SHA-256 of the canonical file and of the vendored copy. It runs in every
+   checkout with no sibling repo and no credential, and it FAILS CLOSED — a missing, malformed or
+   unsatisfied pin is an error, never a skip. If you have the monorepo checked out at `../mpesa`
+   (or `MPESA_REPO=/path`), the guard additionally compares against canonical and fails if the pin
+   has gone stale.
 
 4. **Environment protection rule** on the `maven-central` GitHub Environment (required reviewers),
    matching the `npm` and `pypi` environments used by the other SDKs. Keep it.

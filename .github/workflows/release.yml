@@ -11,7 +11,7 @@ name: Release
 #   3. The release tag must equal gradle.properties:version, or the job stops.
 #   4. Tests run, the non-vacuity sweep runs, and the artifacts are staged and uploaded, BEFORE
 #      the publish step. The publish step is last in the same job, so it cannot run unless
-#      everything above it passed. The sweep (scripts/non-vacuity.py, 111 mutation cases) reverts
+#      everything above it passed. The sweep (scripts/non-vacuity.py, 112 mutation cases) reverts
 #      each protection in the source and requires its guarding test to FAIL; it is the only check
 #      here that tells a test which guards something apart from a test which merely passes. It was
 #      NOT part of this workflow through v0.10.1 -- see CHANGELOG.md.
@@ -41,16 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The canonical Daraja catalog lives in the paylod monorepo, not here. Without it the drift
-      # guard degrades to a skip, and the non-vacuity sweep below cannot certify case
-      # R11-catalog-drift. A release is PERMANENT, so this checkout is required, not best-effort.
-      - name: Check out the canonical monorepo
-        uses: actions/checkout@v4
-        with:
-          repository: mosesmrima/mpesa-baas
-          token: ${{ secrets.MPESA_REPO_TOKEN }}
-          path: .mpesa-canonical
-
+      # The Daraja drift guard verifies the vendored catalog against `daraja-catalog.sha256`, a
+      # committed pin, so it needs nothing checked out beside this repo. This job used to clone
+      # the private monorepo with an MPESA_REPO_TOKEN secret because the guard otherwise degraded
+      # to a skip and the sweep below could not certify case R11-catalog-drift. Neither is true
+      # any more, and a release path with one fewer long-lived credential in it is strictly better.
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -85,8 +80,6 @@ jobs:
           python-version: '3.12'
 
       - name: Test
-        env:
-          MPESA_REPO: ${{ github.workspace }}/.mpesa-canonical
         run: ./gradlew test --console=plain --no-daemon
 
       # THE NON-VACUITY SWEEP IS PART OF THE RELEASE GATE.
@@ -100,14 +93,12 @@ jobs:
       # A Maven Central release cannot be withdrawn. Reverting each protection and requiring its
       # guarding test to fail is the only check here that distinguishes a test that guards
       # something from a test that merely passes, so it belongs before the publish, not after it.
-      # Measured at 11m27s locally for 111/111 CAUGHT; budget 20-30 minutes on a hosted runner.
+      # Measured at 11m27s locally for 112/112 CAUGHT; budget 20-30 minutes on a hosted runner.
       # That is cheap against a job a human already gates and an artifact nobody can recall.
       #
       # The harness's exit status is the gate: 1 if any case is not CAUGHT, 2 on a sweep that
       # measured nothing. No pipe, no `|| true` -- either would swallow it.
       - name: Non-vacuity sweep
-        env:
-          MPESA_REPO: ${{ github.workspace }}/.mpesa-canonical
         run: python3 scripts/non-vacuity.py
 
       # The sweep mutates source in place and restores it in a `finally`. Everything below builds
@@ -126,8 +117,6 @@ jobs:
       # is NOT produced here: the publishing plugin attaches it to the publication rather than to
       # `assemble`. The staging step below is what builds the complete artifact set.
       - name: Build
-        env:
-          MPESA_REPO: ${{ github.workspace }}/.mpesa-canonical
         run: ./gradlew build --console=plain --no-daemon
 
       # Staged SIGNED, with the same key the Central upload will use. This is the dress rehearsal:

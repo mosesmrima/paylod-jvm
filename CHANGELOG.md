@@ -11,7 +11,7 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 - **The non-vacuity harness is now enforced by CI.** `scripts/non-vacuity.py` has existed for
   several releases and was invoked by nothing — not on push, not on pull request, not on release.
   A new `.github/workflows/ci.yml` runs the test suite on every push and pull request, and the
-  full 111-case mutation sweep on every pull request plus a daily schedule; `release.yml` now runs
+  full 112-case mutation sweep on every pull request plus a daily schedule; `release.yml` now runs
   the sweep before it builds or signs anything. The harness's exit status is the gate in every
   case (1 when any case is not CAUGHT, 2 on a sweep that measured nothing), with no pipe and no
   `continue-on-error` to swallow it. A correct gate that nothing invokes protects exactly as much
@@ -21,13 +21,26 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
   published to Maven Central and cannot be withdrawn. The claims are reproducible, and they were
   not machine-verified at the time they were made. The 0.10.0 entry has been corrected in place to
   say so.
-- The Daraja catalog drift guard is no longer allowed to skip in the release path. Both
-  `checkDarajaCatalog` and `DarajaCatalogDriftTest` degrade to a silent skip when the paylod
-  monorepo is not checked out beside this repo, which is the correct behaviour for a consumer
-  checkout and the wrong behaviour for a release — the guard exists precisely because four SDKs
-  vendor this table and three had drifted. CI and the release workflow now check the canonical
-  copy out and fail if it is missing, so the guard that catches drift is the one that actually
-  runs. This requires an `MPESA_REPO_TOKEN` secret with read access to the monorepo.
+- **The Daraja catalog drift guard verified nothing in CI, and had not since it was written.**
+  Both `checkDarajaCatalog` and `DarajaCatalogDriftTest` located the canonical table by looking
+  for the paylod monorepo as a sibling directory. That monorepo is private and is never checked
+  out in CI, so the task logged a warning and returned, the test called `assumeTrue` and skipped,
+  and the build was green regardless. A check that cannot distinguish "I did not look" from "I
+  looked and it is fine" is not a check — and this guard exists precisely because four SDKs vendor
+  this table and three had already drifted from it.
+  Both layers now verify the vendored copy against `daraja-catalog.sha256`, a committed pin
+  recording the SHA-256 of the canonical file and of the vendored copy. That works in any
+  checkout, and it FAILS CLOSED: a missing, unreadable, malformed or unsatisfied pin is an error,
+  never a skip and never a pass. The sibling-monorepo comparison is kept as an additional,
+  stronger check for anyone who has the monorepo beside them, and it now also catches a stale pin.
+  A new non-vacuity case, `R11-catalog-failclosed`, mutates the parser so a pin with zero rows is
+  accepted and requires the guard to go red — the guard's own fail-closed behaviour is now itself
+  covered by the harness.
+  An earlier revision fixed this by cloning the private monorepo in CI with an `MPESA_REPO_TOKEN`
+  secret. That approach was rejected and has been fully removed from `ci.yml`, `release.yml` and
+  `RELEASING.md`: it meant minting a long-lived credential with read access to the whole private
+  monorepo and storing it in four SDK repos, three of them public, to solve a file-availability
+  problem. The release path now carries one fewer long-lived credential than before.
 
 ## [0.10.1] - 2026-07-20
 

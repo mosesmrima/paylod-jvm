@@ -1157,6 +1157,18 @@ CASES = [
                 '"customerMessage": "M-Pesa had a hiccup. Please try again in a moment."')],
     ),
     dict(
+        id='R11-catalog-failclosed', tag='nv-catalog-drift-failclosed',
+        what='the pinned-checksum parser stops rejecting a pin with zero rows, so a catalog pin that '
+             'verifies nothing is accepted and the drift guard silently checks nothing again',
+        edits=[('src/test/kotlin/dev/paylod/DarajaCatalogDriftTest.kt',
+                '        if (rows.isEmpty()) {\n'
+                '            throw AssertionError("$file contains no checksum rows. An empty pin verifies nothing.")\n'
+                '        }',
+                '        if (false) {\n'
+                '            throw AssertionError("$file contains no checksum rows. An empty pin verifies nothing.")\n'
+                '        }')],
+    ),
+    dict(
         id='R11-catalog-key', tag='nv-catalog-key',
         what='a second row claims the (code, family) pair 2001/stk_result, so the catalog key is '
              'ambiguous and a lookup can silently return either of two rows that disagree on retryable',
