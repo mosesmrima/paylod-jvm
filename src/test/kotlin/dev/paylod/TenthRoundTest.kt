@@ -553,33 +553,84 @@ class TenthRoundTest {
     @Test
     @Tag("nv-no-retry-language")
     fun `no non-retryable catalog entry invites another payment attempt`() {
-        val invitation = Regex("try again|retry|pay again|again", RegexOption.IGNORE_CASE)
-        val offenders = DarajaCatalog.allEntries
-            .filter { !it.retryable && invitation.containsMatchIn(it.customerMessage) }
+        // Scoped to the categories where A DEBIT MAY HAVE OCCURRED. `credentials` and `customer`
+        // entries are refused BEFORE dispatch (invalid MSISDN, till sent as paybill, unknown C2B
+        // account reference, bad initiator credentials): no money moved, so "fix it and try again"
+        // is the correct and useful thing to say and must not be flagged. `pending` and
+        // `mpesa_system` are the ones where the outcome is unknown and a second tap can double-charge.
+        val atRisk = DarajaCatalog.allEntries.filter {
+            !it.retryable &&
+                (it.category == DarajaCategory.PENDING || it.category == DarajaCategory.MPESA_SYSTEM)
+        }
+        val offenders = atRisk
+            .filter { invitesRetry(it.customerMessage) }
             .map { "${it.code} (${it.family}): ${it.customerMessage}" }
         assertTrue(
             offenders.isEmpty(),
-            "non-retryable entries whose customer message invites another attempt:\n" +
-                offenders.joinToString("\n"),
+            "non-retryable entries where a debit may have occurred, whose customer message " +
+                "invites another attempt:\n" + offenders.joinToString("\n"),
         )
         // The fixture must be able to discriminate (§8.5): assert the catalog is actually populated
-        // and actually contains non-retryable entries, so "no offenders" cannot mean "nothing was
+        // and the at-risk set is actually populated, so "no offenders" cannot mean "nothing was
         // examined".
         assertTrue(DarajaCatalog.allEntries.size >= 30, "catalog did not load")
         assertTrue(DarajaCatalog.allEntries.count { !it.retryable } >= 15, "nothing to check")
+        assertTrue(atRisk.size >= 5, "the at-risk scope collapsed to nothing: ${atRisk.size}")
+    }
+
+    /**
+     * §3.7 — the DETECTOR itself discriminates. A substring rule that matches a bare "again" cannot
+     * tell "please try again" from "do not pay again yet"; it fired on all four of the codes the
+     * spec names while their text was already correct, which is exactly the false alarm that gets an
+     * invariant deleted. These cases pin both directions so the rule above cannot rot into a rule
+     * that passes everything.
+     */
+    @Test
+    @Tag("nv-no-retry-language")
+    fun `the retry-invitation detector tells an invitation from a prohibition`() {
+        // Genuine invitations — including the exact pre-fix text of 500.001.1001 (api_error), which
+        // is the row this invariant was tightened around. These MUST still be caught.
+        for (msg in listOf(
+            "M-Pesa returned an error. Please try again in a moment.",
+            "M-Pesa had a hiccup. Please try again in a moment.",
+            "We hit a setup error on our side. Please try again shortly.",
+            "That phone number looks invalid. Please check it and try again.",
+            "Please retry the payment.",
+            "We couldn't accept this payment. Please try again.",
+            // A prohibition in one sentence must NOT launder an invitation in the next. With a flat
+            // character window instead of a sentence clamp, this one reads as safe.
+            "Do not pay again yet. If it fails, try again later.",
+            "Check your M-Pesa messages first. Then try again.",
+        )) {
+            assertTrue(invitesRetry(msg), "detector missed a genuine retry invitation: $msg")
+        }
+        // Prohibitions — the negated form. These must NOT be flagged.
+        for (msg in listOf(
+            "M-Pesa had a problem and we cannot confirm the outcome. Do not pay again yet. " +
+                "Check your M-Pesa messages first.",
+            "M-Pesa returned an error and we cannot confirm the outcome. Do not pay again yet. " +
+                "Check your M-Pesa messages first.",
+            "Please check your M-Pesa messages before paying again - we will confirm the outcome shortly.",
+            "You have another M-Pesa request open. Finish or dismiss it first. Do not start a new " +
+                "payment until the open one clears.",
+            "Don't pay again until you have checked your M-Pesa messages.",
+            "We couldn't confirm this payment yet. Please wait while it settles - do not start a new payment.",
+            "Check your phone and enter your M-Pesa PIN to complete this payment.",
+        )) {
+            assertFalse(invitesRetry(msg), "detector misread a prohibition as an invitation: $msg")
+        }
     }
 
     /** §3.7 — the same invariant on the two synthesised decodes, which are not catalog rows. */
     @Test
     @Tag("nv-no-retry-language")
     fun `the fallback decodes never invite another payment attempt either`() {
-        val invitation = Regex("try again|retry|pay again|again", RegexOption.IGNORE_CASE)
         // Unknown, absent, non-canonical and malformed — every route to a synthesised decode.
         for (code in listOf<Any?>(null, "", 4242, "999999", " 0", "0.0", "500.0", "1032\n", true, 1032.0)) {
             val d = DarajaCatalog.decodeError(code, null)
             assertFalse(d.retryable, "synthesised decode for $code was retryable")
             assertFalse(
-                invitation.containsMatchIn(d.customerMessage),
+                invitesRetry(d.customerMessage),
                 "decode for $code invited another attempt: ${d.customerMessage}",
             )
         }
@@ -696,5 +747,45 @@ class TenthRoundTest {
                 )
             }
         }
+    }
+
+    private companion object {
+        /** Words that mean "attempt this payment again". */
+        private val RETRY_WORD = Regex("\\bretry\\b|\\bagain\\b", RegexOption.IGNORE_CASE)
+
+        /**
+         * Markers that INVERT the retry word into a prohibition. "do not pay again", "don't retry"
+         * and "before paying again" all contain a retry word while forbidding the retry, and a rule
+         * that cannot see the difference is a rule that cries wolf until someone deletes it.
+         */
+        private val NEGATION = Regex(
+            "\\bdo not\\b|\\bdon't\\b|\\bdont\\b|\\bnever\\b|\\bbefore\\b|\\bnot\\b|\\bwithout\\b",
+            RegexOption.IGNORE_CASE,
+        )
+
+        /** Sentence terminators. A negation does not reach past one — see [invitesRetry]. */
+        private val SENTENCE_END = Regex("[.!?;]")
+
+        /**
+         * True when [message] tells the customer to attempt payment again.
+         *
+         * Each retry word is judged on the text preceding it WITHIN ITS OWN SENTENCE. The sentence
+         * clamp is load-bearing, not tidiness: with a flat character window,
+         * "Do not pay again yet. If it fails, try again later." reads as safe, because the "do not"
+         * in the first sentence launders the genuine invitation in the second. A rule that can be
+         * defused by prefixing a prohibition is not a rule.
+         *
+         * One ungoverned occurrence is enough to call the whole message an invitation, so this fails
+         * CLOSED — a message that both forbids and invites counts as inviting.
+         */
+        fun invitesRetry(message: String): Boolean =
+            RETRY_WORD.findAll(message).any { m ->
+                val sentenceStart = SENTENCE_END
+                    .findAll(message.substring(0, m.range.first))
+                    .lastOrNull()
+                    ?.let { it.range.last + 1 }
+                    ?: 0
+                !NEGATION.containsMatchIn(message.substring(sentenceStart, m.range.first))
+            }
     }
 }
