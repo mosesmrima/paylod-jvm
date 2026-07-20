@@ -37,7 +37,7 @@
       "fix": "This is transient, but it is NOT proven that no charge was raised. Confirm the payment's final state with GET /status/:id (or the webhook) before charging again; only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "M-Pesa had a hiccup and we couldn't confirm this payment. Please check your M-Pesa messages before paying — do not start a new payment yet.",
+      "customerMessage": "M-Pesa had a problem and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
@@ -52,7 +52,7 @@
       "fix": "Back off, then confirm the payment's final state with GET /status/:id (or the webhook) before charging again — a busy-system rejection is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "M-Pesa is busy and we couldn't confirm this payment. Please check your M-Pesa messages before paying — do not start a new payment yet.",
+      "customerMessage": "M-Pesa is busy and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
         "provenance (2026-07-18, codex security review): retryable changed true->false — 'safe to charge again' was set on non-authoritative community evidence; until no-debit is proven, false is the safe money call."
@@ -66,7 +66,7 @@
       "fix": "Ask the customer to finish or dismiss any open M-Pesa/USSD prompt, then wait 1-3 minutes. Do NOT blind-retry: the in-flight transaction may be your own earlier push, and charging again could double-charge. Confirm the outcome of the existing payment first.",
       "category": "customer",
       "retryable": false,
-      "customerMessage": "You have another M-Pesa request open. Please finish or cancel it on your phone; we'll settle this payment once it clears.",
+      "customerMessage": "You have another M-Pesa request open. Finish or dismiss it first. Do not start a new payment until the open one clears.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://calculator.co.ke/common-m-pesa-api-errors/"
@@ -94,7 +94,7 @@
       "fix": "Keep TransactionDesc within 182 characters. Before charging again, confirm the payment's final state with GET /status/:id (or the webhook) — a send failure is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "We couldn't reach M-Pesa to confirm this payment. Please check your M-Pesa messages — do not start a new payment yet.",
+      "customerMessage": "We could not reach M-Pesa and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://woodev.co.ke/common-m-pesa-api-errors/",
@@ -109,7 +109,7 @@
       "fix": "Shorten the request fields (especially TransactionDesc) to stay within 182 characters. Before charging again, confirm the payment's final state with GET /status/:id (or the webhook) — a delivery failure is not proof no charge was raised. Only start a new attempt with a NEW idempotency key once you have confirmed nothing moved.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "We couldn't reach M-Pesa to confirm this payment. Please check your M-Pesa messages — do not start a new payment yet.",
+      "customerMessage": "We could not reach M-Pesa and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://woodev.co.ke/common-m-pesa-api-errors/",
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
@@ -181,7 +181,7 @@
       "fix": "Match the transaction type to the shortcode: CustomerBuyGoodsOnline + till number for a till, CustomerPayBillOnline + paybill for a paybill. Fix it in Credentials and retry.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We hit a setup error on our side and couldn't confirm this payment. Please contact us rather than paying anything further.",
+      "customerMessage": "We hit a setup error on our side. Please try again shortly.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
@@ -221,7 +221,7 @@
       "fix": "Send the body as JSON, and verify the amount (a positive whole-number KES) and BusinessShortCode are valid before sending.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We couldn't start the payment due to a setup error on our side. Nothing was charged. Please contact us.",
+      "customerMessage": "We couldn't start the payment due to a setup error. Please try again shortly.",
       "sources": [
         "https://gist.github.com/BaronKimaru/6da88718788f14fe501b9b26512b0c28",
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/"
@@ -235,7 +235,7 @@
       "fix": "Validate the JSON schema and required parameters against the endpoint spec before sending.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We couldn't start the payment due to a setup error on our side. Nothing was charged. Please contact us.",
+      "customerMessage": "We couldn't start the payment due to a setup error. Please try again shortly.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
@@ -249,7 +249,7 @@
       "fix": "Normalize the phone number to the 12-digit 2547XXXXXXXX format before sending.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "That phone number looks invalid, so no payment was started and nothing was charged. Please check the number with us.",
+      "customerMessage": "That phone number looks invalid. Please check it and try again.",
       "sources": [
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors",
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/"
@@ -291,7 +291,7 @@
       "fix": "Ensure the header is exactly 'Authorization: Bearer <access_token>' with no extra whitespace.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We hit an authentication error on our side, so no payment was started. Please contact us.",
+      "customerMessage": "We hit an authentication error on our side. Please try again shortly.",
       "sources": [
         "https://muchendu.com/blog/mpesa-daraja-404-error-fix",
         "https://codewithriz.com/blog/solving-invalid-access-token-error-mpesa-live-api"
@@ -305,7 +305,7 @@
       "fix": "Re-encrypt the initiator password with Safaricom's current RSA public certificate, confirm the initiator name belongs to the shortcode, and re-save it in Credentials.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We hit a setup error on our side, so no payment was started. Please contact us.",
+      "customerMessage": "We hit a setup error on our side. Please try again shortly.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://survtechnologies.co.ke/daraja/b2c.html"
@@ -319,7 +319,7 @@
       "fix": "Verify the shortcode/merchant configuration and business account balance, then retry or contact Safaricom support.",
       "category": "mpesa_system",
       "retryable": false,
-      "customerMessage": "M-Pesa returned an error and we couldn't confirm this payment. Please check your M-Pesa messages before paying anything further.",
+      "customerMessage": "M-Pesa returned an error and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://www.kenzobe.com/blog/mpesa-daraja-api-errors"
@@ -361,7 +361,7 @@
       "fix": "Re-encrypt the initiator password with Safaricom's RSA public cert, confirm the initiator belongs to the shortcode, and renew before expiry.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We hit a setup error on our side and couldn't complete this. Please contact us.",
+      "customerMessage": "We hit a setup error on our side. Please try again shortly.",
       "sources": [
         "https://tuma.co.ke/common-mpesa-daraja-api-error-codes-explanation-and-mitigation/",
         "https://survtechnologies.co.ke/daraja/b2c.html"
@@ -389,7 +389,7 @@
       "fix": "Return this reject code for unknown account references, or map/create the account before accepting.",
       "category": "customer",
       "retryable": false,
-      "customerMessage": "That account or reference number wasn't found, so the payment wasn't applied. Please check it with us.",
+      "customerMessage": "That account or reference number wasn't found. Please check it and try again.",
       "sources": [
         "https://dev.to/msnmongare/m-pesa-daraja-api-c2b-integration-guide-djn",
         "https://github.com/newtonmunene99/mpesa-api/blob/master/README.md"
@@ -403,7 +403,7 @@
       "fix": "Return this reject code when the amount is invalid, or relax the amount check if partial payments are allowed.",
       "category": "customer",
       "retryable": false,
-      "customerMessage": "That payment amount wasn't accepted. Please check the amount with us before sending anything further.",
+      "customerMessage": "That payment amount wasn't accepted. Please check the amount and try again.",
       "sources": [
         "https://dev.to/msnmongare/m-pesa-daraja-api-c2b-integration-guide-djn",
         "https://survtechnologies.co.ke/daraja/b2c.html"
@@ -431,7 +431,7 @@
       "fix": "Return this reject code for an unexpected shortcode, or verify your shortcode configuration.",
       "category": "credentials",
       "retryable": false,
-      "customerMessage": "We hit a setup error on our side and couldn't complete this. Please contact us.",
+      "customerMessage": "We hit a setup error on our side. Please try again shortly.",
       "sources": [
         "https://dev.to/msnmongare/m-pesa-daraja-api-c2b-integration-guide-djn",
         "https://github.com/newtonmunene99/mpesa-api/blob/master/README.md"
@@ -445,7 +445,7 @@
       "fix": "Return this reject code for unclassified validation failures, and log the reason for follow-up.",
       "category": "customer",
       "retryable": false,
-      "customerMessage": "We couldn't accept this payment. Please check your M-Pesa messages and contact us.",
+      "customerMessage": "We couldn't accept this payment. Please try again.",
       "sources": [
         "https://dev.to/msnmongare/m-pesa-daraja-api-c2b-integration-guide-djn",
         "https://github.com/newtonmunene99/mpesa-api/blob/master/README.md"
