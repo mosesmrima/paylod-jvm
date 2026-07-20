@@ -157,3 +157,72 @@ signing {
     isRequired = false
     sign(publishing.publications["maven"])
 }
+
+// ── The Daraja catalog is VENDORED, not authored here ─────────────────────────────────────────
+//
+// `src/main/resources/dev/paylod/daraja-error-codes.json` is a physical COPY of the canonical table
+// in the paylod monorepo. It has to be a copy: this is a separate git repo and a separate publish
+// artifact, so it cannot import across the repo boundary.
+//
+// A hand-maintained copy is exactly how four SDKs ended up serving four different sentences for the
+// same M-Pesa result code. paylod-sdk (Node) has carried a sync script for this since that bug;
+// these tasks are its Gradle equivalent, and `check` depends on the verifying one so drift fails a
+// build rather than waiting for a human to notice.
+//
+//   ./gradlew syncDarajaCatalog    # write the copy from canonical
+//   ./gradlew checkDarajaCatalog   # fail if the copy has drifted
+//
+// The monorepo is found at ../mpesa by default; override with MPESA_REPO=/path.
+val darajaCatalogCopy = layout.projectDirectory.file("src/main/resources/dev/paylod/daraja-error-codes.json")
+
+fun canonicalDarajaCatalog(): File {
+    val root = System.getenv("MPESA_REPO") ?: rootDir.resolveSibling("mpesa").path
+    return File(root, "supabase/functions/_shared/daraja/daraja-error-codes.json")
+}
+
+tasks.register("syncDarajaCatalog") {
+    group = "verification"
+    description = "Copy the canonical Daraja error catalog from the paylod monorepo into this SDK."
+    doLast {
+        val from = canonicalDarajaCatalog()
+        if (!from.isFile) {
+            throw GradleException(
+                "canonical Daraja catalog not found at $from (set MPESA_REPO=/path/to/mpesa)",
+            )
+        }
+        val to = darajaCatalogCopy.asFile
+        if (to.exists() && to.readBytes().contentEquals(from.readBytes())) {
+            logger.lifecycle("[ok] up to date  ${to.relativeTo(projectDir)}")
+        } else {
+            from.copyTo(to, overwrite = true)
+            logger.lifecycle("[sync] wrote     ${to.relativeTo(projectDir)}")
+        }
+    }
+}
+
+tasks.register("checkDarajaCatalog") {
+    group = "verification"
+    description = "Fail if the vendored Daraja error catalog has drifted from the canonical copy."
+    doLast {
+        val from = canonicalDarajaCatalog()
+        // A CI job or a consumer without the monorepo cannot verify. The copy is committed, so that
+        // is fine — but do NOT pretend we checked it.
+        if (!from.isFile) {
+            logger.warn(
+                "[warn] skipping Daraja catalog drift check: monorepo not found at $from " +
+                    "(set MPESA_REPO=/path/to/mpesa)",
+            )
+            return@doLast
+        }
+        val to = darajaCatalogCopy.asFile
+        if (!to.exists() || !to.readBytes().contentEquals(from.readBytes())) {
+            throw GradleException(
+                "DRIFT: ${to.relativeTo(projectDir)} differs from the canonical Daraja catalog at " +
+                    "$from.\nRun: ./gradlew syncDarajaCatalog",
+            )
+        }
+        logger.lifecycle("[ok] Daraja catalog matches canonical.")
+    }
+}
+
+tasks.named("check") { dependsOn("checkDarajaCatalog") }
