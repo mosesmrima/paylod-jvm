@@ -4,6 +4,48 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-07-20
+
+**Catalog consistency release.** No behavioural change to the client; the change is which sentence a
+customer reads when a payment does not come back clean.
+
+### Fixed
+
+- The vendored Daraja catalog (`src/main/resources/dev/paylod/daraja-error-codes.json`) is now
+  byte-identical to the canonical table in the paylod monorepo. It had drifted on 17
+  `customerMessage` values, all hand-written variants. Four SDKs vendor this table and three had
+  drifted independently, so a merchant running two of them read two different sentences for the same
+  M-Pesa result code. `retryable` was NOT touched anywhere — the drift was confined to message text.
+- Result code `500.001.1001` on the `api_error` surface no longer invites a retry. Daraja overloads
+  this code: its `stk_result` twin means the payment is STILL IN FLIGHT. Telling a customer to "try
+  again in a moment" about a code that can mean "not finished yet" is the double-charge direction.
+  It now states the outcome is unconfirmed and to check M-Pesa messages first. (Fixed in the
+  canonical table, then synced here.)
+
+### Changed
+
+- The requirement 3.7 invariant ("no non-retryable entry invites another payment attempt") is now
+  negation-aware and correctly scoped. It previously matched a bare `again`, so it could not tell
+  `please try again` from `do not pay again yet` and fired on four entries whose text was already
+  correct. It now judges each retry word against the preceding text and is scoped to the categories
+  where a debit MAY have occurred (`pending`, `mpesa_system`); entries refused before dispatch
+  (invalid MSISDN, till sent as paybill, unknown C2B reference, bad initiator credentials) moved no
+  money, so "fix it and try again" is correct there and is no longer flagged. A new discrimination
+  test pins both directions, including the exact pre-fix `500.001.1001` text, so the rule cannot rot
+  into one that passes everything.
+
+### Added
+
+- `./gradlew syncDarajaCatalog` and `./gradlew checkDarajaCatalog`. `check` now depends on the
+  latter, so catalog drift fails the build instead of waiting for a human to compare four files.
+  The monorepo is found at `../mpesa`, or via `MPESA_REPO`; when it is absent the check warns and
+  skips rather than pretending it verified something.
+- `DarajaCatalogDriftTest` — covers the same ground on the test path, and pins the catalog's key.
+  `code` alone is NOT a key: `0`, `2001` and `500.001.1001` each appear under two families, and the
+  two `2001` rows disagree on `retryable`. The policy is that `(code, family)` is the key everywhere
+  and duplicate pairs are forbidden; deduplicating to bare `code` was rejected because the colliding
+  rows are genuinely different facts.
+
 ## [0.10.0] - 2026-07-20
 
 **Conformance release.** This one is not organised around a review's findings. It is organised
