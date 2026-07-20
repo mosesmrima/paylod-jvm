@@ -116,6 +116,20 @@ present, not to have content, so this passes; producing real API docs would mean
    | `GPG_SIGNING_KEY` | ASCII-armoured private key block |
    | `GPG_SIGNING_PASSPHRASE` | Passphrase for that key |
 
+   Plus one **repository-level** secret, used by `ci.yml` as well as by this workflow, so it must
+   NOT be scoped to the `maven-central` environment:
+
+   | Secret | What it is |
+   | --- | --- |
+   | `MPESA_REPO_TOKEN` | Token with read access to `mosesmrima/mpesa-baas` (contents: read) |
+
+   `MPESA_REPO_TOKEN` supplies the canonical Daraja error catalog, which lives in the monorepo and
+   not in this repo. Without it `checkDarajaCatalog` warns and returns, `DarajaCatalogDriftTest`
+   calls `assumeTrue` and skips, and the non-vacuity sweep's `R11-catalog-drift` case fails as
+   `BROKEN-SELECTOR` — the harness scores a skipped guard as broken, not as a pass, because a
+   guard that did not run cannot have caught anything. Verified: with the monorepo absent that
+   case reports `1 of 1 selected test(s) were SKIPPED on clean source` and the harness exits 1.
+
 4. **Environment protection rule** on the `maven-central` GitHub Environment (required reviewers),
    matching the `npm` and `pypi` environments used by the other SDKs. Keep it.
 

@@ -9,3 +9,9 @@ local.properties
 
 # Kotlin 2.x compiler scratch dir.
 .kotlin/
+
+# The release workflow checks the paylod monorepo out here to supply the canonical Daraja catalog.
+# actions/checkout refuses a path outside the workspace, so it cannot be a sibling there as it is
+# locally. Ignored so that the post-sweep `git status --porcelain` clean-tree assertion sees only
+# what the harness touched.
+.mpesa-canonical/

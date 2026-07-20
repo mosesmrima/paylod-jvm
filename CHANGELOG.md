@@ -4,6 +4,31 @@ All notable changes to `dev.paylod:paylod` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The non-vacuity harness is now enforced by CI.** `scripts/non-vacuity.py` has existed for
+  several releases and was invoked by nothing — not on push, not on pull request, not on release.
+  A new `.github/workflows/ci.yml` runs the test suite on every push and pull request, and the
+  full 111-case mutation sweep on every pull request plus a daily schedule; `release.yml` now runs
+  the sweep before it builds or signs anything. The harness's exit status is the gate in every
+  case (1 when any case is not CAUGHT, 2 on a sweep that measured nothing), with no pipe and no
+  `continue-on-error` to swallow it. A correct gate that nothing invokes protects exactly as much
+  as a broken one.
+- **Every mutation score in this file up to and including 0.10.1 was produced by hand, locally.**
+  No release before this change was certified by a pipeline, including 0.10.1, which is already
+  published to Maven Central and cannot be withdrawn. The claims are reproducible, and they were
+  not machine-verified at the time they were made. The 0.10.0 entry has been corrected in place to
+  say so.
+- The Daraja catalog drift guard is no longer allowed to skip in the release path. Both
+  `checkDarajaCatalog` and `DarajaCatalogDriftTest` degrade to a silent skip when the paylod
+  monorepo is not checked out beside this repo, which is the correct behaviour for a consumer
+  checkout and the wrong behaviour for a release — the guard exists precisely because four SDKs
+  vendor this table and three had drifted. CI and the release workflow now check the canonical
+  copy out and fail if it is missing, so the guard that catches drift is the one that actually
+  runs. This requires an `MPESA_REPO_TOKEN` secret with read access to the monorepo.
+
 ## [0.10.1] - 2026-07-20
 
 **Catalog consistency release.** No behavioural change to the client; the change is which sentence a
@@ -63,6 +88,16 @@ each one.
 **289 tests, 0 failed, 0 skipped. 104/104 mutations caught** by `scripts/non-vacuity.py`, which
 reverts each protection in the source and requires its guarding test to FAIL. Signing is unchanged
 (the shared golden webhook vector still matches byte-for-byte) and the Java interop suite passes.
+
+**Both figures above come from a manual run on a developer machine, not from CI.** At the time of
+this release nothing in the repository invoked the harness: `release.yml` was the only workflow,
+it ran on a published GitHub Release alone, and its verification step was `./gradlew test`. The
+release log does contain a line reading `NVCOUNT tests=… failed=0 skipped=1`, which resembles
+harness output and is not — `NVCOUNT` is printed unconditionally from the test task's `doLast`, so
+that line is the ordinary full-suite run announcing its own counts. Zero mutations were exercised
+by any pipeline. Read the mutation score as a claim you can reproduce
+(`python3 scripts/non-vacuity.py`), not as a pipeline certification. See Unreleased for when that
+changed.
 
 ### A redaction placeholder was accepted as proof of payment
 

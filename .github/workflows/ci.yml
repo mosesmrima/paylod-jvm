@@ -1,0 +1,173 @@
+name: CI
+
+# The test suite and the non-vacuity harness, on every push and every pull request.
+#
+# WHY THIS FILE EXISTS. Until it did, `release.yml` was the only workflow in the repo, and it runs
+# only on a published GitHub Release. `scripts/non-vacuity.py` -- 111 mutation cases that revert
+# each protection in the source and require its guarding test to FAIL -- was invoked by nothing.
+# Not on push, not on PR, not on release. The v0.10.1 release log does contain a line reading
+# `NVCOUNT tests=293 failed=0 skipped=1`, which looks like harness output but is not: `NVCOUNT` is
+# printed unconditionally from the test task's `doLast`, so that line is the ORDINARY full-suite
+# run announcing itself. Zero mutations were exercised in CI, ever. The "104/104 mutations caught"
+# figure in CHANGELOG.md came from a human running the script by hand on a laptop.
+#
+# A gate that nothing invokes protects exactly as much as a gate that is broken. This wires it up.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Daily, 03:17 UTC. Off the hour deliberately -- GitHub drops scheduled runs at peak minutes.
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── FAST PATH ────────────────────────────────────────────────────────────────────────────────
+  # Runs on every push and PR. `build` includes `check`, which includes `checkDarajaCatalog`.
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: paylod-jvm
+
+      # The canonical Daraja catalog lives in the paylod monorepo, NOT in this repo. Without it
+      # both `checkDarajaCatalog` and `DarajaCatalogDriftTest` degrade to a skip -- see the
+      # `canonical-catalog` step in the non-vacuity job for why that is not acceptable there.
+      # Here the checkout is best-effort: a missing secret must not redden the fast path.
+      - name: Check out the canonical monorepo (for the Daraja drift guard)
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: mosesmrima/mpesa-baas
+          token: ${{ secrets.MPESA_REPO_TOKEN }}
+          path: mpesa
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The repo is checked out into a subdirectory (the canonical monorepo needs to sit
+      # beside it), so setup-gradle has to be told where the build actually is or its caching
+      # silently finds nothing.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: paylod-jvm
+
+      # `rootDir.resolveSibling("mpesa")` already resolves correctly given the checkout paths
+      # above, but stating MPESA_REPO explicitly means the layout is not load-bearing.
+      - name: Build and test
+        working-directory: paylod-jvm
+        env:
+          MPESA_REPO: ${{ github.workspace }}/mpesa
+        run: ./gradlew build --console=plain --no-daemon
+
+      # `checkDarajaCatalog` WARNS and returns when the monorepo is absent, and the drift test
+      # calls `assumeTrue`. Both are correct in a consumer checkout and both are silent, so this
+      # step says out loud which of the two happened here.
+      - name: Report drift-guard coverage
+        if: always()
+        run: |
+          if [ -f "mpesa/supabase/functions/_shared/daraja/daraja-error-codes.json" ]; then
+            echo "Canonical catalog present: the Daraja drift guard RAN."
+          else
+            echo "::warning::Canonical catalog absent, so the Daraja drift guard SKIPPED in this job. It is enforced by the non-vacuity job, which fails without it."
+          fi
+
+  # ── FULL SWEEP ───────────────────────────────────────────────────────────────────────────────
+  # 111 mutation cases, each a clean run plus a mutated run, every one forced through
+  # `--rerun-tasks` to defeat Gradle's build cache. That is 222 uncached Gradle test invocations.
+  #
+  # MEASURED: 11m27s wall (4m05s user) for 111/111 CAUGHT on a warm local checkout. A GitHub-hosted
+  # 2-core runner starting cold should be taken as roughly 2x that, so budget 20-30 minutes; the
+  # job's timeout-minutes is set well above that so a slow runner reports a real result rather than
+  # a timeout that reads like a failure.
+  #
+  # So it runs on pull_request -- nothing merges uncertified -- and on a daily schedule, so a
+  # direct push to a branch surfaces within a day. It does NOT run on every push, where 20-30
+  # minutes per commit would buy little over the `test` job above. The publish path is covered
+  # separately and unconditionally: release.yml runs the same sweep before it builds or signs.
+  # Between the three, every route by which code reaches a user passes through this harness.
+  non-vacuity:
+    name: Non-vacuity sweep (111 mutations)
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: paylod-jvm
+
+      # NOT best-effort here. Case R11-catalog-drift reverts the vendored catalog to pre-fix
+      # wording and requires `DarajaCatalogDriftTest` to fail. Without the canonical copy that test
+      # calls `assumeTrue` and SKIPS -- and the harness classifies a skipped guard as
+      # BROKEN-SELECTOR, not as a pass, because a disabled guard cannot catch anything. So the
+      # sweep genuinely cannot be certified without this checkout.
+      - name: Check out the canonical monorepo
+        uses: actions/checkout@v4
+        with:
+          repository: mosesmrima/mpesa-baas
+          token: ${{ secrets.MPESA_REPO_TOKEN }}
+          path: mpesa
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The repo is checked out into a subdirectory (the canonical monorepo needs to sit
+      # beside it), so setup-gradle has to be told where the build actually is or its caching
+      # silently finds nothing.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: paylod-jvm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Fail HERE, with a sentence that names the cause, rather than 40 minutes later inside the
+      # sweep with "1 of 1 selected test(s) were SKIPPED on clean source" against one case id.
+      - name: Require the canonical catalog
+        run: |
+          catalog="mpesa/supabase/functions/_shared/daraja/daraja-error-codes.json"
+          if [ ! -f "$catalog" ]; then
+            echo "::error::Canonical Daraja catalog not found at $catalog. The non-vacuity sweep cannot be certified without it: case R11-catalog-drift depends on DarajaCatalogDriftTest, which skips when the monorepo is absent, and the harness treats a skipped guard as broken rather than as a pass. Configure the MPESA_REPO_TOKEN secret with read access to mosesmrima/mpesa-baas." >&2
+            exit 1
+          fi
+          echo "Canonical catalog present. All 111 cases are runnable."
+
+      # No `continue-on-error`, no `|| true`, no pipe: the harness's own exit status IS the gate.
+      # It exits 1 when any case is not CAUGHT (VACUOUS, BROKEN-SELECTOR, BROKEN-ANCHOR,
+      # BROKEN-BUILD, BROKEN-MUTATION) and 2 on a sweep that measured nothing -- an unregistered
+      # `nv-` tag, a case naming a tag no test carries, or an empty result set. Both are non-zero,
+      # so both fail the step and the job. A pipe through `tee` would mask them behind tee's
+      # status, which is why there isn't one.
+      - name: Non-vacuity sweep
+        working-directory: paylod-jvm
+        env:
+          MPESA_REPO: ${{ github.workspace }}/mpesa
+        run: python3 scripts/non-vacuity.py
+
+      # The harness mutates source in place and restores it in a `finally`. If the tree is dirty
+      # afterwards, that restore did not hold -- worth knowing before a later job builds from it.
+      - name: Verify the harness restored the working tree
+        if: always()
+        working-directory: paylod-jvm
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The working tree is dirty after the sweep; the harness's restore guard did not hold." >&2
+            git status --porcelain
+            exit 1
+          fi
+          echo "Working tree clean: every mutation was restored."
