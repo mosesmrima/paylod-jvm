@@ -69,7 +69,21 @@ jobs:
   # Between the three, every route by which code reaches a user passes through this harness.
   non-vacuity:
     name: Non-vacuity sweep (112 mutations)
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+    # Runs on push too, not only PR and schedule.
+    #
+    # The sweep costs roughly 25 minutes on a hosted runner against 11 locally, and skipping it on
+    # push was a defensible trade. It is not the trade this repository should make, because of how
+    # the skip RENDERS: the job appears in a green run with the word "skipped" beside it, which is
+    # visually indistinguishable from a gate that ran and passed.
+    #
+    # That exact confusion is what this repository spent a day undoing. The Node harness reported
+    # 0/121 on every release for its entire life; a NUL byte made a source file invisible to grep;
+    # four catalog drift guards were green because the file they compare against was absent. Every
+    # one of them was a check that ran, reported nothing, and looked fine. A skipped gate is the
+    # same failure wearing a checkmark.
+    #
+    # This repository takes few pushes. Twenty-five minutes is a cheap price for never having to
+    # ask whether a green tick meant the sweep ran.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
