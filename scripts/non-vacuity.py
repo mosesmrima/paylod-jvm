@@ -1136,6 +1136,22 @@ CASES = [
         edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt', '            customerMessage = "We couldn\'t confirm this payment yet. Please wait while it settles — " +\n                "do not start a new payment.",', '            customerMessage = "The payment didn\'t go through. Please try again.",')],
     ),
     dict(
+        id='R11-catalog-drift', tag='nv-catalog-drift',
+        what='the vendored Daraja catalog drifts back to the pre-fix wording for code 17, so this SDK '
+             'tells a customer something different than the other three for the same result code',
+        edits=[('src/main/resources/dev/paylod/daraja-error-codes.json',
+                '"customerMessage": "M-Pesa had a problem and we cannot confirm the outcome. Do not pay again yet. Check your M-Pesa messages first."',
+                '"customerMessage": "M-Pesa had a hiccup. Please try again in a moment."')],
+    ),
+    dict(
+        id='R11-catalog-key', tag='nv-catalog-key',
+        what='a second row claims the (code, family) pair 2001/stk_result, so the catalog key is '
+             'ambiguous and a lookup can silently return either of two rows that disagree on retryable',
+        edits=[('src/main/resources/dev/paylod/daraja-error-codes.json',
+                '"code": "2001",\n      "family": "b2c_c2b_result",',
+                '"code": "2001",\n      "family": "stk_result",')],
+    ),
+    dict(
         id='R10-retryable-agrees', tag='nv-retryable-agrees',
         what='the catalog retryable is passed through on a non-FAILED verdict, so a nested detail.retryable can contradict the top-level one',
         edits=[('src/main/kotlin/dev/paylod/PaymentOutcome.kt', '            if (detail == null || !detail.retryable) detail else detail.copy(retryable = false)', '            detail')],
