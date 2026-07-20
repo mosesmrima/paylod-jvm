@@ -1136,6 +1136,19 @@ CASES = [
         edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt', '            customerMessage = "We couldn\'t confirm this payment yet. Please wait while it settles — " +\n                "do not start a new payment.",', '            customerMessage = "The payment didn\'t go through. Please try again.",')],
     ),
     dict(
+        # The defect this closes was never "one bad string" -- it was that NOTHING WAS LOOKING at
+        # the fallbacks, which is why Python's shipped an invitation for ten review rounds. So the
+        # mutation ADDS a fallback that no probe points at. It compiles, it changes no behaviour,
+        # and only the coverage guard can notice it.
+        id='R10-retry-language-fallback-coverage', tag='nv-no-retry-language',
+        what='a decode fallback exists that no probe covers, so a future fallback can ship unchecked',
+        edits=[('src/main/kotlin/dev/paylod/DarajaCatalog.kt',
+                '    private fun pendingFallback(code: String) = DecodedError(',
+                '    @Suppress("unused")\n'
+                '    private fun unprobedFallback(code: String) = pendingFallback(code)\n\n'
+                '    private fun pendingFallback(code: String) = DecodedError(')],
+    ),
+    dict(
         id='R11-catalog-drift', tag='nv-catalog-drift',
         what='the vendored Daraja catalog drifts back to the pre-fix wording for code 17, so this SDK '
              'tells a customer something different than the other three for the same result code',

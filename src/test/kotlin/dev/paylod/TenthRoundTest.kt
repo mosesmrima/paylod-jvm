@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import java.io.File
 
 /**
  * ROUND 10 — conformance with `docs/SDK-CONFORMANCE.md`.
@@ -747,6 +748,65 @@ class TenthRoundTest {
                 )
             }
         }
+    }
+
+    // ── §3.7 — the FALLBACKS are in scope too ───────────────────────────────────────────────
+
+    /**
+     * §3.7 APPLIED TO THE PATHS WITH NO CATALOG ROW.
+     *
+     * The invariant above walks `DarajaCatalog.allEntries` — the CATALOG. A fallback is not a
+     * catalog row: it is what `decodeError` returns when nothing matched. So the one path where
+     * the SDK knows LEAST about what happened was the one path no test in any of the four SDKs
+     * was looking at, and the Python port's `_failed_fallback` sat there through ten review rounds
+     * saying "The payment didn't go through. Please try again." beside a `fix` field stating, in
+     * the same object, that we cannot prove no money moved. It was found by READING THE FILE.
+     *
+     * This SDK's fallbacks were already correct — `indeterminateFallback` is deliberately phrased
+     * without any retry word at all. Being correct and being CHECKED are different properties, and
+     * only the second one survives the next edit.
+     *
+     * The probe list is verified against the fallbacks actually declared in `DarajaCatalog.kt`, so
+     * adding a third fallback fails this test until somebody points a probe at it.
+     */
+    @Test
+    @Tag("nv-no-retry-language")
+    fun `no decode fallback invites another payment attempt`() {
+        // (declared name, resultCode, rawDesc, the title that proves the probe landed)
+        val probes = listOf(
+            Triple("pendingFallback", "31337" to "the transaction is being processed", "Payment still in progress"),
+            Triple("indeterminateFallback", null to null, "Payment state unknown"),
+        )
+
+        // Every fallback DECLARED in the source is probed here.
+        val source = File("src/main/kotlin/dev/paylod/DarajaCatalog.kt").readText()
+        val declared = Regex("""private fun (\w*[Ff]allback)\(""")
+            .findAll(source).map { it.groupValues[1] }.toSortedSet()
+        assertTrue(declared.isNotEmpty(), "found no fallback declarations — the scan is broken, not clean")
+        assertEquals(
+            declared.toList(),
+            probes.map { it.first }.toSortedSet().toList(),
+            "a fallback exists that no probe covers — that is the exact shape of the defect",
+        )
+
+        for ((name, input, title) in probes) {
+            val decoded = DarajaCatalog.decodeError(input.first, input.second, DarajaFamily.STK_RESULT)
+            // §8.5: a probe that quietly decoded a real catalog row would prove nothing.
+            assertEquals(title, decoded.title, "probe for $name did not reach $name")
+            assertFalse(decoded.retryable, "$name is retryable")
+            assertTrue(decoded.customerMessage.isNotBlank(), "$name has a blank customer message")
+            assertFalse(
+                invitesRetry(decoded.customerMessage),
+                "$name invites another payment attempt: ${decoded.customerMessage}",
+            )
+        }
+
+        // The specific regression, in the shape a real caller hits most: `resultCode` absent.
+        val absent = DarajaCatalog.decodeError(null)
+        assertEquals(
+            "We couldn't confirm this payment yet. Please wait while it settles — do not start a new payment.",
+            absent.customerMessage,
+        )
     }
 
     private companion object {
